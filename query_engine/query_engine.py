@@ -1277,7 +1277,23 @@ def _cell_is_busy(self, record: Dict[str, Any]) -> bool:
         record.get("record_type", "")
     )
 
-    if "faculty_free_slot" in record_type:
+    # Explicit free-slot records of ANY kind (faculty, class, or
+    # room) are never busy. Previously this only recognized
+    # "faculty_free_slot" - harmless while this helper's only
+    # caller was faculty_free_for_period() (which only ever sees
+    # faculty-related records), but wrong for a room- or class-
+    # free record, where the record's own "room"/"class_name"
+    # field is populated with the WHICH-ONE-IS-FREE identity
+    # rather than indicating an occupying class - without this,
+    # such a record would incorrectly fall through to "busy".
+    if any(
+        free_type in record_type
+        for free_type in (
+            "faculty_free_slot",
+            "class_free_slot",
+            "room_free_slot",
+        )
+    ):
         return False
 
     # Explicit free indicators
@@ -1791,6 +1807,255 @@ def faculty_free_for_period(
     }
 
 
+def _room_records(self) -> List[Dict[str, Any]]:
+    """
+    Return all room timetable records.
+
+    This combines:
+        - scheduled events that occupy a room
+        - explicit room free-slot records
+
+    Mirrors _faculty_records() above, but for rooms - needed
+    for questions such as:
+
+        Which rooms are free from 10:15 to 12:15 on Wednesday?
+    """
+
+    records = []
+
+    # Scheduled/busy events
+    for event in self._events():
+
+        if isinstance(event, dict):
+
+            room = self._get(
+                event,
+                "room",
+                "classroom"
+            )
+
+            if room:
+                records.append(event)
+
+    # Explicit free-slot records
+    for record in self._room_free():
+
+        if isinstance(record, dict):
+
+            room = self._get(
+                record,
+                "room",
+                "classroom"
+            )
+
+            if room:
+                records.append(record)
+
+    return records
+
+
+def room_free_for_period(
+    self,
+    day: str,
+    start_time: str,
+    end_time: str
+) -> Dict[str, Any]:
+    """
+    Return rooms that are completely free during the requested
+    period.
+
+    Mirrors faculty_free_for_period() above, but groups by
+    ROOM instead of by teacher, and reuses the same
+    _slot_overlaps_period()/_cell_is_busy() primitives so a
+    room's free/busy status is judged with exactly the same
+    logic as a faculty member's.
+
+    IMPORTANT:
+    If both ROOM_FREE_SLOT and a SCHEDULED_EVENT exist for the
+    same room/day/slot, the SCHEDULED_EVENT wins (room is busy).
+    """
+
+    start = self._time_to_minutes(start_time)
+    end = self._time_to_minutes(end_time)
+
+    day_key = self._day(day)
+
+    if (
+        start is None
+        or end is None
+        or end <= start
+    ):
+        return {
+            "query_type": "room_free_period",
+            "day": day_key,
+            "start_time": start_time,
+            "end_time": end_time,
+            "slots": [],
+            "count": 0,
+            "results": []
+        }
+
+    all_records = self._room_records()
+
+    # ---------------------------------------------------------
+    # Get all room names
+    # ---------------------------------------------------------
+
+    rooms = sorted(
+        {
+            self._clean(
+                self._get(
+                    record,
+                    "room",
+                    "classroom"
+                )
+            )
+            for record in all_records
+            if self._clean(
+                self._get(
+                    record,
+                    "room",
+                    "classroom"
+                )
+            )
+        },
+        key=lambda x: x.casefold()
+    )
+
+    # ---------------------------------------------------------
+    # Records overlapping requested period
+    # ---------------------------------------------------------
+
+    requested_records = [
+        record
+        for record in all_records
+        if self._day(
+            record.get("day")
+        ) == day_key
+        and self._slot_overlaps_period(
+            self._clean(
+                record.get("slot_time")
+            ),
+            start,
+            end
+        )
+    ]
+
+    # ---------------------------------------------------------
+    # Requested slots
+    # ---------------------------------------------------------
+
+    requested_slots = sorted(
+        {
+            self._slot(
+                record.get("slot")
+            )
+            for record in requested_records
+            if self._slot(
+                record.get("slot")
+            ) is not None
+        }
+    )
+
+    free_rooms = []
+
+    # ---------------------------------------------------------
+    # Check every room
+    # ---------------------------------------------------------
+
+    for room in rooms:
+
+        room_records = [
+            record
+            for record in requested_records
+            if self._normalize(
+                self._get(
+                    record,
+                    "room",
+                    "classroom"
+                )
+            ) == self._normalize(room)
+        ]
+
+        if not room_records:
+            continue
+
+        records_by_slot = {}
+
+        for record in room_records:
+
+            slot = self._slot(
+                record.get("slot")
+            )
+
+            if slot is None:
+                continue
+
+            records_by_slot.setdefault(
+                slot,
+                []
+            ).append(record)
+
+        is_free = True
+
+        # -----------------------------------------------------
+        # Check every requested slot
+        # -----------------------------------------------------
+
+        for slot in requested_slots:
+
+            slot_records = records_by_slot.get(
+                slot,
+                []
+            )
+
+            # No record for this slot - cannot automatically
+            # call this FREE because there may be incomplete
+            # timetable information.
+            if not slot_records:
+                is_free = False
+                break
+
+            slot_is_busy = any(
+                self._cell_is_busy(record)
+                for record in slot_records
+            )
+
+            if slot_is_busy:
+                is_free = False
+                break
+
+        # -----------------------------------------------------
+        # Room is completely free
+        # -----------------------------------------------------
+
+        if is_free:
+
+            free_rooms.append(
+                {
+                    "room": room,
+                    "day": day_key,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "slots": requested_slots,
+                }
+            )
+
+    free_rooms.sort(
+        key=lambda x: x["room"].casefold()
+    )
+
+    return {
+        "query_type": "room_free_period",
+        "day": day_key,
+        "start_time": start_time,
+        "end_time": end_time,
+        "slots": requested_slots,
+        "count": len(free_rooms),
+        "results": free_rooms,
+    }
+
+
 # =============================================================
 # ATTACH METHODS TO QUERY ENGINE
 #
@@ -1799,11 +2064,13 @@ def faculty_free_for_period(
 # =============================================================
 
 QueryEngine._faculty_records = _faculty_records
+QueryEngine._room_records = _room_records
 QueryEngine._cell_is_busy = _cell_is_busy
 QueryEngine._time_to_minutes = _time_to_minutes
 QueryEngine._slot_overlaps_period = _slot_overlaps_period
 QueryEngine.faculty_status_for_period = faculty_status_for_period
 QueryEngine.faculty_free_for_period = faculty_free_for_period
+QueryEngine.room_free_for_period = room_free_for_period
 
 
 __all__ = [

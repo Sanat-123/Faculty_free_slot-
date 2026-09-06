@@ -592,6 +592,32 @@ class FacultyAIChatbot:
     
 
     # ======================================================
+    # WORD-BOUNDARY KEYWORD MATCH
+    #
+    # A plain `word in text` substring check is wrong for short
+    # trigger words that can appear INSIDE unrelated words - e.g.
+    # "lab" is a literal substring of "available" ("avai-LAB-le"),
+    # so a naive substring check on "which rooms are available"
+    # would incorrectly "see" a lab reference that was never
+    # there. This checks for the word as a whole word instead.
+    # ======================================================
+
+    @staticmethod
+    def _contains_any_word(text, words):
+
+        for word in words:
+
+            if re.search(
+                r"\b" + re.escape(word) + r"\b",
+                text
+            ):
+
+                return True
+
+        return False
+
+
+    # ======================================================
     # EXTRACT DAY
     # ======================================================
 
@@ -2399,6 +2425,170 @@ class FacultyAIChatbot:
                 )
 
         # --------------------------------------------------
+        # ROOM AVAILABILITY
+        #
+        # Example:
+        # Which rooms are free on Monday slot 3?
+        # Which rooms are available on Monday slot 3?
+        # What rooms are free Monday at slot 3?
+        # Find free rooms on Tuesday from 10:15 to 12:15.
+        #
+        # Checked BEFORE lab shifting. "room"/"rooms" plus an
+        # availability word ("free"/"available"/"vacant") is a
+        # general room-availability question UNLESS it also
+        # references a specific lab/venue (see LAB SHIFTING
+        # below) or a specific faculty member's class - those
+        # are left to fall through to that branch instead. The
+        # absence of any faculty/lab reference is what makes
+        # this a plain room-availability query rather than a
+        # request to move something's venue.
+        #
+        # Delegates entirely to the existing
+        # QueryEngine.room_free_slots() (single slot) /
+        # QueryEngine.room_free_for_period() (time range) -
+        # both operate on the SAME canonical dataset every other
+        # query in this method uses; no new/parallel room engine
+        # is introduced.
+        # --------------------------------------------------
+
+        room_words = ("room", "rooms")
+
+        room_availability_words = (
+            "free", "available", "vacant"
+        )
+
+        lab_reference_words = (
+            "lab", "labs", "venue"
+        )
+
+        is_room_availability_intent = (
+            any(word in text for word in room_words)
+            and any(
+                word in text
+                for word in room_availability_words
+            )
+            and not self._contains_any_word(
+                text, lab_reference_words
+            )
+            and not self._extract_period_teacher(query)
+        )
+
+        if is_room_availability_intent:
+
+            room_day = self._extract_day(query)
+
+            room_start, room_end = (
+                self._extract_time_range(query)
+            )
+
+            room_slot = self._extract_slot(query)
+
+            if not room_day:
+
+                return (
+                    "Please specify a day for the room "
+                    "availability query, for example \"Which "
+                    "rooms are free on Monday slot 3?\""
+                )
+
+            if room_slot is not None:
+
+                result = self.query_engine.room_free_slots(
+                    day=room_day,
+                    slot=room_slot
+                )
+
+                rooms = sorted(
+                    {
+                        str(
+                            self.query_engine._get(
+                                record, "room", "classroom"
+                            )
+                        ).strip()
+                        for record in result.get("results", [])
+                        if str(
+                            self.query_engine._get(
+                                record, "room", "classroom"
+                            )
+                        ).strip()
+                    },
+                    key=lambda name: name.casefold()
+                )
+
+                day_label = str(
+                    result.get("day") or room_day
+                ).capitalize()
+
+                if not rooms:
+
+                    return (
+                        "Room availability cannot be "
+                        "determined for "
+                        f"{day_label} slot {room_slot} from "
+                        "the current upload."
+                    )
+
+                lines = [
+                    f"Rooms free on {day_label} slot "
+                    f"{room_slot}:"
+                ]
+
+                lines.append("")
+
+                for index, room in enumerate(rooms, start=1):
+
+                    lines.append(f"{index}. {room}")
+
+                return "\n".join(lines)
+
+            if room_start and room_end:
+
+                result = self.query_engine.room_free_for_period(
+                    day=room_day,
+                    start_time=room_start,
+                    end_time=room_end
+                )
+
+                rooms = [
+                    record["room"]
+                    for record in result.get("results", [])
+                ]
+
+                day_label = str(
+                    result.get("day") or room_day
+                ).capitalize()
+
+                if not rooms:
+
+                    return (
+                        "Room availability cannot be "
+                        f"determined for {day_label} from "
+                        f"{room_start} to {room_end} from the "
+                        "current upload."
+                    )
+
+                lines = [
+                    f"Rooms free on {day_label} from "
+                    f"{room_start} to {room_end}:"
+                ]
+
+                lines.append("")
+
+                for index, room in enumerate(rooms, start=1):
+
+                    lines.append(f"{index}. {room}")
+
+                return "\n".join(lines)
+
+            return (
+                "Please specify a slot number or a complete "
+                "time range for the room availability query, "
+                "for example \"Which rooms are free on Monday "
+                "slot 3?\" or \"Which rooms are free from "
+                "10:15 to 12:15 on Wednesday?\""
+            )
+
+        # --------------------------------------------------
         # LAB SHIFTING / VENUE CHANGE
         #
         # Example:
@@ -2463,18 +2653,24 @@ class FacultyAIChatbot:
             )
 
         room_shift_words = ("shift", "move")
-        room_availability_words = ("available", "free", "another")
-        room_context_words = ("room", "lab", "venue")
+
+        room_availability_words_lab = (
+            "available", "free", "another"
+        )
+
+        room_context_words = ("lab", "labs", "venue")
 
         has_room_shift_intent = (
             (
                 any(word in text for word in room_shift_words)
                 or any(
                     word in text
-                    for word in room_availability_words
+                    for word in room_availability_words_lab
                 )
             )
-            and any(word in text for word in room_context_words)
+            and self._contains_any_word(
+                text, room_context_words
+            )
         )
 
         if has_room_shift_intent:
