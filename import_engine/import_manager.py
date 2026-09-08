@@ -274,6 +274,19 @@ class ImportManager:
 
             # ==================================================
             # PDF
+            #
+            # Deliberately does NOT call PDFImporter.inspect_
+            # file() here: that method re-opens the PDF and
+            # re-walks every page/table a second time purely for
+            # diagnostics, roughly doubling PDF processing time
+            # for a file type that is already the slowest to
+            # import. Nothing downstream of this method actually
+            # reads `inspection` for PDFs beyond has_day/has_slot,
+            # which are computed a few lines below from the real
+            # `records` for EVERY file type anyway. PDFImporter.
+            # inspect_file() remains available to call directly
+            # (e.g. for troubleshooting a specific file) - it is
+            # just not part of the normal import path anymore.
             # ==================================================
 
             if file_type == "pdf":
@@ -283,15 +296,6 @@ class ImportManager:
                 records = importer.import_file(
                     path
                 )
-
-                if hasattr(
-                    importer,
-                    "inspect_file"
-                ):
-
-                    inspection = importer.inspect_file(
-                        path
-                    )
 
             # ==================================================
             # EXCEL

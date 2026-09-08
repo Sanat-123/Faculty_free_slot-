@@ -35,6 +35,8 @@ import os
 import sys
 import shutil
 import tempfile
+import hashlib
+import time
 from pathlib import Path
 
 import streamlit as st
@@ -112,6 +114,13 @@ SUPPORTED_TYPES = [
 
 # ============================================================
 # SESSION STATE
+#
+# IMPORTANT: every mutable piece of the uploaded knowledge base
+# lives in st.session_state, which Streamlit keeps separate per
+# browser session. Nothing here is stored in a module-level
+# variable, a global dict, or an @st.cache_resource-style shared
+# cache - that would let one user's uploaded timetable leak into
+# another user's session.
 # ============================================================
 
 if "records" not in st.session_state:
@@ -143,6 +152,35 @@ if "chatbot_error" not in st.session_state:
 
 if "file_names" not in st.session_state:
     st.session_state.file_names = []
+
+if "upload_fingerprint" not in st.session_state:
+    # Deterministic content-based fingerprint (filename + bytes,
+    # order-invariant) of the LAST uploaded file set that was
+    # actually processed - see compute_upload_fingerprint()
+    # below. While the current upload's fingerprint matches this,
+    # nothing is re-imported/re-built; the existing session
+    # knowledge base (or the existing error, if every file failed
+    # last time) is reused as-is.
+    st.session_state.upload_fingerprint = None
+
+if "build_duration_seconds" not in st.session_state:
+    # Real elapsed wall-clock time (time.perf_counter()) that the
+    # last successful build actually took - shown to the user
+    # instead of a fake progress percentage.
+    st.session_state.build_duration_seconds = None
+
+if "file_reports" not in st.session_state:
+    # Per-file status from the last build (filename, file type,
+    # status, record count, message) - kept in session_state so
+    # it stays visible on every rerun, not just the one right
+    # after upload.
+    st.session_state.file_reports = []
+
+if "build_error" not in st.session_state:
+    # Set when EVERY uploaded file produced zero records - no
+    # chatbot/engine is built in that case, and this message
+    # explains why.
+    st.session_state.build_error = None
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -215,15 +253,24 @@ def import_single_file(uploaded_file):
     build_combined_dataset() below).
 
     IMPORTANT: the temporary file is written using the file's
-    ORIGINAL name, not a randomly generated one. CanonicalEvent-
-    Matcher.identify_source() classifies a record's source
-    (facultywise / classwise / location-wise) by looking for
-    those words in the "source_file" field, which is derived
-    directly from this path's filename. A randomized temp name
-    would make every uploaded PDF look like an unclassified
-    generic "PDF" source, which silently breaks faculty/class/
-    room free-slot detection even though the file imports
-    "successfully".
+    ORIGINAL name, not a randomly generated one. This keeps the
+    *filename-based* fallback in CanonicalEventMatcher.
+    identify_source() available for a file literally named
+    "...facultywise...", "...classwise..." or "...location
+    wise...". It is only a fallback now: PDFImporter itself
+    detects each PAGE's identity (teacher / class / room) from
+    the page's own CONTENT, independent of what the file is
+    named - see import_engine/pdf_importer.py's
+    detect_page_identity(). The filename is kept for backward
+    compatibility and as a fallback for pages whose content-based
+    identity could not be determined.
+
+    Returns a dict with an explicit `status`:
+
+        "success"       - at least one record was imported
+        "zero_records"  - imported without error, but produced
+                           no timetable records
+        "failed"        - the file could not be imported at all
     """
 
     temp_dir = None
@@ -272,6 +319,11 @@ def import_single_file(uploaded_file):
 
         if isinstance(result, dict):
 
+            file_type = result.get(
+                "file_type",
+                ""
+            )
+
             if not result.get(
                 "success",
                 False
@@ -279,11 +331,14 @@ def import_single_file(uploaded_file):
 
                 return {
                     "success": False,
+                    "status": "failed",
+                    "file_type": file_type,
                     "message": result.get(
                         "error",
                         "File import failed."
                     ),
                     "records": [],
+                    "record_count": 0,
                     "warnings": []
                 }
 
@@ -299,6 +354,8 @@ def import_single_file(uploaded_file):
 
         else:
 
+            file_type = ""
+
             records = result
 
             warnings = []
@@ -312,17 +369,23 @@ def import_single_file(uploaded_file):
 
             return {
                 "success": False,
+                "status": "zero_records",
+                "file_type": file_type,
                 "message": (
                     "The file was imported but "
                     "no timetable records were found."
                 ),
                 "records": [],
+                "record_count": 0,
                 "warnings": warnings
             }
 
         return {
             "success": True,
+            "status": "success",
+            "file_type": file_type,
             "records": records,
+            "record_count": len(records),
             "warnings": warnings
         }
 
@@ -331,8 +394,11 @@ def import_single_file(uploaded_file):
 
         return {
             "success": False,
+            "status": "failed",
+            "file_type": "",
             "message": str(e),
             "records": [],
+            "record_count": 0,
             "warnings": []
         }
 
@@ -392,10 +458,17 @@ def build_combined_dataset(uploaded_files):
             file_reports.append(
                 {
                     "name": uploaded_file.name,
-                    "success": True,
-                    "record_count": len(
-                        file_result["records"]
+                    "file_type": file_result.get(
+                        "file_type",
+                        ""
                     ),
+                    "status": "success",
+                    "success": True,
+                    "record_count": file_result.get(
+                        "record_count",
+                        len(file_result["records"])
+                    ),
+                    "message": "",
                 }
             )
 
@@ -413,7 +486,16 @@ def build_combined_dataset(uploaded_files):
             file_reports.append(
                 {
                     "name": uploaded_file.name,
+                    "file_type": file_result.get(
+                        "file_type",
+                        ""
+                    ),
+                    "status": file_result.get(
+                        "status",
+                        "failed"
+                    ),
                     "success": False,
+                    "record_count": 0,
                     "message": file_result.get(
                         "message",
                         "Unknown error"
@@ -532,20 +614,143 @@ def _render_assistant_message(text):
 
 
 # ============================================================
+# UPLOAD FINGERPRINT
+#
+# A deterministic, CONTENT-based fingerprint for the current set
+# of uploaded files. This - not the filename list - is what
+# decides whether the (expensive) import/canonicalization/engine-
+# construction work needs to run again.
+# ============================================================
+
+def compute_upload_fingerprint(uploaded_files):
+
+    """
+    Hashes each file's normalized filename + actual bytes with
+    SHA-256, then combines the per-file hashes in SORTED order.
+
+    This means the fingerprint:
+      - changes if any file's bytes change
+      - changes if a file is added or removed
+      - changes if a file is replaced by a different one under
+        the same name
+      - does NOT change merely because the same files were
+        selected/uploaded in a different order
+    """
+
+    per_file_hashes = []
+
+    for uploaded_file in uploaded_files:
+
+        normalized_name = (
+            uploaded_file.name
+            .strip()
+            .lower()
+        )
+
+        content = uploaded_file.getvalue()
+
+        file_hash = hashlib.sha256()
+
+        file_hash.update(
+            normalized_name.encode("utf-8")
+        )
+
+        file_hash.update(
+            b"\x00"
+        )
+
+        file_hash.update(
+            content
+        )
+
+        per_file_hashes.append(
+            file_hash.hexdigest()
+        )
+
+    # Order-invariant: sort so upload ORDER never affects the
+    # final fingerprint, only the underlying set of files.
+    per_file_hashes.sort()
+
+    combined_hash = hashlib.sha256()
+
+    for file_hash_hex in per_file_hashes:
+
+        combined_hash.update(
+            file_hash_hex.encode("utf-8")
+        )
+
+    return combined_hash.hexdigest()
+
+
+# ============================================================
 # PROCESS UPLOAD
 # ============================================================
 
 if uploaded_files:
 
-    current_file_names = [
-        uploaded_file.name
-        for uploaded_file in uploaded_files
-    ]
-
-    if (
-        st.session_state.file_names
-        != current_file_names
+    with st.spinner(
+        "Checking uploaded files..."
     ):
+
+        current_fingerprint = compute_upload_fingerprint(
+            uploaded_files
+        )
+
+    fingerprint_unchanged = (
+        st.session_state.upload_fingerprint
+        == current_fingerprint
+    )
+
+    if fingerprint_unchanged and (
+        st.session_state.nlp is not None
+    ):
+
+        # ------------------------------------------------------
+        # SAME CONTENT AS LAST TIME - reuse the existing session
+        # knowledge base. No import, no CanonicalEventMatcher
+        # rebuild, no QueryEngine/NLP rebuild, no FacultyAIChatbot
+        # rebuild.
+        # ------------------------------------------------------
+
+        duration = (
+            st.session_state.build_duration_seconds
+        )
+
+        duration_text = (
+            f"{duration:.2f}s"
+            if duration is not None
+            else "an earlier run"
+        )
+
+        st.info(
+            "🔁 Reused existing timetable knowledge base "
+            "(these exact files were already processed in "
+            f"{duration_text})."
+        )
+
+    elif fingerprint_unchanged and (
+        st.session_state.build_error
+    ):
+
+        # Same failing file set as last time - don't re-run the
+        # same expensive, doomed import again.
+
+        st.error(
+            st.session_state.build_error
+        )
+
+    else:
+
+        # ------------------------------------------------------
+        # NEW/CHANGED CONTENT - rebuild exactly once.
+        # ------------------------------------------------------
+
+        current_file_names = [
+            uploaded_file.name
+            for uploaded_file in uploaded_files
+        ]
+
+        build_start = time.perf_counter()
 
         with st.spinner(
             f"Processing {len(uploaded_files)} "
@@ -556,8 +761,48 @@ if uploaded_files:
                 uploaded_files
             )
 
+        build_duration = (
+            time.perf_counter()
+            - build_start
+        )
 
-        if result["success"]:
+        file_reports = result.get(
+            "file_reports",
+            []
+        )
+
+        successful_reports = [
+            report
+            for report in file_reports
+            if report.get("status") == "success"
+        ]
+
+        needs_attention_reports = [
+            report
+            for report in file_reports
+            if report.get("status") != "success"
+        ]
+
+        st.session_state.upload_fingerprint = (
+            current_fingerprint
+        )
+
+        st.session_state.file_reports = (
+            file_reports
+        )
+
+        st.session_state.build_duration_seconds = (
+            build_duration
+        )
+
+
+        if successful_reports:
+
+            # ------------------------------------------------
+            # AT LEAST ONE FILE PRODUCED RECORDS - continue with
+            # the valid dataset, clearly warning about any
+            # zero-record/failed files.
+            # ------------------------------------------------
 
             st.session_state.records = (
                 result["records"]
@@ -579,10 +824,12 @@ if uploaded_files:
                 current_file_names
             )
 
+            st.session_state.build_error = None
+
             st.session_state.messages = []
 
 
-            # ------------------------------------------------
+            # --------------------------------------------------
             # FULL UNISCHED AI ENGINE
             #
             # Reuses the SAME CanonicalEventMatcher just built
@@ -594,7 +841,7 @@ if uploaded_files:
             # in the web UI, on top of the same canonical
             # dataset the read-only timetable queries already
             # use.
-            # ------------------------------------------------
+            # --------------------------------------------------
 
             try:
 
@@ -609,120 +856,43 @@ if uploaded_files:
                 # Read-only timetable queries
                 # (st.session_state.nlp) still work even if the
                 # richer engine fails to build - see the
-                # DATASET STATUS / chat sections below.
+                # ENGINE STATUS / chat sections below.
                 st.session_state.chatbot = None
 
                 st.session_state.chatbot_error = str(e)
 
 
-            st.success(
-                f"Successfully loaded "
-                f"{len(current_file_names)} file(s): "
-                + ", ".join(current_file_names)
-            )
+            # --------------------------------------------------
+            # TRUTHFUL top-line status
+            # --------------------------------------------------
 
+            total_count = len(file_reports)
+            success_count = len(successful_reports)
+            attention_count = len(needs_attention_reports)
 
-            # ------------------------------------------------
-            # Per-file import report
-            # ------------------------------------------------
+            if attention_count == 0:
 
-            file_reports = result.get(
-                "file_reports",
-                []
-            )
+                st.success(
+                    f"{total_count} file(s) uploaded — all "
+                    f"processed successfully in "
+                    f"{build_duration:.2f}s."
+                )
 
-            failed_reports = [
-                report
-                for report in file_reports
-                if not report["success"]
-            ]
-
-            with st.expander(
-                f"📄 File details "
-                f"({len(file_reports)} uploaded)"
-            ):
-
-                for report in file_reports:
-
-                    if report["success"]:
-
-                        st.write(
-                            f"✅ **{report['name']}** — "
-                            f"{report['record_count']} "
-                            f"record(s) imported"
-                        )
-
-                    else:
-
-                        st.write(
-                            f"❌ **{report['name']}** — "
-                            f"{report['message']}"
-                        )
-
-            if failed_reports:
+            else:
 
                 st.warning(
-                    f"{len(failed_reports)} of "
-                    f"{len(file_reports)} file(s) could "
-                    f"not be imported. See file details "
-                    f"above."
+                    f"{total_count} file(s) uploaded — "
+                    f"{success_count} processed successfully — "
+                    f"{attention_count} need attention (see "
+                    f"file details below). Continuing with the "
+                    f"{success_count} valid file(s). Built in "
+                    f"{build_duration:.2f}s."
                 )
 
 
-            # ------------------------------------------------
-            # Statistics
-            # ------------------------------------------------
-
-            matcher = (
-                st.session_state.matcher
-            )
-
-            col1, col2, col3, col4 = st.columns(4)
-
-
-            with col1:
-
-                st.metric(
-                    "Imported Records",
-                    len(
-                        st.session_state.records
-                    )
-                )
-
-
-            with col2:
-
-                st.metric(
-                    "Canonical Events",
-                    len(
-                        matcher.events
-                    )
-                )
-
-
-            with col3:
-
-                st.metric(
-                    "Faculty Free Slots",
-                    len(
-                        matcher.faculty_free_slots
-                    )
-                )
-
-
-            with col4:
-
-                st.metric(
-                    "Room Free Slots",
-                    len(
-                        matcher.room_free_slots
-                    )
-                )
-
-
-            # ------------------------------------------------
+            # --------------------------------------------------
             # Warnings
-            # ------------------------------------------------
+            # --------------------------------------------------
 
             warnings = result.get(
                 "warnings",
@@ -744,49 +914,128 @@ if uploaded_files:
 
         else:
 
-            st.error(
-                "❌ File processing failed"
+            # ------------------------------------------------
+            # ALL FILES RETURNED ZERO RECORDS - do not build a
+            # fake/empty chatbot or engine. Show a clear error.
+            # ------------------------------------------------
+
+            st.session_state.records = []
+
+            st.session_state.matcher = None
+
+            st.session_state.engine = None
+
+            st.session_state.nlp = None
+
+            st.session_state.chatbot = None
+
+            st.session_state.chatbot_error = None
+
+            st.session_state.file_names = []
+
+            st.session_state.messages = []
+
+            error_message = (
+                f"{len(current_file_names)} file(s) uploaded — "
+                f"0 produced any timetable records. See file "
+                f"details below."
+            )
+
+            st.session_state.build_error = (
+                error_message
             )
 
             st.error(
-                result.get(
-                    "message",
-                    "Unknown error"
-                )
+                error_message
             )
-
-            file_reports = result.get(
-                "file_reports",
-                []
-            )
-
-            if file_reports:
-
-                with st.expander(
-                    "📄 File details"
-                ):
-
-                    for report in file_reports:
-
-                        if report["success"]:
-
-                            st.write(
-                                f"✅ **{report['name']}** — "
-                                f"{report['record_count']} "
-                                f"record(s) imported"
-                            )
-
-                        else:
-
-                            st.write(
-                                f"❌ **{report['name']}** — "
-                                f"{report['message']}"
-                            )
 
 
 # ============================================================
 # DATASET STATUS
+#
+# Always rendered from st.session_state (not just right after
+# upload), so per-file status and dataset stats stay visible on
+# every rerun - including while chatting, when the fingerprint
+# is unchanged and nothing was rebuilt.
 # ============================================================
+
+if st.session_state.file_reports:
+
+    st.markdown("---")
+
+    total_count = len(
+        st.session_state.file_reports
+    )
+
+    success_count = sum(
+        1
+        for report in st.session_state.file_reports
+        if report.get("status") == "success"
+    )
+
+    attention_count = (
+        total_count
+        - success_count
+    )
+
+    expander_title = (
+        f"📄 File details ({total_count} uploaded — "
+        f"{success_count} processed successfully"
+    )
+
+    if attention_count:
+
+        expander_title += (
+            f" — {attention_count} need attention)"
+        )
+
+    else:
+
+        expander_title += ")"
+
+    with st.expander(
+        expander_title,
+        expanded=bool(attention_count)
+    ):
+
+        for report in st.session_state.file_reports:
+
+            file_type_text = (
+                report.get("file_type")
+                or "unknown"
+            ).upper()
+
+            status = report.get(
+                "status",
+                "failed"
+            )
+
+            if status == "success":
+
+                st.write(
+                    f"✅ **{report['name']}** "
+                    f"({file_type_text}) — "
+                    f"{report['record_count']} "
+                    f"record(s) imported"
+                )
+
+            elif status == "zero_records":
+
+                st.write(
+                    f"⚠️ **{report['name']}** "
+                    f"({file_type_text}) — "
+                    f"0 records — "
+                    f"{report.get('message', '')}"
+                )
+
+            else:
+
+                st.write(
+                    f"❌ **{report['name']}** "
+                    f"({file_type_text}) — "
+                    f"{report.get('message', 'Unknown error')}"
+                )
+
 
 if st.session_state.nlp:
 
@@ -804,39 +1053,73 @@ if st.session_state.nlp:
         st.session_state.matcher
     )
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4, col5 = st.columns(5)
 
     with col1:
 
-        st.write(
-            f"**Files ({len(st.session_state.file_names)}):**"
+        st.metric(
+            "Files",
+            len(
+                st.session_state.file_names
+            )
         )
+
+    with col2:
+
+        st.metric(
+            "Imported Records",
+            len(
+                records
+            )
+        )
+
+    with col3:
+
+        st.metric(
+            "Canonical Events",
+            len(
+                matcher.events
+            )
+        )
+
+    with col4:
+
+        st.metric(
+            "Faculty Free Slots",
+            len(
+                matcher.faculty_free_slots
+            )
+        )
+
+    with col5:
+
+        st.metric(
+            "Room Free Slots",
+            len(
+                matcher.room_free_slots
+            )
+        )
+
+    if (
+        len(matcher.room_free_slots) == 0
+        and len(matcher.faculty_free_slots) == 0
+    ):
+
+        st.info(
+            "The uploaded data does not contain enough "
+            "information to infer free slots. Timetable search "
+            "and other questions may still work."
+        )
+
+    with st.expander(
+        f"**Files ({len(st.session_state.file_names)}):**"
+    ):
 
         for file_name in st.session_state.file_names:
 
             st.write(
                 f"- {file_name}"
             )
-
-    with col2:
-
-        st.write(
-            "**Records:**"
-        )
-
-        st.write(
-            len(records)
-        )
-
-    with col3:
-
-        st.write(
-            "**Scheduled Events:**"
-        )
-
-        st.write(
-            len(matcher.events)
-        )
 
 
 # ============================================================

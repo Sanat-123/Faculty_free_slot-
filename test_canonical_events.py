@@ -25,6 +25,7 @@ Tests the complete pipeline:
 """
 
 from pathlib import Path
+import sys
 
 from import_engine.import_manager import ImportManager
 from data_engine.canonical_event_matcher import CanonicalEventMatcher
@@ -57,666 +58,437 @@ FILES = [
 
 ]
 
-
-# =============================================================
-# HEADER
-# =============================================================
-
-print("=" * 80)
-
-print(
-    "UNISCHED AI - REAL CANONICAL EVENT TEST"
-)
-
-print("=" * 80)
-
-print()
+def main() -> int:
+    """
+    Runs the full real-data canonical-event pipeline test and
+    returns a process-style exit code (0 = completed, 1 = no
+    records were imported at all). Never calls sys.exit()/
+    raises SystemExit itself, so it is safe to call from a
+    pytest test function as well as from the __main__ guard
+    below - see test_canonical_events_pipeline().
+    """
 
 
-# =============================================================
-# IMPORT MANAGER
-# =============================================================
+    # =============================================================
+    # HEADER
+    # =============================================================
 
-manager = ImportManager()
-
-
-all_records = []
-
-successful_files = []
-
-
-# =============================================================
-# IMPORT ALL FILES
-# =============================================================
-
-for filename in FILES:
+    print("=" * 80)
 
     print(
-        f"IMPORTING: {filename}"
+        "UNISCHED AI - REAL CANONICAL EVENT TEST"
     )
 
-    file_path = DATA_DIR / filename
+    print("=" * 80)
 
-    # ---------------------------------------------------------
-    # Check file
-    # ---------------------------------------------------------
+    print()
 
-    if not file_path.exists():
+
+    # =============================================================
+    # IMPORT MANAGER
+    # =============================================================
+
+    manager = ImportManager()
+
+
+    all_records = []
+
+    successful_files = []
+
+
+    # =============================================================
+    # IMPORT ALL FILES
+    # =============================================================
+
+    for filename in FILES:
 
         print(
-            f"ERROR: File not found: {file_path}"
+            f"IMPORTING: {filename}"
         )
 
-        print()
+        file_path = DATA_DIR / filename
 
-        continue
+        # ---------------------------------------------------------
+        # Check file
+        # ---------------------------------------------------------
 
-    try:
-
-        # -----------------------------------------------------
-        # ImportManager supports:
-        #
-        # import_file(filename, file_path)
-        #
-        # The exact signature used by the project is handled
-        # below.
-        # -----------------------------------------------------
-
-        try:
-
-            result = manager.import_file(
-                filename,
-                str(file_path)
-            )
-
-        except TypeError:
-
-            # Fallback for ImportManager implementations
-            # that accept only file_path.
-
-            result = manager.import_file(
-                str(file_path)
-            )
-
-        # -----------------------------------------------------
-        # Result should be a dictionary
-        # -----------------------------------------------------
-
-        if not isinstance(
-            result,
-            dict
-        ):
+        if not file_path.exists():
 
             print(
-                "ERROR: Import Manager returned an unexpected result."
-            )
-
-            print(
-                "Returned type:",
-                type(result)
+                f"ERROR: File not found: {file_path}"
             )
 
             print()
 
             continue
 
-        # -----------------------------------------------------
-        # Check success
-        # -----------------------------------------------------
+        try:
 
-        status = result.get(
-            "status",
-            "SUCCESS"
-        )
+            # -----------------------------------------------------
+            # ImportManager supports:
+            #
+            # import_file(filename, file_path)
+            #
+            # The exact signature used by the project is handled
+            # below.
+            # -----------------------------------------------------
 
-        if str(status).upper() not in {
-            "SUCCESS",
-            "OK",
-        }:
+            try:
+
+                result = manager.import_file(
+                    filename,
+                    str(file_path)
+                )
+
+            except TypeError:
+
+                # Fallback for ImportManager implementations
+                # that accept only file_path.
+
+                result = manager.import_file(
+                    str(file_path)
+                )
+
+            # -----------------------------------------------------
+            # Result should be a dictionary
+            # -----------------------------------------------------
+
+            if not isinstance(
+                result,
+                dict
+            ):
+
+                print(
+                    "ERROR: Import Manager returned an unexpected result."
+                )
+
+                print(
+                    "Returned type:",
+                    type(result)
+                )
+
+                print()
+
+                continue
+
+            # -----------------------------------------------------
+            # Check success
+            # -----------------------------------------------------
+
+            status = result.get(
+                "status",
+                "SUCCESS"
+            )
+
+            if str(status).upper() not in {
+                "SUCCESS",
+                "OK",
+            }:
+
+                print(
+                    "FAILED"
+                )
+
+                print(
+                    "Status:",
+                    status
+                )
+
+                print(
+                    "Error:",
+                    result.get(
+                        "error"
+                    )
+                )
+
+                print()
+
+                continue
+
+            # -----------------------------------------------------
+            # Get records
+            # -----------------------------------------------------
+
+            records = result.get(
+                "records",
+                []
+            )
+
+            if records is None:
+
+                records = []
+
+            # -----------------------------------------------------
+            # Some ImportManager implementations may return
+            # imported_data instead of records.
+            # -----------------------------------------------------
+
+            if not records:
+
+                records = result.get(
+                    "imported_records",
+                    []
+                )
+
+            # -----------------------------------------------------
+            # Add source information if missing
+            # -----------------------------------------------------
+
+            cleaned_records = []
+
+            for record in records:
+
+                if not isinstance(
+                    record,
+                    dict
+                ):
+
+                    continue
+
+                record = dict(
+                    record
+                )
+
+                if not record.get(
+                    "source_file"
+                ):
+
+                    record[
+                        "source_file"
+                    ] = filename
+
+                if not record.get(
+                    "source_type"
+                ):
+
+                    record[
+                        "source_type"
+                    ] = file_path.suffix.lower().replace(
+                        ".",
+                        ""
+                    )
+
+                cleaned_records.append(
+                    record
+                )
+
+            # -----------------------------------------------------
+            # Add to global list
+            # -----------------------------------------------------
+
+            all_records.extend(
+                cleaned_records
+            )
+
+            successful_files.append(
+                filename
+            )
+
+            print(
+                f"SUCCESS: {len(cleaned_records)}"
+            )
+
+        except Exception as exc:
 
             print(
                 "FAILED"
             )
 
             print(
-                "Status:",
-                status
-            )
-
-            print(
                 "Error:",
-                result.get(
-                    "error"
-                )
+                type(exc).__name__,
+                str(exc)
             )
 
-            print()
+        print()
 
-            continue
 
-        # -----------------------------------------------------
-        # Get records
-        # -----------------------------------------------------
+    # =============================================================
+    # TOTAL IMPORTED RECORDS
+    # =============================================================
 
-        records = result.get(
-            "records",
-            []
-        )
+    print("=" * 80)
 
-        if records is None:
+    print(
+        f"TOTAL IMPORTED RECORDS: {len(all_records)}"
+    )
 
-            records = []
+    print("=" * 80)
 
-        # -----------------------------------------------------
-        # Some ImportManager implementations may return
-        # imported_data instead of records.
-        # -----------------------------------------------------
+    print()
 
-        if not records:
 
-            records = result.get(
-                "imported_records",
-                []
-            )
+    # =============================================================
+    # STOP IF NOTHING IMPORTED
+    # =============================================================
 
-        # -----------------------------------------------------
-        # Add source information if missing
-        # -----------------------------------------------------
+    if not all_records:
 
-        cleaned_records = []
-
-        for record in records:
-
-            if not isinstance(
-                record,
-                dict
-            ):
-
-                continue
-
-            record = dict(
-                record
-            )
-
-            if not record.get(
-                "source_file"
-            ):
-
-                record[
-                    "source_file"
-                ] = filename
-
-            if not record.get(
-                "source_type"
-            ):
-
-                record[
-                    "source_type"
-                ] = file_path.suffix.lower().replace(
-                    ".",
-                    ""
-                )
-
-            cleaned_records.append(
-                record
-            )
-
-        # -----------------------------------------------------
-        # Add to global list
-        # -----------------------------------------------------
-
-        all_records.extend(
-            cleaned_records
-        )
-
-        successful_files.append(
-            filename
+        print(
+            "ERROR: No records were imported."
         )
 
         print(
-            f"SUCCESS: {len(cleaned_records)}"
+            "Check your ImportManager and dataset paths."
         )
 
-    except Exception as exc:
+        return 1
+
+
+    # =============================================================
+    # CANONICAL MATCHER
+    # =============================================================
+
+    matcher = CanonicalEventMatcher(
+        all_records
+    )
+
+
+    # =============================================================
+    # MATCH
+    # =============================================================
+
+    canonical_events = matcher.match()
+
+
+    # =============================================================
+    # SUMMARY
+    # =============================================================
+
+    summary = matcher.summary()
+
+
+    print("=" * 80)
+
+    print(
+        "CANONICAL DATA SUMMARY"
+    )
+
+    print("=" * 80)
+
+    print()
+
+    print(
+        "Canonical timetable events:",
+        summary[
+            "canonical_events"
+        ]
+    )
+
+    print(
+        "Faculty free slots:",
+        summary[
+            "faculty_free_slots"
+        ]
+    )
+
+    print(
+        "Class free slots:",
+        summary[
+            "class_free_slots"
+        ]
+    )
+
+    print(
+        "Room free slots:",
+        summary[
+            "room_free_slots"
+        ]
+    )
+
+    print(
+        "Contract records:",
+        summary[
+            "contract_records"
+        ]
+    )
+
+    print(
+        "Unmatched records:",
+        summary[
+            "unmatched_records"
+        ]
+    )
+
+    print(
+        "Matched groups:",
+        summary[
+            "matched_groups"
+        ]
+    )
+
+    print(
+        "Multi-source events:",
+        summary[
+            "multi_source_events"
+        ]
+    )
+
+    print(
+        "Conflict events:",
+        summary[
+            "conflict_events"
+        ]
+    )
+
+    print()
+
+
+    # =============================================================
+    # FILE-WISE INFORMATION
+    # =============================================================
+
+    print("=" * 80)
+
+    print(
+        "SUCCESSFULLY IMPORTED FILES"
+    )
+
+    print("=" * 80)
+
+    print()
+
+    for filename in successful_files:
 
         print(
-            "FAILED"
-        )
-
-        print(
-            "Error:",
-            type(exc).__name__,
-            str(exc)
+            f"✓ {filename}"
         )
 
     print()
 
 
-# =============================================================
-# TOTAL IMPORTED RECORDS
-# =============================================================
+    # =============================================================
+    # FREE SLOT SAMPLE
+    # =============================================================
 
-print("=" * 80)
-
-print(
-    f"TOTAL IMPORTED RECORDS: {len(all_records)}"
-)
-
-print("=" * 80)
-
-print()
-
-
-# =============================================================
-# STOP IF NOTHING IMPORTED
-# =============================================================
-
-if not all_records:
-
-    print(
-        "ERROR: No records were imported."
+    free_slots = (
+        matcher.get_faculty_free_slots()
     )
 
-    print(
-        "Check your ImportManager and dataset paths."
-    )
 
-    raise SystemExit(1)
-
-
-# =============================================================
-# CANONICAL MATCHER
-# =============================================================
-
-matcher = CanonicalEventMatcher(
-    all_records
-)
-
-
-# =============================================================
-# MATCH
-# =============================================================
-
-canonical_events = matcher.match()
-
-
-# =============================================================
-# SUMMARY
-# =============================================================
-
-summary = matcher.summary()
-
-
-print("=" * 80)
-
-print(
-    "CANONICAL DATA SUMMARY"
-)
-
-print("=" * 80)
-
-print()
-
-print(
-    "Canonical timetable events:",
-    summary[
-        "canonical_events"
-    ]
-)
-
-print(
-    "Faculty free slots:",
-    summary[
-        "faculty_free_slots"
-    ]
-)
-
-print(
-    "Class free slots:",
-    summary[
-        "class_free_slots"
-    ]
-)
-
-print(
-    "Room free slots:",
-    summary[
-        "room_free_slots"
-    ]
-)
-
-print(
-    "Contract records:",
-    summary[
-        "contract_records"
-    ]
-)
-
-print(
-    "Unmatched records:",
-    summary[
-        "unmatched_records"
-    ]
-)
-
-print(
-    "Matched groups:",
-    summary[
-        "matched_groups"
-    ]
-)
-
-print(
-    "Multi-source events:",
-    summary[
-        "multi_source_events"
-    ]
-)
-
-print(
-    "Conflict events:",
-    summary[
-        "conflict_events"
-    ]
-)
-
-print()
-
-
-# =============================================================
-# FILE-WISE INFORMATION
-# =============================================================
-
-print("=" * 80)
-
-print(
-    "SUCCESSFULLY IMPORTED FILES"
-)
-
-print("=" * 80)
-
-print()
-
-for filename in successful_files:
+    print("=" * 80)
 
     print(
-        f"✓ {filename}"
+        "FACULTY FREE SLOT SAMPLE"
     )
 
-print()
-
-
-# =============================================================
-# FREE SLOT SAMPLE
-# =============================================================
-
-free_slots = (
-    matcher.get_faculty_free_slots()
-)
-
-
-print("=" * 80)
-
-print(
-    "FACULTY FREE SLOT SAMPLE"
-)
-
-print("=" * 80)
-
-print()
-
-
-for index, record in enumerate(
-    free_slots[:10],
-    start=1
-):
-
-    print(
-        f"FREE SLOT {index}"
-    )
-
-    print(
-        "Teacher:",
-        record.get(
-            "teacher",
-            ""
-        )
-    )
-
-    print(
-        "Day:",
-        record.get(
-            "day",
-            ""
-        )
-    )
-
-    print(
-        "Slot:",
-        record.get(
-            "slot"
-        )
-    )
-
-    print(
-        "Time:",
-        record.get(
-            "slot_time",
-            ""
-        )
-    )
-
-    print(
-        "Source:",
-        record.get(
-            "source_file",
-            ""
-        )
-    )
+    print("=" * 80)
 
     print()
 
 
-# =============================================================
-# CANONICAL EVENT SAMPLE
-# =============================================================
-
-print("=" * 80)
-
-print(
-    "CANONICAL EVENT SAMPLE"
-)
-
-print("=" * 80)
-
-print()
-
-
-for index, event in enumerate(
-    canonical_events[:10],
-    start=1
-):
-
-    print(
-        f"EVENT {index}"
-    )
-
-    print(
-        "Teacher:",
-        event.get(
-            "teacher",
-            ""
-        )
-    )
-
-    print(
-        "Day:",
-        event.get(
-            "day",
-            ""
-        )
-    )
-
-    print(
-        "Slot:",
-        event.get(
-            "slot"
-        )
-    )
-
-    print(
-        "Time:",
-        event.get(
-            "slot_time",
-            ""
-        )
-    )
-
-    print(
-        "Subject:",
-        event.get(
-            "subject",
-            ""
-        )
-    )
-
-    print(
-        "Room:",
-        event.get(
-            "room",
-            ""
-        )
-    )
-
-    print(
-        "Class:",
-        event.get(
-            "class_name",
-            ""
-        )
-    )
-
-    print(
-        "Sources:",
-        event.get(
-            "sources",
-            []
-        )
-    )
-
-    print()
-
-
-# =============================================================
-# CONTRACT SAMPLE
-# =============================================================
-
-contracts = (
-    matcher.get_contract_records()
-)
-
-
-print("=" * 80)
-
-print(
-    "CONTRACT RECORD SAMPLE"
-)
-
-print("=" * 80)
-
-print()
-
-
-for index, record in enumerate(
-    contracts[:5],
-    start=1
-):
-
-    print(
-        f"CONTRACT {index}"
-    )
-
-    print(
-        "Teacher:",
-        record.get(
-            "teacher",
-            ""
-        )
-    )
-
-    print(
-        "Subject:",
-        record.get(
-            "subject",
-            ""
-        )
-    )
-
-    print(
-        "Class:",
-        record.get(
-            "class_name",
-            ""
-        )
-    )
-
-    print(
-        "Group:",
-        record.get(
-            "group_name",
-            ""
-        )
-    )
-
-    print(
-        "Room:",
-        record.get(
-            "room",
-            ""
-        )
-    )
-
-    print()
-
-
-# =============================================================
-# CONFLICT SAMPLE
-# =============================================================
-
-conflicts = matcher.conflicts
-
-
-print("=" * 80)
-
-print(
-    "CONFLICT SAMPLE"
-)
-
-print("=" * 80)
-
-print()
-
-
-if not conflicts:
-
-    print(
-        "No conflicts detected."
-    )
-
-else:
-
-    for index, conflict in enumerate(
-        conflicts[:10],
+    for index, record in enumerate(
+        free_slots[:10],
         start=1
     ):
 
         print(
-            f"CONFLICT {index}"
+            f"FREE SLOT {index}"
         )
 
         print(
             "Teacher:",
-            conflict.get(
+            record.get(
                 "teacher",
                 ""
             )
@@ -724,7 +496,7 @@ else:
 
         print(
             "Day:",
-            conflict.get(
+            record.get(
                 "day",
                 ""
             )
@@ -732,14 +504,88 @@ else:
 
         print(
             "Slot:",
-            conflict.get(
+            record.get(
                 "slot"
             )
         )
 
         print(
+            "Time:",
+            record.get(
+                "slot_time",
+                ""
+            )
+        )
+
+        print(
+            "Source:",
+            record.get(
+                "source_file",
+                ""
+            )
+        )
+
+        print()
+
+
+    # =============================================================
+    # CANONICAL EVENT SAMPLE
+    # =============================================================
+
+    print("=" * 80)
+
+    print(
+        "CANONICAL EVENT SAMPLE"
+    )
+
+    print("=" * 80)
+
+    print()
+
+
+    for index, event in enumerate(
+        canonical_events[:10],
+        start=1
+    ):
+
+        print(
+            f"EVENT {index}"
+        )
+
+        print(
+            "Teacher:",
+            event.get(
+                "teacher",
+                ""
+            )
+        )
+
+        print(
+            "Day:",
+            event.get(
+                "day",
+                ""
+            )
+        )
+
+        print(
+            "Slot:",
+            event.get(
+                "slot"
+            )
+        )
+
+        print(
+            "Time:",
+            event.get(
+                "slot_time",
+                ""
+            )
+        )
+
+        print(
             "Subject:",
-            conflict.get(
+            event.get(
                 "subject",
                 ""
             )
@@ -747,7 +593,7 @@ else:
 
         print(
             "Room:",
-            conflict.get(
+            event.get(
                 "room",
                 ""
             )
@@ -755,16 +601,16 @@ else:
 
         print(
             "Class:",
-            conflict.get(
+            event.get(
                 "class_name",
                 ""
             )
         )
 
         print(
-            "Conflicts:",
-            conflict.get(
-                "conflicts",
+            "Sources:",
+            event.get(
+                "sources",
                 []
             )
         )
@@ -772,44 +618,231 @@ else:
         print()
 
 
-# =============================================================
-# FINAL RESULT
-# =============================================================
+    # =============================================================
+    # CONTRACT SAMPLE
+    # =============================================================
 
-print("=" * 80)
+    contracts = (
+        matcher.get_contract_records()
+    )
 
-print(
-    "CANONICAL EVENT TEST COMPLETED"
-)
 
-print("=" * 80)
+    print("=" * 80)
 
-print()
+    print(
+        "CONTRACT RECORD SAMPLE"
+    )
 
-print(
-    f"Imported records : {len(all_records)}"
-)
+    print("=" * 80)
 
-print(
-    f"Canonical events : {len(canonical_events)}"
-)
+    print()
 
-print(
-    f"Faculty free     : {len(free_slots)}"
-)
 
-print(
-    f"Contracts        : {len(contracts)}"
-)
+    for index, record in enumerate(
+        contracts[:5],
+        start=1
+    ):
 
-print(
-    f"Unmatched        : {len(matcher.get_unmatched_records())}"
-)
+        print(
+            f"CONTRACT {index}"
+        )
 
-print()
+        print(
+            "Teacher:",
+            record.get(
+                "teacher",
+                ""
+            )
+        )
 
-print(
-    "UNISCHED AI CANONICAL MATCHER TEST FINISHED."
-)
+        print(
+            "Subject:",
+            record.get(
+                "subject",
+                ""
+            )
+        )
 
-print("=" * 80)
+        print(
+            "Class:",
+            record.get(
+                "class_name",
+                ""
+            )
+        )
+
+        print(
+            "Group:",
+            record.get(
+                "group_name",
+                ""
+            )
+        )
+
+        print(
+            "Room:",
+            record.get(
+                "room",
+                ""
+            )
+        )
+
+        print()
+
+
+    # =============================================================
+    # CONFLICT SAMPLE
+    # =============================================================
+
+    conflicts = matcher.conflicts
+
+
+    print("=" * 80)
+
+    print(
+        "CONFLICT SAMPLE"
+    )
+
+    print("=" * 80)
+
+    print()
+
+
+    if not conflicts:
+
+        print(
+            "No conflicts detected."
+        )
+
+    else:
+
+        for index, conflict in enumerate(
+            conflicts[:10],
+            start=1
+        ):
+
+            print(
+                f"CONFLICT {index}"
+            )
+
+            print(
+                "Teacher:",
+                conflict.get(
+                    "teacher",
+                    ""
+                )
+            )
+
+            print(
+                "Day:",
+                conflict.get(
+                    "day",
+                    ""
+                )
+            )
+
+            print(
+                "Slot:",
+                conflict.get(
+                    "slot"
+                )
+            )
+
+            print(
+                "Subject:",
+                conflict.get(
+                    "subject",
+                    ""
+                )
+            )
+
+            print(
+                "Room:",
+                conflict.get(
+                    "room",
+                    ""
+                )
+            )
+
+            print(
+                "Class:",
+                conflict.get(
+                    "class_name",
+                    ""
+                )
+            )
+
+            print(
+                "Conflicts:",
+                conflict.get(
+                    "conflicts",
+                    []
+                )
+            )
+
+            print()
+
+
+    # =============================================================
+    # FINAL RESULT
+    # =============================================================
+
+    print("=" * 80)
+
+    print(
+        "CANONICAL EVENT TEST COMPLETED"
+    )
+
+    print("=" * 80)
+
+    print()
+
+    print(
+        f"Imported records : {len(all_records)}"
+    )
+
+    print(
+        f"Canonical events : {len(canonical_events)}"
+    )
+
+    print(
+        f"Faculty free     : {len(free_slots)}"
+    )
+
+    print(
+        f"Contracts        : {len(contracts)}"
+    )
+
+    print(
+        f"Unmatched        : {len(matcher.get_unmatched_records())}"
+    )
+
+    print()
+
+    print(
+        "UNISCHED AI CANONICAL MATCHER TEST FINISHED."
+    )
+
+    print("=" * 80)
+
+    return 0
+
+
+def test_canonical_events_pipeline():
+    """
+    Pytest entry point. Runs the exact same real-data
+    canonical-event pipeline test as
+    `python test_canonical_events.py` (via main()) and asserts
+    it completed successfully. main() never raises SystemExit,
+    so this behaves as a normal pytest test rather than
+    aborting the test process.
+    """
+
+    exit_code = main()
+
+    assert exit_code == 0, "canonical-event pipeline test failed "\
+        "(see printed output above for details)"
+
+
+if __name__ == "__main__":
+    sys.exit(main())

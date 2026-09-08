@@ -639,12 +639,82 @@ class PDFImporter:
     # ==========================================================
 
     @staticmethod
+    def _looks_like_clock_time(
+        value: str
+    ) -> bool:
+
+        """
+        True if `value` is, in its entirety, a clock-time token
+        such as "9:00", "12:45", "08:15" - H:MM or HH:MM, minutes
+        00-59. This is a purely FORMAT-based check (never a list
+        of specific times) so it generalizes to any uploaded
+        timetable: a token is excluded because it IS shaped like
+        a time, not because it matches some particular observed
+        value.
+
+        A real room code that happens to use a colon (e.g.
+        "7F:CP7", "7F:EE-Lab13") always has letters on at least
+        one side of the colon, so it never matches this pattern -
+        only a genuinely all-digits "H:MM" token does.
+        """
+
+        return bool(
+            re.fullmatch(
+                r"\d{1,2}:[0-5]\d",
+                value.strip()
+            )
+        )
+
+    @classmethod
     def detect_room(
+        cls,
         text: str
     ) -> str:
 
         if not text:
             return ""
+
+        # ------------------------------------------------------
+        # Strip clock-time RANGES ("8:00 - 10:00", "12:45-14:45")
+        # before looking for a room at all.
+        #
+        # Several of these PDFs' table cells embed the slot's own
+        # time range directly in the cell text alongside the
+        # actual room (e.g. "8:00 - 10:00 Group 1 A-JAVA Lab/
+        # Spoken-Java CL-13 SN"). The room-candidate regexes below
+        # were never meant to look inside a time range at all -
+        # removing it at the source is more robust than trying to
+        # out-guess it candidate-by-candidate afterwards, and
+        # naturally also prevents a lone leftover time FRAGMENT
+        # (e.g. just the "00" from "10:00") from ever being
+        # extracted as a bare 2-4 digit "room" if no real room is
+        # present in the cell.
+        # ------------------------------------------------------
+
+        text = re.sub(
+            r"\d{1,2}:[0-5]\d\s*-\s*\d{1,2}:[0-5]\d",
+            " ",
+            text
+        )
+
+        # ------------------------------------------------------
+        # Also strip any remaining STANDALONE clock-time token
+        # (not part of a "-" range, e.g. a cell whose only
+        # content is a single time like "9:00"). This has to
+        # happen at the TEXT level, before the extraction regexes
+        # below run, and not only as a candidate-level filter
+        # afterwards - otherwise the bare 2-4 digit pattern could
+        # still separately pick up a leftover FRAGMENT of the
+        # time (e.g. just the "00" from "9:00") once the full
+        # colon-token is gone from the candidate list but its
+        # digits are still sitting in the text.
+        # ------------------------------------------------------
+
+        text = re.sub(
+            r"\b\d{1,2}:[0-5]\d\b",
+            " ",
+            text
+        )
 
         candidates = []
 
@@ -671,6 +741,19 @@ class PDFImporter:
                 text
             )
         )
+
+        # ------------------------------------------------------
+        # Generic, reusable defensive layer: even after stripping
+        # time RANGES above, never let a candidate through that is
+        # itself, in its entirety, a clock-time token - covers any
+        # lone (non-ranged) time value a source file might embed
+        # in a cell in some other shape.
+        # ------------------------------------------------------
+
+        candidates = [
+            x for x in candidates
+            if not cls._looks_like_clock_time(x)
+        ]
 
         if not candidates:
             return ""
@@ -815,7 +898,8 @@ class PDFImporter:
         source_page: int,
         teacher: str = "",
         class_name: str = "",
-        room: str = ""
+        room: str = "",
+        page_identity_type: str = ""
     ) -> Dict[str, Any]:
 
         """
@@ -828,6 +912,15 @@ class PDFImporter:
         over whatever the same field's cell-text extractor
         would otherwise guess -- the other fields are still
         extracted from the cell text as before.
+
+        `page_identity_type` records WHICH of the three fields
+        (if any) was that page-level identity ("teacher" /
+        "class" / "room" / "" for unknown/not applicable). This
+        is what lets CanonicalEventMatcher.identify_source()
+        classify a record from the ACTUAL PAGE CONTENT that
+        produced it, instead of only guessing from the source
+        filename -- required because the uploaded file may be
+        named anything.
         """
 
         cell_text = (
@@ -965,6 +1058,9 @@ class PDFImporter:
 
             "record_type":
                 record_type,
+
+            "page_identity_type":
+                page_identity_type,
         }
 
     # ==========================================================
@@ -1003,15 +1099,43 @@ class PDFImporter:
         records = []
 
         # --------------------------------------------------
-        # Detect teacher
+        # Detect page identity (teacher / class / room /
+        # unknown) from actual page content - NOT filename.
+        #
+        # Unlike the old teacher-only check this used to be,
+        # a page is no longer skipped just because it isn't a
+        # facultywise page. Classwise and location/room-wise
+        # pages identify themselves differently (a bare class
+        # or room code immediately above the slot-header row -
+        # see detect_page_label_line()), and a page whose
+        # identity can't be determined at all is still parsed
+        # if it has genuine day/slot table structure - it will
+        # simply have blank teacher/class_name/room identity
+        # fields (create_record() never invents a value for a
+        # field that wasn't actually present).
         # --------------------------------------------------
 
-        teacher = cls.detect_teacher(
+        identity_type, identity_value = cls.detect_page_identity(
             page
         )
 
-        if not teacher:
-            return records
+        teacher = (
+            identity_value
+            if identity_type == "teacher"
+            else ""
+        )
+
+        class_name = (
+            identity_value
+            if identity_type == "class"
+            else ""
+        )
+
+        room = (
+            identity_value
+            if identity_type == "room"
+            else ""
+        )
 
         # --------------------------------------------------
         # Extract tables
@@ -1132,33 +1256,31 @@ class PDFImporter:
 
                     # --------------------------------------------------
                     # Create record
+                    #
+                    # create_record() already computes the correct
+                    # record_type ("FACULTY_SCHEDULED" /
+                    # "CLASS_SCHEDULED" / "ROOM_SCHEDULED" /
+                    # "SCHEDULED", and their *_FREE_SLOT
+                    # equivalents) from whichever of
+                    # teacher/class_name/room is non-empty - there
+                    # is no need to (and this must NOT) overwrite
+                    # it afterwards, since doing so would mislabel
+                    # every class/room page's records as
+                    # FACULTY_SCHEDULED/FACULTY_FREE_SLOT.
                     # --------------------------------------------------
 
                     record = cls.create_record(
                         teacher=teacher,
+                        class_name=class_name,
+                        room=room,
                         day=day,
                         slot=slot_info["slot"],
                         slot_time=slot_info["time"],
                         cell_text=cell,
                         source_file=source_file,
-                        source_page=page_number
+                        source_page=page_number,
+                        page_identity_type=identity_type
                     )
-
-                    # --------------------------------------------------
-                    # Explicit record type
-                    # --------------------------------------------------
-
-                    if cell:
-
-                        record["record_type"] = (
-                            "FACULTY_SCHEDULED"
-                        )
-
-                    else:
-
-                        record["record_type"] = (
-                            "FACULTY_FREE_SLOT"
-                        )
 
                     records.append(
                         record
@@ -1264,6 +1386,23 @@ class PDFImporter:
         file_path: str | Path
     ) -> Dict[str, Any]:
 
+        """
+        Diagnostic inspection of a PDF file: reports, per page,
+        the CONTENT-detected identity (teacher / class / room /
+        unknown - see detect_page_identity()) and whether that
+        page produced any records, plus file-level totals.
+
+        This is a standalone diagnostic utility - it is NOT
+        called from ImportManager.import_file()'s normal import
+        path, because it re-opens and re-walks every page/table
+        a second time, roughly doubling PDF processing time for
+        no benefit ImportManager actually uses (see
+        import_engine/import_manager.py). Call it directly when
+        you need the detailed per-page breakdown, e.g. for
+        troubleshooting why a particular file produced fewer
+        records than expected.
+        """
+
         validation = cls.validate_file(
             file_path
         )
@@ -1280,8 +1419,15 @@ class PDFImporter:
 
         pages = 0
         pages_with_teacher = 0
+        pages_with_class = 0
+        pages_with_room = 0
         pages_with_tables = 0
+        pages_with_timetable_structure = 0
         total_records = 0
+        has_day = False
+        has_slot = False
+
+        page_reports: List[Dict[str, Any]] = []
 
         with pdfplumber.open(
             path
@@ -1296,12 +1442,18 @@ class PDFImporter:
                 start=1
             ):
 
-                teacher = cls.detect_teacher(
-                    page
+                identity_type, identity_value = (
+                    cls.detect_page_identity(
+                        page
+                    )
                 )
 
-                if teacher:
+                if identity_type == "teacher":
                     pages_with_teacher += 1
+                elif identity_type == "class":
+                    pages_with_class += 1
+                elif identity_type == "room":
+                    pages_with_room += 1
 
                 tables = cls.extract_tables_from_page(
                     page
@@ -1310,13 +1462,109 @@ class PDFImporter:
                 if tables:
                     pages_with_tables += 1
 
-                total_records += len(
-                    cls.process_page(
-                        page,
-                        page_number,
-                        path.name
-                    )
+                page_records = cls.process_page(
+                    page,
+                    page_number,
+                    path.name
                 )
+
+                if page_records:
+                    pages_with_timetable_structure += 1
+
+                total_records += len(
+                    page_records
+                )
+
+                page_failure_reason = ""
+
+                if not page_records:
+
+                    if not tables:
+                        page_failure_reason = (
+                            "No table structure detected "
+                            "on this page."
+                        )
+                    elif not identity_type:
+                        page_failure_reason = (
+                            "A table was found, but no "
+                            "day/slot timetable grid could "
+                            "be matched to it (and no "
+                            "teacher/class/room identity "
+                            "was detected either)."
+                        )
+                    else:
+                        page_failure_reason = (
+                            "A page identity was detected, "
+                            "but no day/slot timetable rows "
+                            "could be matched in its "
+                            "table(s)."
+                        )
+
+                for record in page_records:
+
+                    if record.get("day"):
+                        has_day = True
+
+                    if record.get("slot") is not None:
+                        has_slot = True
+
+                page_reports.append(
+                    {
+                        "page":
+                            page_number,
+
+                        "identity_type":
+                            identity_type or "unknown",
+
+                        "identity_value":
+                            identity_value,
+
+                        "has_table":
+                            bool(tables),
+
+                        "records":
+                            len(page_records),
+
+                        "reason":
+                            page_failure_reason,
+                    }
+                )
+
+        pages_with_identity = (
+            pages_with_teacher
+            + pages_with_class
+            + pages_with_room
+        )
+
+        identity_kinds_present = sum(
+            1
+            for count in (
+                pages_with_teacher,
+                pages_with_class,
+                pages_with_room,
+            )
+            if count > 0
+        )
+
+        if identity_kinds_present > 1:
+
+            dataset_type = "MIXED"
+
+        elif pages_with_teacher:
+
+            dataset_type = "FACULTYWISE"
+
+        elif pages_with_class:
+
+            dataset_type = "CLASSWISE"
+
+        elif pages_with_room:
+
+            dataset_type = "LOCATIONWISE"
+
+        else:
+
+            dataset_type = "UNKNOWN"
 
         return {
 
@@ -1335,16 +1583,35 @@ class PDFImporter:
             "pages_with_teacher":
                 pages_with_teacher,
 
+            "pages_with_class":
+                pages_with_class,
+
+            "pages_with_room":
+                pages_with_room,
+
+            "pages_with_identity":
+                pages_with_identity,
+
             "pages_with_tables":
                 pages_with_tables,
+
+            "pages_with_timetable_structure":
+                pages_with_timetable_structure,
 
             "records":
                 total_records,
 
+            "has_day":
+                has_day,
+
+            "has_slot":
+                has_slot,
+
             "dataset_type":
-                "FACULTYWISE"
-                if pages_with_teacher
-                else "UNKNOWN",
+                dataset_type,
+
+            "page_reports":
+                page_reports,
         }
 
 

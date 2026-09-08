@@ -592,6 +592,37 @@ class FacultyAIChatbot:
     
 
     # ======================================================
+    # FORMAT SLOT RANGE
+    #
+    # Turns a list of slot numbers like [6, 7] into a readable
+    # "6-7", a single slot [6] into "6", and a non-consecutive
+    # list like [2, 5] into "2, 5" - purely a display helper,
+    # never used for any scheduling decision.
+    # ======================================================
+
+    @staticmethod
+    def _format_slot_range(slots):
+
+        if not slots:
+            return "-"
+
+        ordered = sorted(slots)
+
+        if len(ordered) == 1:
+            return str(ordered[0])
+
+        is_consecutive = all(
+            ordered[i + 1] == ordered[i] + 1
+            for i in range(len(ordered) - 1)
+        )
+
+        if is_consecutive:
+            return f"{ordered[0]}-{ordered[-1]}"
+
+        return ", ".join(str(slot) for slot in ordered)
+
+
+    # ======================================================
     # WORD-BOUNDARY KEYWORD MATCH
     #
     # A plain `word in text` substring check is wrong for short
@@ -2776,17 +2807,50 @@ class FacultyAIChatbot:
                     f"{availability['source_room']})."
                 )
 
-            return (
-                f"Rooms available for "
+            slots_label = self._format_slot_range(
+                availability["slots"]
+            )
+
+            lines = [
+                f"Available rooms for "
                 f"{availability['teacher']}'s "
                 f"{availability['class_name']} "
-                f"({availability['subject']}) on "
-                f"{availability['day'].capitalize()} slots "
-                f"{availability['slots']} (currently room "
-                f"{availability['source_room']}) "
-                f"({len(available_rooms)}):\n\n"
-                + ", ".join(available_rooms)
+                f"({availability['subject']})"
+            ]
+
+            lines.append("")
+
+            lines.append(
+                f"Day: {availability['day'].capitalize()}"
             )
+
+            lines.append(
+                f"Slots: {slots_label}"
+            )
+
+            lines.append(
+                f"Current room: "
+                f"{availability['source_room']}"
+            )
+
+            lines.append("")
+
+            lines.append(
+                f"Available rooms ({len(available_rooms)}):"
+            )
+
+            lines.append("")
+
+            for index, room in enumerate(
+                available_rooms,
+                start=1
+            ):
+
+                lines.append(
+                    f"{index}. {room}"
+                )
+
+            return "\n".join(lines)
 
         # ==================================================
         # ABSENT FACULTY / REPLACEMENT QUERY

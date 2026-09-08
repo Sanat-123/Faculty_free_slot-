@@ -280,6 +280,43 @@ class CanonicalEventMatcher:
         record: Dict[str, Any]
     ) -> str:
 
+        # -----------------------------------------------------
+        # CONTENT-BASED (preferred)
+        #
+        # Set directly by PDFImporter.create_record() from
+        # detect_page_identity() - i.e. from what the PAGE
+        # ITSELF says it is (a "Teacher ..." line, or a bare
+        # class/room code immediately above the slot-header
+        # row), never from the uploaded file's name. This is
+        # what makes classification independent of what the
+        # user happens to name their file.
+        # -----------------------------------------------------
+
+        page_identity_type = cls.normalize_text(
+            cls.get_field(
+                record,
+                "page_identity_type"
+            )
+        )
+
+        if page_identity_type == "teacher":
+            return "FACULTYWISE"
+
+        if page_identity_type == "class":
+            return "CLASSWISE"
+
+        if page_identity_type == "room":
+            return "LOCATIONWISE"
+
+        # -----------------------------------------------------
+        # FILENAME-BASED (fallback)
+        #
+        # Only reached for records that don't carry a
+        # page_identity_type at all (e.g. Excel/CSV-sourced
+        # records, or a PDF page whose content-based identity
+        # could not be determined - see detect_page_identity()).
+        # -----------------------------------------------------
+
         source = cls.normalize_text(
             cls.source_file(record)
         )
