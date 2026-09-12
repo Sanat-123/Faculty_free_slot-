@@ -787,6 +787,65 @@ class PDFImporter:
     # SUBJECT DETECTION
     # ==========================================================
 
+    # ==========================================================
+    # GROUP DETECTION
+    # ==========================================================
+
+    @staticmethod
+    def detect_group(text: str) -> str:
+
+        """
+        Find a "Group N" reference anywhere in the cell text
+        (not just as the whole line) and return it in a
+        normalized "Group N" form, e.g. from raw text like
+        "10:00 - 12:00 Group 1 CS Lab CL-19 MA" this returns
+        "Group 1". Purely pattern-based (any digit works),
+        so it is not tied to any specific lab/subject name.
+        """
+
+        if not text:
+            return ""
+
+        match = re.search(
+            r"\bgroup\s*(\d+)\b",
+            text,
+            flags=re.IGNORECASE
+        )
+
+        if not match:
+            return ""
+
+        return f"Group {match.group(1)}"
+
+    # ==========================================================
+    # DIVISION / SECTION SUFFIX DETECTION
+    #
+    # Some timetables split one numbered class (e.g. "5CS") into
+    # lettered sections/divisions (e.g. "AI-A", "AI-B", "DV-R")
+    # that appear in the cell text as a SEPARATE trailing token,
+    # not glued onto the digit-prefixed class code detect_class()
+    # already finds. This is a shape-based pattern (short letter
+    # group, hyphen, one or two letters) - not a list of known
+    # section names - so it generalizes to any uploaded
+    # timetable's own section naming.
+    # ==========================================================
+
+    @staticmethod
+    def detect_division_suffix(text: str) -> str:
+
+        if not text:
+            return ""
+
+        match = re.search(
+            r"(?<![\w-])[A-Za-z]{1,6}-[A-Za-z]{1,2}(?![\w-])",
+            text
+        )
+
+        if not match:
+            return ""
+
+        return match.group(0)
+
     @classmethod
     def detect_subject(
         cls,
@@ -848,6 +907,45 @@ class PDFImporter:
                 "",
                 subject,
                 flags=re.IGNORECASE
+            )
+
+        # Strip a "Group N" reference that appears WITHIN the
+        # line (not just when it is the whole line) - e.g.
+        # "10:00 - 12:00 Group 1 CS Lab MA" still has "Group 1"
+        # stuck in the middle after class/room removal.
+        subject = re.sub(
+            r"\bgroup\s*\d+\b",
+            "",
+            subject,
+            flags=re.IGNORECASE
+        )
+
+        # Strip an embedded clock time-range, e.g.
+        # "10:00 - 12:00 CS Lab" -> "CS Lab". This is the SAME
+        # sub-block timing already captured separately as
+        # slot_time - keeping a second copy inside subject only
+        # adds noise.
+        subject = re.sub(
+            r"\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}",
+            "",
+            subject
+        )
+
+        # Strip a division/section suffix (e.g. "AI-A", "AI-B")
+        # that isn't part of the digit-prefixed class code -
+        # detect_class()/create_record() are responsible for
+        # attaching it to the class instead.
+        division_suffix = cls.detect_division_suffix(
+            subject
+        )
+
+        if division_suffix:
+
+            subject = re.sub(
+                re.escape(division_suffix),
+                "",
+                subject,
+                count=1
             )
 
         subject = cls.clean_text(
@@ -956,12 +1054,43 @@ class PDFImporter:
             cell_text
         )
 
+        extracted_group = cls.detect_group(
+            cell_text
+        )
+
+        division_suffix = cls.detect_division_suffix(
+            re.sub(
+                re.escape(extracted_class),
+                "",
+                cell_text,
+                flags=re.IGNORECASE
+            ) if extracted_class else cell_text
+        )
+
         # Page-level identity wins for its own field; the cell
         # text is only used to fill in whichever of class/room
         # ISN'T the page's own known identity.
         final_room = room or extracted_room
 
         final_class = class_name or extracted_class
+
+        # A division/section suffix found in the cell text
+        # (e.g. "AI-A", "AI-B") is not itself a full class code -
+        # it refines whichever class was already identified
+        # (from the page or from a digit-prefixed token in this
+        # same cell), e.g. "5CS" + "AI-A" -> "5CS-AI-A". This
+        # preserves the distinction between divisions that would
+        # otherwise be lost (and previously ended up glued onto
+        # "subject" instead).
+        if division_suffix:
+
+            if final_class and not final_class.upper().endswith(
+                division_suffix.upper()
+            ):
+                final_class = f"{final_class}-{division_suffix}"
+
+            elif not final_class:
+                final_class = division_suffix
 
         has_content = bool(
             cell_text
@@ -1025,7 +1154,7 @@ class PDFImporter:
                 final_class,
 
             "group_name":
-                "",
+                extracted_group,
 
             "type":
                 cls.detect_type(

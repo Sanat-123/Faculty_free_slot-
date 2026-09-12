@@ -1050,6 +1050,101 @@ class FacultyAIChatbot:
 
         return None
 
+    def _extract_all_period_teachers(self, query):
+        """
+        Like _extract_period_teacher, but returns EVERY known
+        faculty name mentioned in the query (in the order they
+        appear), instead of just one. Used for queries naming
+        multiple faculty at once, e.g. "What if Mr. X and
+        Dr. Y are absent on Monday?".
+        """
+
+        text = str(query).lower()
+
+        try:
+            names = self.nl_query._known_teachers()
+        except Exception:
+            names = []
+
+        query_key = re.sub(
+            r"\b(?:dr|mr|mrs|ms|prof|professor)\.?\s*",
+            "",
+            text,
+            flags=re.IGNORECASE
+        )
+
+        query_key = re.sub(
+            r"\s+",
+            " ",
+            query_key
+        ).strip()
+
+        matches = []
+
+        # Longest names first, so a longer name is claimed
+        # before a shorter name that happens to be a prefix
+        # of it (e.g. "Dinesh Kumar" vs "Dinesh Kumar Sharma").
+        for name in sorted(
+            names,
+            key=lambda x: len(str(x)),
+            reverse=True
+        ):
+
+            name_key = re.sub(
+                r"\b(?:dr|mr|mrs|ms|prof|professor)\.?\s*",
+                "",
+                str(name),
+                flags=re.IGNORECASE
+            )
+
+            name_key = re.sub(
+                r"\s+",
+                " ",
+                name_key
+            ).strip()
+
+            if not name_key:
+                continue
+
+            pattern = (
+                r"(?<![a-z])"
+                + re.escape(name_key)
+                + r"(?![a-z])"
+            )
+
+            match = re.search(
+                pattern,
+                query_key,
+                re.IGNORECASE
+            )
+
+            if not match:
+                continue
+
+            matches.append((match.start(), name))
+
+            # Remove the matched span so a shorter name
+            # contained inside an already-claimed longer name
+            # cannot also match.
+            query_key = (
+                query_key[:match.start()]
+                + " " * (match.end() - match.start())
+                + query_key[match.end():]
+            )
+
+        matches.sort(key=lambda pair: pair[0])
+
+        # De-duplicate while preserving order.
+        seen = set()
+        ordered = []
+
+        for _, name in matches:
+            if name not in seen:
+                seen.add(name)
+                ordered.append(name)
+
+        return ordered
+
     # ======================================================
     # PERIOD QUERY DETECTION
     # ======================================================
@@ -2326,6 +2421,61 @@ class FacultyAIChatbot:
                     f"shift ({result.get('reason', 'unknown')})."
                 )
 
+            whatif_all_teachers = (
+                self._extract_all_period_teachers(query)
+            )
+
+            if len(whatif_all_teachers) >= 2 and whatif_day:
+
+                plan = self.multi_absence_coordinator.plan(
+                    [
+                        {"teacher": t, "day": whatif_day}
+                        for t in whatif_all_teachers
+                    ]
+                )
+
+                names_text = ", ".join(whatif_all_teachers)
+
+                lines = [
+                    f"What if {names_text} are all absent on "
+                    f"{str(whatif_day).capitalize()}?",
+                    "",
+                    f"{plan['covered_count']} block(s) covered, "
+                    f"{plan['uncovered_count']} block(s) "
+                    "uncovered.",
+                ]
+
+                if plan["covered"]:
+                    lines.append("")
+                    lines.append("Suggested replacements:")
+                    for item in plan["covered"]:
+                        lines.append(
+                            f"• {item.get('absent_teacher', '?')} \u2192 "
+                            f"{item.get('replacement_teacher', '?')} "
+                            f"for {item.get('class_name', '?')} "
+                            f"({item.get('subject', '?')}) "
+                            f"slots {item.get('slots', '?')}"
+                        )
+
+                if plan["uncovered"]:
+                    lines.append("")
+                    lines.append("Not covered:")
+                    for item in plan["uncovered"]:
+                        lines.append(
+                            f"• {item.get('absent_teacher', '?')} - "
+                            f"{item.get('class_name', '?')} "
+                            f"slots {item.get('slots', '?')} "
+                            f"({item.get('reason', 'no candidate found')})"
+                        )
+
+                lines.append("")
+                lines.append(
+                    "(This is only a simulation - nothing has "
+                    "been changed.)"
+                )
+
+                return "\n".join(lines)
+
             if whatif_teacher and whatif_day:
 
                 result = self.what_if_coordinator.simulate_absence(
@@ -2354,9 +2504,51 @@ class FacultyAIChatbot:
 
                 lines = [header, "", summary]
 
-                if result.get("recommendation"):
-                    lines.append(result["recommendation"])
+                covered_entities = [
+                    entity
+                    for entity in result["affected_entities"]
+                    if entity.get("replacement_teacher")
+                ]
 
+                uncovered_entities = [
+                    entity
+                    for entity in result["affected_entities"]
+                    if not entity.get("replacement_teacher")
+                ]
+
+                if covered_entities:
+
+                    lines.append("")
+                    lines.append("Suggested replacements:")
+
+                    for index, item in enumerate(
+                        covered_entities,
+                        start=1
+                    ):
+                        lines.append(
+                            f"{index}. {item['replacement_teacher']} "
+                            f"for {item.get('class_name', '?')} "
+                            f"({item.get('subject', '?')}) "
+                            f"slots {item.get('slots', '?')}"
+                        )
+
+                if uncovered_entities:
+
+                    lines.append("")
+                    lines.append("Not covered:")
+
+                    for index, item in enumerate(
+                        uncovered_entities,
+                        start=1
+                    ):
+                        lines.append(
+                            f"{index}. {item.get('class_name', '?')} "
+                            f"({item.get('subject', '?')}) "
+                            f"slots {item.get('slots', '?')} "
+                            f"- {item.get('reason', 'no candidate found')}"
+                        )
+
+                lines.append("")
                 lines.append(
                     "(This is only a simulation - nothing has "
                     "been changed.)"
@@ -2710,6 +2902,72 @@ class FacultyAIChatbot:
             shift_day = self._extract_day(query)
             shift_slot = self._extract_slot(query)
             shift_room = self._extract_room(query)
+
+            # --------------------------------------------------
+            # NO SLOT GIVEN - AUTO-RESOLVE FROM THE TEACHER'S
+            # OWN LAB BLOCKS ON THAT DAY
+            #
+            # e.g. "Can Dr. X's lab be moved to another room on
+            # Wednesday?" names no slot. If the teacher has
+            # exactly one lab block that day, that block is
+            # unambiguous and is used directly (its data comes
+            # straight from absence_engine._affected_blocks(),
+            # the same block lookup find_lab_block()/plan_shift()
+            # already use - nothing here is hardcoded). If there
+            # is more than one, the user is asked to disambiguate
+            # rather than guessing.
+            # --------------------------------------------------
+
+            if (
+                shift_teacher
+                and shift_day
+                and shift_slot is None
+            ):
+
+                day_blocks = (
+                    self.absence_engine._affected_blocks(
+                        shift_teacher,
+                        shift_day,
+                    )
+                )
+
+                lab_blocks = [
+                    block
+                    for block in day_blocks
+                    if str(
+                        block.get("type", "")
+                    ).strip().lower() == "lab"
+                ]
+
+                if len(lab_blocks) == 1:
+
+                    block_slots = lab_blocks[0].get("slots", [])
+
+                    if block_slots:
+                        shift_slot = block_slots[0]
+
+                elif len(lab_blocks) > 1:
+
+                    options = "; ".join(
+                        f"{b.get('class_name', '?')} "
+                        f"({b.get('subject', '?')}) "
+                        f"slots {b.get('slots', '?')}"
+                        for b in lab_blocks
+                    )
+
+                    return (
+                        f"{shift_teacher} has more than one lab "
+                        f"on {str(shift_day).capitalize()}: "
+                        f"{options}. Please specify which one, "
+                        "e.g. by slot or subject."
+                    )
+
+                else:
+
+                    return (
+                        f"{shift_teacher} has no lab session on "
+                        f"{str(shift_day).capitalize()}."
+                    )
 
             if not shift_teacher or not shift_day or (
                 shift_slot is None
@@ -3613,6 +3871,111 @@ class FacultyAIChatbot:
                 return (
                     f"{teacher} has {periods} periods on {day}."
                 )
+
+            # --------------------------------------------------
+            # SPECIFIC FACULTY WORKLOAD - NO DAY GIVEN
+            #
+            # e.g. "What is the workload of Mr. Nitin Goyal?"
+            # Falls back to the full weekly breakdown, plus a
+            # theory/lab split and a per-semester count, all
+            # derived from the event data itself (event "type"
+            # /subject text for theory-vs-lab, and the leading
+            # digit of class_name for semester) - nothing here
+            # is hardcoded to any specific teacher or class.
+            # --------------------------------------------------
+
+            if teacher and not day:
+
+                result = (
+                    self.workload_engine.weekly_workload(
+                        teacher
+                    )
+                )
+
+                total_periods = result.get("total_periods", 0)
+                by_day = result.get("by_day", {})
+                events = result.get("events", [])
+
+                if total_periods == 0:
+                    return (
+                        f"No timetable entries found for "
+                        f"{teacher}."
+                    )
+
+                lab_count = 0
+                theory_count = 0
+                semester_counts = {}
+
+                for event in events:
+
+                    subject = str(
+                        event.get("subject", "")
+                    ).lower()
+                    event_type = str(
+                        event.get("type", "")
+                    ).lower()
+
+                    if "lab" in subject or "lab" in event_type:
+                        lab_count += 1
+                    else:
+                        theory_count += 1
+
+                    class_name = str(
+                        event.get("class_name", "")
+                    ).strip()
+
+                    sem_match = re.match(
+                        r"(\d+)",
+                        class_name
+                    )
+
+                    if sem_match:
+                        sem = sem_match.group(1)
+                        semester_counts[sem] = (
+                            semester_counts.get(sem, 0) + 1
+                        )
+
+                lines = [
+                    f"Workload for {teacher}:",
+                    "",
+                    f"Total classes: {total_periods}",
+                    f"Theory: {theory_count}",
+                    f"Lab: {lab_count}",
+                ]
+
+                day_order = (
+                    "monday",
+                    "tuesday",
+                    "wednesday",
+                    "thursday",
+                    "friday",
+                    "saturday",
+                    "sunday",
+                )
+
+                if by_day:
+                    lines.append("")
+                    lines.append("Classes by day:")
+                    for current_day in day_order:
+                        if current_day in by_day:
+                            lines.append(
+                                f"• {current_day.capitalize()}: "
+                                f"{by_day[current_day]}"
+                            )
+
+                if semester_counts:
+                    lines.append("")
+                    lines.append("Classes by semester:")
+                    for sem in sorted(
+                        semester_counts,
+                        key=int
+                    ):
+                        lines.append(
+                            f"• {sem} Sem: "
+                            f"{semester_counts[sem]}"
+                        )
+
+                return "\n".join(lines)
 
             # --------------------------------------------------
             # WORKLOAD SUMMARY

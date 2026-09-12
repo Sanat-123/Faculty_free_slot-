@@ -298,7 +298,7 @@ def _generate_response(intent, result):
 
         if results:
 
-            lines = [
+            header_line = (
                 subject_label
                 + (
                     f" on {day.capitalize()}"
@@ -306,44 +306,112 @@ def _generate_response(intent, result):
                     else ""
                 )
                 + ":"
+            )
+
+            # -----------------------------------------------
+            # BUILD A MARKDOWN TABLE INSTEAD OF A BULLET LIST
+            #
+            # Column choice depends on which entity this
+            # lookup was BY (teacher/class/room) - the other
+            # two identifying fields are shown as columns so
+            # the reader doesn't lose that context. A "Day"
+            # column is always included: when no single day
+            # was requested, results span the whole week and
+            # previously had no way to tell which day a row
+            # belonged to.
+            # -----------------------------------------------
+
+            if teacher:
+                other_columns = ["Class", "Room"]
+            elif class_name:
+                other_columns = ["Faculty", "Room"]
+            elif room:
+                other_columns = ["Class", "Faculty"]
+            else:
+                other_columns = ["Faculty", "Class", "Room"]
+
+            day_order = {
+                "monday": 0,
+                "tuesday": 1,
+                "wednesday": 2,
+                "thursday": 3,
+                "friday": 4,
+                "saturday": 5,
+                "sunday": 6,
+            }
+
+            def _sort_key(record):
+                record_day = str(
+                    record.get("day", "")
+                ).strip().lower()
+                slot_value = record.get("slot", 0)
+                try:
+                    slot_num = int(slot_value)
+                except (TypeError, ValueError):
+                    slot_num = 0
+                return (
+                    day_order.get(record_day, 99),
+                    slot_num,
+                )
+
+            sorted_results = sorted(results, key=_sort_key)
+
+            table_lines = [
+                "| Day | Slot | Time | Subject | "
+                + " | ".join(other_columns)
+                + " |",
+                "|---" * (4 + len(other_columns)) + "|",
             ]
 
-            for record in results:
+            for record in sorted_results:
 
-                slot = record.get(
-                    "slot",
-                    ""
+                record_day = str(
+                    record.get("day", "")
+                ).strip().capitalize()
+
+                slot = record.get("slot", "")
+                slot_time = record.get("slot_time", "")
+                subject = record.get("subject", "") or "—"
+
+                class_display = record.get("class_name", "")
+                group_name = record.get("group_name", "")
+
+                if group_name:
+                    class_display = (
+                        f"{class_display} ({group_name})"
+                        if class_display
+                        else group_name
+                    )
+
+                other_values = []
+
+                for column in other_columns:
+
+                    if column == "Class":
+                        other_values.append(
+                            class_display or "—"
+                        )
+                    elif column == "Faculty":
+                        other_values.append(
+                            record.get("teacher", "") or "—"
+                        )
+                    elif column == "Room":
+                        other_values.append(
+                            record.get("room", "") or "—"
+                        )
+
+                table_lines.append(
+                    f"| {record_day} | {slot} | {slot_time} "
+                    f"| {subject} | "
+                    + " | ".join(other_values)
+                    + " |"
                 )
 
-                slot_time = record.get(
-                    "slot_time",
-                    ""
-                )
-
-                subject = record.get(
-                    "subject",
-                    ""
-                )
-
-                room = record.get(
-                    "room",
-                    ""
-                )
-
-                line = f"• Slot {slot}"
-
-                if slot_time:
-                    line += f" — {slot_time}"
-
-                if subject:
-                    line += f" — {subject}"
-
-                if room:
-                    line += f" — Room {room}"
-
-                lines.append(line)
-
-            return "\n".join(lines)
+            return (
+                header_line
+                + "\n\n"
+                + "\n".join(table_lines)
+            )
 
         # -------------------------------------------------
         # CASE 2:
@@ -558,11 +626,31 @@ def _generate_response(intent, result):
         )
 
         # -------------------------------------------------
+        # Distinguish "many teachers, free at one slot/day"
+        # (the common case - e.g. "Who is free on Monday
+        # slot 3?") from "one teacher's own free slots"
+        # (e.g. asking specifically about a single named
+        # faculty member's availability). Only the SECOND
+        # case should show a per-slot breakdown - the first
+        # should read as a clean list of names, matching
+        # what FIND_FREE_FACULTY has always been tested to
+        # return (see test_pdf_chatbot_app.py).
+        # -------------------------------------------------
+
+        distinct_teachers = set(
+            str(row.get("teacher", "")).strip()
+            for row in data
+            if isinstance(row, dict) and row.get("teacher")
+        )
+
+        is_single_teacher_query = len(distinct_teachers) == 1
+
+        # -------------------------------------------------
         # CASE 1:
         # Faculty-specific free-slot query
         # -------------------------------------------------
 
-        if has_slot_information:
+        if has_slot_information and is_single_teacher_query:
 
             # Group records by teacher
             faculty_slots = {}
@@ -714,8 +802,11 @@ def _generate_response(intent, result):
             f"Available Faculty "
             f"({len(teachers)}):\n\n"
             + "\n".join(
-                f"• {teacher}"
-                for teacher in teachers
+                f"{index}. {teacher}"
+                for index, teacher in enumerate(
+                    teachers,
+                    start=1
+                )
             )
         )
 
