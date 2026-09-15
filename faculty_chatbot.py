@@ -8,6 +8,7 @@ from engine.entity_extractor import EntityExtractor
 from engine.intent_detector import IntentDetector
 from engine.query_planner import QueryPlanner
 from engine.response_generator import ResponseGenerator
+from engine.response_formatter import format_workload_response
 
 from import_engine.import_manager import ImportManager
 from data_engine.canonical_event_matcher import CanonicalEventMatcher
@@ -3935,47 +3936,26 @@ class FacultyAIChatbot:
                             semester_counts.get(sem, 0) + 1
                         )
 
-                lines = [
-                    f"Workload for {teacher}:",
-                    "",
-                    f"Total classes: {total_periods}",
-                    f"Theory: {theory_count}",
-                    f"Lab: {lab_count}",
-                ]
+                # ------------------------------------------
+                # Hand the structured result to the
+                # presentation layer (engine/response_
+                # formatter.py) - this function only computes
+                # WHAT the workload is; formatting HOW it looks
+                # is entirely response_formatter's job.
+                # ------------------------------------------
 
-                day_order = (
-                    "monday",
-                    "tuesday",
-                    "wednesday",
-                    "thursday",
-                    "friday",
-                    "saturday",
-                    "sunday",
+                workload_data = {
+                    "faculty": teacher,
+                    "total": total_periods,
+                    "theory": theory_count,
+                    "lab": lab_count,
+                    "by_day": by_day,
+                    "by_semester": semester_counts,
+                }
+
+                return format_workload_response(
+                    workload_data
                 )
-
-                if by_day:
-                    lines.append("")
-                    lines.append("Classes by day:")
-                    for current_day in day_order:
-                        if current_day in by_day:
-                            lines.append(
-                                f"• {current_day.capitalize()}: "
-                                f"{by_day[current_day]}"
-                            )
-
-                if semester_counts:
-                    lines.append("")
-                    lines.append("Classes by semester:")
-                    for sem in sorted(
-                        semester_counts,
-                        key=int
-                    ):
-                        lines.append(
-                            f"• {sem} Sem: "
-                            f"{semester_counts[sem]}"
-                        )
-
-                return "\n".join(lines)
 
             # --------------------------------------------------
             # WORKLOAD SUMMARY

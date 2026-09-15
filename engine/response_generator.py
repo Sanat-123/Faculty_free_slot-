@@ -318,7 +318,11 @@ def _generate_response(intent, result):
             # column is always included: when no single day
             # was requested, results span the whole week and
             # previously had no way to tell which day a row
-            # belonged to.
+            # belonged to. A "Group" column is added only when
+            # at least one result actually carries a group_name
+            # (e.g. "Group 1"/"Group 2") - purely driven by
+            # whether the imported data has that information,
+            # never assumed.
             # -----------------------------------------------
 
             if teacher:
@@ -330,6 +334,14 @@ def _generate_response(intent, result):
             else:
                 other_columns = ["Faculty", "Class", "Room"]
 
+            has_group_data = any(
+                str(record.get("group_name", "")).strip()
+                for record in results
+            )
+
+            if has_group_data:
+                other_columns = other_columns + ["Group"]
+
             day_order = {
                 "monday": 0,
                 "tuesday": 1,
@@ -340,21 +352,127 @@ def _generate_response(intent, result):
                 "sunday": 6,
             }
 
+            def _slot_num(record):
+                try:
+                    return int(record.get("slot", 0))
+                except (TypeError, ValueError):
+                    return 0
+
             def _sort_key(record):
                 record_day = str(
                     record.get("day", "")
                 ).strip().lower()
-                slot_value = record.get("slot", 0)
-                try:
-                    slot_num = int(slot_value)
-                except (TypeError, ValueError):
-                    slot_num = 0
                 return (
                     day_order.get(record_day, 99),
-                    slot_num,
+                    _slot_num(record),
                 )
 
             sorted_results = sorted(results, key=_sort_key)
+
+            # ------------------------------------------------
+            # MERGE CONSECUTIVE SLOTS INTO ONE ROW
+            #
+            # A lab or lecture that runs across several
+            # back-to-back slots (e.g. slots 5, 6, 7) is one
+            # real, continuous class period - not three separate
+            # ones. Two adjacent records are merged into a
+            # single run when they fall on the same day, their
+            # slot numbers are consecutive integers, AND every
+            # other identifying field (subject, teacher, class,
+            # room, group) is identical - so genuinely different
+            # back-to-back classes are never merged just because
+            # their slots happen to be adjacent.
+            # ------------------------------------------------
+
+            def _identity(record):
+                return (
+                    str(
+                        record.get("day", "")
+                    ).strip().lower(),
+                    str(
+                        record.get("subject", "")
+                    ).strip().lower(),
+                    str(
+                        record.get("teacher", "")
+                    ).strip().lower(),
+                    str(
+                        record.get("class_name", "")
+                    ).strip().lower(),
+                    str(
+                        record.get("room", "")
+                    ).strip().lower(),
+                    str(
+                        record.get("group_name", "")
+                    ).strip().lower(),
+                )
+
+            # Group records by their full identity FIRST
+            # (ignoring slot), THEN look for consecutive slot
+            # runs within each group. Grouping by identity
+            # before checking adjacency is essential here: with
+            # parallel groups/sections meeting at the same
+            # slots (e.g. "DSA Lab" for Group 2 and "Java" for
+            # Group 1 both at slot 5), the two subjects
+            # interleave in plain slot order, so simply looking
+            # at the previous row in the sorted list would never
+            # see slot 6's "DSA Lab" as adjacent to slot 5's -
+            # slot 5's "Java" sits between them in that order.
+            identity_groups = {}
+
+            for record in sorted_results:
+
+                identity_groups.setdefault(
+                    _identity(record), []
+                ).append(record)
+
+            runs = []
+
+            for group_records in identity_groups.values():
+
+                group_records = sorted(
+                    group_records,
+                    key=_slot_num
+                )
+
+                group_runs = []
+
+                for record in group_records:
+
+                    if (
+                        group_runs
+                        and _slot_num(record)
+                        == _slot_num(group_runs[-1][-1]) + 1
+                    ):
+                        group_runs[-1].append(record)
+                    else:
+                        group_runs.append([record])
+
+                runs.extend(group_runs)
+
+            # Restore day/first-slot display order across all
+            # runs (grouping by identity above scrambled it).
+            runs.sort(
+                key=lambda run: (
+                    day_order.get(
+                        str(
+                            run[0].get("day", "")
+                        ).strip().lower(),
+                        99
+                    ),
+                    _slot_num(run[0]),
+                )
+            )
+
+            def _time_bounds(slot_time):
+
+                text = str(slot_time or "").strip()
+
+                if "-" not in text:
+                    return text, text
+
+                start, _, end = text.partition("-")
+
+                return start.strip(), end.strip()
 
             table_lines = [
                 "| Day | Slot | Time | Subject | "
@@ -363,25 +481,58 @@ def _generate_response(intent, result):
                 "|---" * (4 + len(other_columns)) + "|",
             ]
 
-            for record in sorted_results:
+            for run in runs:
+
+                first_record = run[0]
+                last_record = run[-1]
 
                 record_day = str(
-                    record.get("day", "")
+                    first_record.get("day", "")
                 ).strip().capitalize()
 
-                slot = record.get("slot", "")
-                slot_time = record.get("slot_time", "")
-                subject = record.get("subject", "") or "—"
+                if len(run) > 1:
 
-                class_display = record.get("class_name", "")
-                group_name = record.get("group_name", "")
-
-                if group_name:
-                    class_display = (
-                        f"{class_display} ({group_name})"
-                        if class_display
-                        else group_name
+                    slot_display = (
+                        f"{_slot_num(first_record)}-"
+                        f"{_slot_num(last_record)}"
                     )
+
+                    start_time, _ = _time_bounds(
+                        first_record.get("slot_time", "")
+                    )
+
+                    _, end_time = _time_bounds(
+                        last_record.get("slot_time", "")
+                    )
+
+                    time_display = (
+                        f"{start_time} - {end_time}"
+                        if start_time and end_time
+                        else str(
+                            first_record.get("slot_time", "")
+                        )
+                    )
+
+                else:
+
+                    slot_display = str(
+                        first_record.get("slot", "")
+                    )
+
+                    time_display = first_record.get(
+                        "slot_time",
+                        ""
+                    )
+
+                subject = first_record.get(
+                    "subject",
+                    ""
+                ) or "—"
+
+                class_display = first_record.get(
+                    "class_name",
+                    ""
+                )
 
                 other_values = []
 
@@ -393,16 +544,26 @@ def _generate_response(intent, result):
                         )
                     elif column == "Faculty":
                         other_values.append(
-                            record.get("teacher", "") or "—"
+                            first_record.get(
+                                "teacher", ""
+                            ) or "—"
                         )
                     elif column == "Room":
                         other_values.append(
-                            record.get("room", "") or "—"
+                            first_record.get(
+                                "room", ""
+                            ) or "—"
+                        )
+                    elif column == "Group":
+                        other_values.append(
+                            first_record.get(
+                                "group_name", ""
+                            ) or "—"
                         )
 
                 table_lines.append(
-                    f"| {record_day} | {slot} | {slot_time} "
-                    f"| {subject} | "
+                    f"| {record_day} | {slot_display} "
+                    f"| {time_display} | {subject} | "
                     + " | ".join(other_values)
                     + " |"
                 )

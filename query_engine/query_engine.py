@@ -514,6 +514,22 @@ class QueryEngine:
 
         results = []
 
+        # Resolve ONCE, exact-match-first: if class_name is
+        # itself a real, standalone class (e.g. "3CS-D"), match
+        # ONLY that class - never also pull in classes that
+        # merely happen to start with the same text (e.g.
+        # "3CS-DS", "3CS-DS-A"). Only when there's no such exact
+        # class does this fall back to the broader substring
+        # behaviour, e.g. for an intentionally partial query
+        # like "7CS".
+        resolution = self.resolve_class_reference(
+            class_name
+        )
+
+        matching_classes = set(
+            resolution.get("matching_classes", [])
+        )
+
         for event in self._events():
 
             record_class = self._get(
@@ -522,10 +538,7 @@ class QueryEngine:
                 "class"
             )
 
-            if not self._contains(
-                record_class,
-                class_name
-            ):
+            if record_class not in matching_classes:
                 continue
 
             record_day = self._get(
@@ -687,6 +700,16 @@ class QueryEngine:
 
         results = []
 
+        matching_classes = None
+
+        if class_name:
+
+            matching_classes = set(
+                self.resolve_class_reference(
+                    class_name
+                ).get("matching_classes", [])
+            )
+
         for record in self._class_free():
 
             record_class = self._get(
@@ -705,12 +728,9 @@ class QueryEngine:
                 "slot"
             )
 
-            if class_name:
+            if matching_classes is not None:
 
-                if not self._contains(
-                    record_class,
-                    class_name
-                ):
+                if record_class not in matching_classes:
                     continue
 
             if day:
@@ -753,6 +773,16 @@ class QueryEngine:
 
         results = []
 
+        # Same exact-match-first principle as class_schedule():
+        # a real, standalone room like "CL-1" must never also
+        # pull in "CL-10", "CL-15", etc. just because they share
+        # that text as a prefix.
+        matching_rooms = set(
+            self.resolve_room_reference(
+                room
+            ).get("matching_rooms", [])
+        )
+
         for event in self._events():
 
             record_room = self._get(
@@ -761,10 +791,7 @@ class QueryEngine:
                 "classroom"
             )
 
-            if not self._contains(
-                record_room,
-                room
-            ):
+            if record_room not in matching_rooms:
                 continue
 
             record_day = self._get(
@@ -817,6 +844,16 @@ class QueryEngine:
 
         results = []
 
+        matching_rooms = None
+
+        if room:
+
+            matching_rooms = set(
+                self.resolve_room_reference(
+                    room
+                ).get("matching_rooms", [])
+            )
+
         for record in self._room_free():
 
             record_room = self._get(
@@ -835,12 +872,9 @@ class QueryEngine:
                 "slot"
             )
 
-            if room:
+            if matching_rooms is not None:
 
-                if not self._contains(
-                    record_room,
-                    room
-                ):
+                if record_room not in matching_rooms:
                     continue
 
             if day:
@@ -1156,10 +1190,33 @@ class QueryEngine:
     # reports for that data.
     # =========================================================
 
-    def resolve_class_reference(
+    def _resolve_entity_reference(
         self,
-        raw_text: Any
+        raw_text: Any,
+        known_values: List[str],
+        value_key: str,
+        matches_key: str
     ) -> Dict[str, Any]:
+
+        """
+        Generic exact-match-first, broad-substring-fallback
+        resolver shared by class and room reference resolution
+        (see resolve_class_reference / resolve_room_reference).
+
+        EXACT: the raw text, once normalized, IS one of the
+               known values outright (e.g. "3CS-D" is itself a
+               real class name in this dataset).
+
+        BROAD: the raw text isn't itself a known value, but is
+               a substring of one or more of them (e.g. "7cs" is
+               a prefix shared by "7CSA", "7CS-DS", "7CS-IOT").
+               Only reached when NO exact match exists, so a
+               real, standalone value like "3CS-D" is never
+               silently absorbed into "3CS-DS"/"3CS-DS-A" just
+               because it happens to be a text-prefix of them.
+
+        NONE:  the raw text matches nothing at all.
+        """
 
         query_text = self._normalize(raw_text)
 
@@ -1167,46 +1224,68 @@ class QueryEngine:
             return {
                 "query_text": raw_text,
                 "mode": "none",
-                "class_name": None,
-                "matching_classes": [],
+                value_key: None,
+                matches_key: [],
             }
 
-        known_classes = self.entity_knowledge()["classes"]
-
         exact_matches = [
-            class_name
-            for class_name in known_classes
-            if self._normalize(class_name) == query_text
+            value
+            for value in known_values
+            if self._normalize(value) == query_text
         ]
 
         if exact_matches:
             return {
                 "query_text": raw_text,
                 "mode": "exact",
-                "class_name": exact_matches[0],
-                "matching_classes": exact_matches,
+                value_key: exact_matches[0],
+                matches_key: exact_matches,
             }
 
-        matching_classes = sorted(
-            class_name
-            for class_name in known_classes
-            if self._contains(class_name, raw_text)
+        broad_matches = sorted(
+            value
+            for value in known_values
+            if self._contains(value, raw_text)
         )
 
-        if matching_classes:
+        if broad_matches:
             return {
                 "query_text": raw_text,
                 "mode": "broad",
-                "class_name": None,
-                "matching_classes": matching_classes,
+                value_key: None,
+                matches_key: broad_matches,
             }
 
         return {
             "query_text": raw_text,
             "mode": "none",
-            "class_name": None,
-            "matching_classes": [],
+            value_key: None,
+            matches_key: [],
         }
+
+    def resolve_class_reference(
+        self,
+        raw_text: Any
+    ) -> Dict[str, Any]:
+
+        return self._resolve_entity_reference(
+            raw_text,
+            self.entity_knowledge()["classes"],
+            "class_name",
+            "matching_classes"
+        )
+
+    def resolve_room_reference(
+        self,
+        raw_text: Any
+    ) -> Dict[str, Any]:
+
+        return self._resolve_entity_reference(
+            raw_text,
+            self.entity_knowledge()["rooms"],
+            "room",
+            "matching_rooms"
+        )
 
 
 # =============================================================

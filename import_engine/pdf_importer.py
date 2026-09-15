@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from collections import defaultdict
 import re
 
 import pdfplumber
@@ -386,6 +387,186 @@ class PDFImporter:
     # PAGE IDENTITY (teacher / class / room)
     # ==========================================================
 
+    # ==========================================================
+    # PER-PAGE FACULTY ABBREVIATION LEGEND
+    #
+    # Classwise/room-wise pages often print faculty as a short
+    # code inside the grid (e.g. "MM", "SSS", "ArS") and put the
+    # actual code -> full-name key in a small legend block near
+    # the bottom of the SAME page (e.g. "MM Dr. Mehul Mahrishi").
+    # This is the timetable's own source-of-truth for what a
+    # given code means ON THAT PAGE - nothing here is a fixed
+    # abbreviation list; every mapping is read straight out of
+    # the page text.
+    #
+    # A code is intentionally NOT resolved globally across the
+    # whole document: the SAME code has been observed to mean
+    # different people on different pages, and even to appear
+    # twice with two different names on a single page's own
+    # legend (a real quirk in the source data) - both cases are
+    # handled by scoping every legend to its own page and
+    # dropping any code that isn't unambiguous within it.
+    # ==========================================================
+
+    _LEGEND_TITLE_WORDS = {
+        "dr", "mr", "ms", "mrs", "prof", "professor"
+    }
+
+    @classmethod
+    def extract_page_legend(
+        cls,
+        page
+    ) -> Dict[str, str]:
+
+        try:
+            text = page.extract_text() or ""
+        except Exception:
+            text = ""
+
+        if not text:
+            return {}
+
+        marker = re.search(
+            r"Timetable generated:[^\n]*\n?(.*)",
+            text,
+            re.DOTALL
+        )
+
+        if not marker:
+            return {}
+
+        legend_text = marker.group(1)
+
+        if not legend_text.strip():
+            return {}
+
+        raw_matches = list(
+            re.finditer(
+                r"\b(?:[A-Z][a-z]{0,2}){1,3}\b(?!\.)",
+                legend_text
+            )
+        )
+
+        code_matches = []
+
+        for match in raw_matches:
+
+            token = match.group(0)
+
+            if token.lower() in cls._LEGEND_TITLE_WORDS:
+                continue
+
+            preceding = legend_text[:match.start()].rstrip()
+
+            preceding_word_match = re.search(
+                r"([A-Za-z]+\.?)$",
+                preceding
+            )
+
+            if (
+                preceding_word_match
+                and preceding_word_match.group(1).rstrip(
+                    "."
+                ).lower() in cls._LEGEND_TITLE_WORDS
+            ):
+                continue
+
+            code_matches.append(match)
+
+        candidates: Dict[str, List[str]] = defaultdict(list)
+
+        for index, match in enumerate(code_matches):
+
+            start = match.end()
+
+            end = (
+                code_matches[index + 1].start()
+                if index + 1 < len(code_matches)
+                else len(legend_text)
+            )
+
+            name = re.sub(
+                r"\s+",
+                " ",
+                legend_text[start:end]
+            ).strip().strip(".").strip()
+
+            if not name:
+                continue
+
+            code = match.group(0)
+
+            if name not in candidates[code]:
+                candidates[code].append(name)
+
+        # A code that resolves to more than one DIFFERENT name
+        # within this same page's own legend is a genuine
+        # ambiguity in the source - leave it unresolved rather
+        # than guess which one is meant.
+        return {
+            code: names[0]
+            for code, names in candidates.items()
+            if len(names) == 1
+        }
+
+    # ==========================================================
+    # ROOM DETECTION FROM A PAGE TITLE/LABEL
+    #
+    # detect_room() above is tuned for CELL text, where the
+    # digit/dash/colon shape of a room code (e.g. "CL-15",
+    # "301", "7F:EE-Lab13") is what distinguishes a room from a
+    # subject - and subjects routinely end in a bare word like
+    # "Lab" too (e.g. "DSA Lab", "CS Lab"), so that same "ends
+    # in a room-type word" shape can NOT safely be added to
+    # detect_room() itself without misreading half the lab
+    # subjects in a normal cell as rooms.
+    #
+    # A PAGE TITLE is a much narrower, safer context: it is the
+    # page's ENTIRE identity line with nothing else on it (e.g.
+    # "IAI Lab." on a Location-wise page, parallel to "Teacher
+    # Dr. X" or "7CSA." on the other page types), not a mix of
+    # subject/class/room text. Only used as a fallback here,
+    # after detect_room() (which still wins whenever the label
+    # DOES contain a digit/dash/colon room code) has already
+    # failed.
+    # ==========================================================
+
+    _ROOM_TYPE_WORDS = {
+        "lab", "hall", "lib", "library", "room",
+        "block", "building", "centre", "center",
+    }
+
+    @classmethod
+    def detect_room_from_label(
+        cls,
+        label: str
+    ) -> str:
+
+        text = cls.clean_text(
+            label
+        ).rstrip(".").strip()
+
+        if not text:
+            return ""
+
+        words = text.split()
+
+        if not words or len(words) > 4:
+            return ""
+
+        if words[-1].lower() not in cls._ROOM_TYPE_WORDS:
+            return ""
+
+        # A page-identity label is otherwise only teacher/class/
+        # room text - if it contains a digit at all it is far
+        # more likely a room code detect_room() should have
+        # already caught (or a stray class fragment), not a
+        # bare-word room name.
+        if any(ch.isdigit() for ch in text):
+            return ""
+
+        return text
+
     @classmethod
     def detect_page_identity(
         cls,
@@ -431,6 +612,13 @@ class PDFImporter:
             return "class", class_name
 
         room = cls.detect_room(
+            label
+        )
+
+        if room:
+            return "room", room
+
+        room = cls.detect_room_from_label(
             label
         )
 
@@ -581,8 +769,10 @@ class PDFImporter:
 
         patterns = [
 
-            # 3CS-DS-A
-            r"\b\d+[A-Za-z]{2,}(?:-[A-Za-z0-9]+)+\b",
+            # 3CS-DS-A (tolerates a stray space right after a
+            # hyphen too, e.g. "5CS-DS- B" from a PDF text-
+            # extraction spacing artifact - normalized below)
+            r"\b\d+[A-Za-z]{2,}(?:-\s?[A-Za-z0-9]+)+\b",
 
             # 7CS-IOT
             r"\b\d+[A-Za-z]{2,}[A-Za-z0-9-]*\b",
@@ -601,6 +791,16 @@ class PDFImporter:
             candidates.extend(
                 found
             )
+
+        # Normalize away a stray space directly after a hyphen
+        # (e.g. "5CS-DS- B" -> "5CS-DS-B") - the pattern above
+        # tolerates it on the way in so the match isn't missed
+        # entirely, but the class name itself should never
+        # contain that space.
+        candidates = [
+            re.sub(r"-\s+", "-", x)
+            for x in candidates
+        ]
 
         if not candidates:
             return ""
@@ -869,14 +1069,29 @@ class PDFImporter:
             return ""
 
         # Remove group information
-        lines = [
-            x for x in lines
-            if not re.match(
-                r"^group\s*\d+",
+        #
+        # Only strip the "Group N" PREFIX from a line, not the
+        # whole line. A cell that has "Group 1" as its own
+        # separate line (nothing else on it) correctly loses
+        # that line entirely once the prefix is removed - but a
+        # single-line cell like "Group 1 CS Lab 5F::CP5 SD" must
+        # keep "CS Lab 5F::CP5 SD" rather than being discarded
+        # wholesale just because it STARTS WITH "Group 1".
+        cleaned_lines = []
+
+        for x in lines:
+
+            stripped = re.sub(
+                r"^group\s*\d+\s*",
+                "",
                 x,
                 flags=re.IGNORECASE
-            )
-        ]
+            ).strip()
+
+            if stripped:
+                cleaned_lines.append(stripped)
+
+        lines = cleaned_lines
 
         if not lines:
             return ""
@@ -893,8 +1108,19 @@ class PDFImporter:
 
         if class_name:
 
+            # class_name itself is already normalized (no
+            # stray space after a hyphen - see detect_class()),
+            # but the raw subject text it needs to be removed
+            # FROM might still have one (e.g. "5CS-DS- B"). The
+            # removal pattern tolerates that same optional space
+            # after each hyphen so it still finds and strips the
+            # match.
+            class_removal_pattern = re.escape(
+                class_name
+            ).replace(r"\-", r"-\s?")
+
             subject = re.sub(
-                re.escape(class_name),
+                class_removal_pattern,
                 "",
                 subject,
                 flags=re.IGNORECASE
@@ -997,7 +1223,8 @@ class PDFImporter:
         teacher: str = "",
         class_name: str = "",
         room: str = "",
-        page_identity_type: str = ""
+        page_identity_type: str = "",
+        legend: Optional[Dict[str, str]] = None
     ) -> Dict[str, Any]:
 
         """
@@ -1046,6 +1273,32 @@ class PDFImporter:
             cell_text
         )
 
+        # ------------------------------------------------------
+        # PAGE LEGEND RESOLUTION
+        #
+        # If this page has its own faculty-abbreviation legend
+        # (extract_page_legend()), a trailing code left in the
+        # subject text after detect_subject()'s own cleanup
+        # (e.g. "Project/Spoken-Latex MM") is resolved using
+        # THAT PAGE'S own key - "MM" -> whatever name that same
+        # page's legend says it means, not a fixed lookup table.
+        # ------------------------------------------------------
+
+        legend_teacher = ""
+
+        if legend and subject:
+
+            subject_tokens = subject.split()
+
+            if subject_tokens and (
+                subject_tokens[-1] in legend
+            ):
+
+                legend_teacher = legend[subject_tokens[-1]]
+                subject = " ".join(
+                    subject_tokens[:-1]
+                ).strip()
+
         extracted_room = cls.detect_room(
             cell_text
         )
@@ -1073,6 +1326,8 @@ class PDFImporter:
         final_room = room or extracted_room
 
         final_class = class_name or extracted_class
+
+        final_teacher = teacher or legend_teacher
 
         # A division/section suffix found in the cell text
         # (e.g. "AI-A", "AI-B") is not itself a full class code -
@@ -1132,7 +1387,7 @@ class PDFImporter:
 
             "teacher":
                 cls.clean_text(
-                    teacher
+                    final_teacher
                 ),
 
             "day":
@@ -1245,6 +1500,10 @@ class PDFImporter:
         # --------------------------------------------------
 
         identity_type, identity_value = cls.detect_page_identity(
+            page
+        )
+
+        legend = cls.extract_page_legend(
             page
         )
 
@@ -1408,7 +1667,8 @@ class PDFImporter:
                         cell_text=cell,
                         source_file=source_file,
                         source_page=page_number,
-                        page_identity_type=identity_type
+                        page_identity_type=identity_type,
+                        legend=legend
                     )
 
                     records.append(

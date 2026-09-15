@@ -38,6 +38,7 @@ when they contain no day or slot.
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -1026,6 +1027,655 @@ class CanonicalEventMatcher:
     # MAIN MATCH METHOD
     # =========================================================
 
+    @staticmethod
+    def _teacher_initials(teacher: str) -> str:
+
+        """
+        Derive simple initials from a full teacher name, e.g.
+        "Dr. Mehul Mahrishi" -> "MM", "Mr. Ashish Pant" -> "AP".
+        Purely mechanical (title stripped, first letter of each
+        remaining word) - not a lookup against any fixed list,
+        so it generalizes to whatever names the uploaded
+        timetable actually contains.
+        """
+
+        text = str(teacher or "").strip()
+
+        text = re.sub(
+            r"^(?:dr|mr|mrs|ms|prof|professor)\.?\s*",
+            "",
+            text,
+            flags=re.IGNORECASE
+        )
+
+        parts = [
+            p for p in re.split(
+                r"[\s.]+",
+                text
+            )
+            if p
+        ]
+
+        if not parts:
+            return ""
+
+        return "".join(p[0] for p in parts).upper()
+
+    def _normalize_subjects_for_fusion(
+        self,
+        records: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+
+        """
+        Strip two data-derived kinds of noise from `subject`
+        before matching, so the same real class session
+        described slightly differently across source files
+        (a room fragment or instructor short-code glued onto
+        the subject text in one file but not another) still
+        normalizes to the same text and can fuse together:
+
+          1. A trailing token equal to a ROOM value seen
+             elsewhere in THIS dataset -> moved into `room` if
+             blank, always stripped from `subject` (stripping is
+             safe regardless of ambiguity - it never invents an
+             attribution, it only removes noise).
+          2. A trailing token equal to a teacher's initials
+             (title dropped, first letter of each name part) ->
+             always stripped from `subject`; only used to FILL a
+             blank `teacher` field when the initials are
+             unambiguous (belong to exactly one teacher actually
+             present in this dataset).
+
+        Both reference sets (known_rooms, known_initials) are
+        built FROM the uploaded data itself - nothing here is a
+        fixed list of abbreviations.
+        """
+
+        known_rooms = set()
+        known_full_names = set()
+        trusted_full_names = set()
+        initials_to_teachers: Dict[str, set] = defaultdict(set)
+
+        for record in records:
+
+            if not isinstance(record, dict):
+                continue
+
+            room = str(record.get("room", "")).strip()
+
+            if room:
+                known_rooms.add(room)
+
+            teacher = str(record.get("teacher", "")).strip()
+
+            if teacher:
+
+                known_full_names.add(teacher)
+
+                # A Facultywise page's teacher identity comes
+                # straight from that page's own header line
+                # (detect_teacher()), not from cell-level legend
+                # text or abbreviation resolution - it is the
+                # most reliable name source available, and is
+                # used below to repair a teacher value that a
+                # DIFFERENT source's own text-extraction has
+                # corrupted (e.g. two overlapping text runs on a
+                # page rendering as one scrambled string).
+                if record.get("page_identity_type") == "teacher":
+                    trusted_full_names.add(teacher)
+
+                initials = self._teacher_initials(teacher)
+
+                if initials:
+                    initials_to_teachers[initials].add(teacher)
+
+        known_initials = set(initials_to_teachers.keys())
+
+        unambiguous_initials = {
+            initials: next(iter(teachers))
+            for initials, teachers in initials_to_teachers.items()
+            if len(teachers) == 1
+        }
+
+        # ------------------------------------------------------
+        # ROOM PREFIX ALIASES
+        #
+        # The same physical room can appear under a shorter,
+        # bare-word reference in one source and its full
+        # multi-word name in another (e.g. a room-wise page's own
+        # title is "IAI Lab", but a Facultywise cell's text ends
+        # in just "IAI"). For every multi-word room in this
+        # dataset, its FIRST word is added as a recognized alias
+        # for the full name - but ONLY when that first word is
+        # not shared by any OTHER multi-word room here (no
+        # collision), so this never guesses between two different
+        # rooms that happen to start with the same word.
+        # ------------------------------------------------------
+
+        room_first_word_owners: Dict[str, set] = defaultdict(set)
+
+        for room in known_rooms:
+
+            room_words = room.split()
+
+            if len(room_words) > 1:
+                room_first_word_owners[room_words[0]].add(room)
+
+        room_prefix_aliases = {
+            first_word: next(iter(owners))
+            for first_word, owners in (
+                room_first_word_owners.items()
+            )
+            if len(owners) == 1
+            and first_word not in known_rooms
+        }
+
+        # ------------------------------------------------------
+        # REPAIR A CORRUPTED TEACHER FIELD USING A TRUSTED NAME
+        #
+        # Some source pages garble adjacent text during PDF
+        # extraction (two overlapping text runs interleaved into
+        # one string) - e.g. "Trivendra Kumar Sharma Dr.
+        # AnjanAaS" where the real value should just be
+        # "Trivendra Kumar Sharma". Rather than trying to parse
+        # the garbage, if a teacher value STARTS WITH an already
+        # trusted, clean name and has extra trailing text, it is
+        # truncated back to that trusted name - the same
+        # correction a person would make by cross-checking
+        # against the Facultywise page for that same teacher.
+        # ------------------------------------------------------
+
+        if trusted_full_names:
+
+            sorted_trusted = sorted(
+                trusted_full_names,
+                key=len,
+                reverse=True
+            )
+
+            for record in records:
+
+                if not isinstance(record, dict):
+                    continue
+
+                teacher = str(record.get("teacher", "")).strip()
+
+                if not teacher or teacher in trusted_full_names:
+                    continue
+
+                for trusted in sorted_trusted:
+
+                    if (
+                        teacher.startswith(trusted)
+                        and len(teacher) > len(trusted)
+                        and teacher[len(trusted)] in (
+                            " ", "\t"
+                        )
+                    ):
+                        record["teacher"] = trusted
+                        break
+
+        cleaned = []
+
+        for record in records:
+
+            if not isinstance(record, dict):
+                cleaned.append(record)
+                continue
+
+            subject = str(record.get("subject", "")).strip()
+
+            if not subject:
+                cleaned.append(record)
+                continue
+
+            tokens = subject.split()
+
+            if not tokens:
+                cleaned.append(record)
+                continue
+
+            record = dict(record)
+            changed_any = False
+
+            while len(tokens) > 1:
+
+                stripped_one = False
+
+                # Try multi-word room names first (longest
+                # match wins), since some real rooms in this
+                # dataset are 2-3 words (e.g. "IAI Lab",
+                # "Central Lib") - checking only the single
+                # trailing token would miss these. A bare-word
+                # alias (e.g. "IAI" for "IAI Lab" - see
+                # room_prefix_aliases above) is checked right
+                # alongside the exact room set, and resolves to
+                # the FULL room name, not the bare word.
+                max_span = min(3, len(tokens) - 1)
+
+                for span in range(max_span, 0, -1):
+
+                    candidate = " ".join(tokens[-span:])
+
+                    resolved_room = (
+                        candidate
+                        if candidate in known_rooms
+                        else room_prefix_aliases.get(candidate)
+                    )
+
+                    if resolved_room:
+
+                        if not str(
+                            record.get("room", "")
+                        ).strip():
+                            record["room"] = resolved_room
+
+                        tokens = tokens[:-span]
+                        stripped_one = True
+                        break
+
+                if stripped_one:
+                    changed_any = True
+                    continue
+
+                # Try a trailing run of tokens that exactly
+                # matches an ALREADY-CONFIRMED full teacher name
+                # from elsewhere in this dataset (e.g. a page
+                # names someone by their bare first name, like
+                # "Sumita", rather than a code) - this only ever
+                # matches a name this dataset has independently
+                # established belongs to a real teacher, so it
+                # never invents an identity.
+                max_name_span = min(4, len(tokens) - 1)
+
+                for span in range(max_name_span, 0, -1):
+
+                    candidate = " ".join(tokens[-span:])
+
+                    if candidate in known_full_names:
+
+                        if not str(
+                            record.get("teacher", "")
+                        ).strip():
+                            record["teacher"] = candidate
+
+                        tokens = tokens[:-span]
+                        stripped_one = True
+                        break
+
+                if stripped_one:
+                    changed_any = True
+                    continue
+
+                trailing = tokens[-1]
+
+                if trailing in known_initials:
+
+                    if (
+                        trailing in unambiguous_initials
+                        and not str(
+                            record.get("teacher", "")
+                        ).strip()
+                    ):
+                        record["teacher"] = (
+                            unambiguous_initials[trailing]
+                        )
+
+                    tokens = tokens[:-1]
+                    stripped_one = True
+
+                if not stripped_one:
+                    break
+
+                changed_any = True
+
+            if changed_any:
+                record["subject"] = " ".join(tokens).strip()
+
+            cleaned.append(record)
+
+        return cleaned
+
+    # =========================================================
+    # CLASS-GRANULARITY RECONCILIATION
+    #
+    # Two source files can legitimately describe the same real
+    # class period at different levels of detail - e.g. a
+    # classwise page that only tracks the parent class ("5CS")
+    # next to a facultywise page that also captures the division
+    # ("5CS-AI-A"). match_key() treats class_name as an exact
+    # field, so these land in different buckets and show up as
+    # two rows for what is really one session - ESPECIALLY once
+    # _normalize_subjects_for_fusion() above successfully
+    # recovers a teacher name that was previously blank on the
+    # coarser record.
+    #
+    # This pass merges canonical events ONLY when teacher, day,
+    # slot, subject AND room are all identical AND the class
+    # names form a genuine parent/child pair (one equals the
+    # other, or one is exactly "<other>-<something>"). Anything
+    # else - including two events that merely share day+slot,
+    # or share day+slot+class, or share day+slot+subject, but
+    # differ in teacher/room/class-in-a-way-that-isn't-a-clean
+    # hierarchy - is left alone, per the project's rule that
+    # legitimate parallel events must never be blindly collapsed.
+    # =========================================================
+
+    @staticmethod
+    def _class_names_compatible(
+        class_a: str,
+        class_b: str
+    ) -> bool:
+
+        a = str(class_a or "").strip().lower()
+        b = str(class_b or "").strip().lower()
+
+        if a == b:
+            return True
+
+        if not a or not b:
+            # One side has no class information at all - not
+            # enough to safely claim a hierarchy relationship.
+            return False
+
+        if b.startswith(a + "-"):
+            return True
+
+        if a.startswith(b + "-"):
+            return True
+
+        return False
+
+    @staticmethod
+    def _rooms_compatible(room_a: str, room_b: str) -> bool:
+
+        a = str(room_a or "").strip().lower()
+        b = str(room_b or "").strip().lower()
+
+        # A blank room on one side just means that source page
+        # didn't repeat the room for this cell - it is not a
+        # claim of "no room" that could conflict with a real
+        # one. Two different REAL rooms are never merged.
+        if not a or not b:
+            return True
+
+        return a == b
+
+    def _reconcile_class_granularity(
+        self,
+        events: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+
+        groups: Dict[Tuple, List[int]] = defaultdict(list)
+
+        for index, event in enumerate(events):
+
+            identity = (
+                self.normalize_text(
+                    event.get("teacher", "")
+                ),
+                self.normalize_day(
+                    event.get("day", "")
+                ),
+                self.normalize_slot(
+                    event.get("slot", "")
+                ),
+                self.normalize_text(
+                    event.get("subject", "")
+                ),
+            )
+
+            groups[identity].append(index)
+
+        to_drop = set()
+
+        for identity, indices in groups.items():
+
+            if len(indices) < 2:
+                continue
+
+            # A blank teacher/subject identity is too weak to
+            # safely merge on - only reconcile groups with a
+            # real teacher AND subject in common. Room is
+            # checked for compatibility separately below, since
+            # a blank room on one side shouldn't block a merge.
+            if not all(identity):
+                continue
+
+            group_events = [events[i] for i in indices]
+
+            class_names = [
+                e.get("class_name", "") for e in group_events
+            ]
+
+            rooms = [
+                e.get("room", "") for e in group_events
+            ]
+
+            all_compatible = all(
+                self._class_names_compatible(
+                    class_names[i],
+                    class_names[j]
+                )
+                and self._rooms_compatible(
+                    rooms[i],
+                    rooms[j]
+                )
+                for i in range(len(class_names))
+                for j in range(i + 1, len(class_names))
+            )
+
+            if not all_compatible:
+                continue
+
+            # Keep the event with the most specific (longest)
+            # class name as the primary record, and fold every
+            # other event's sources/source_records into it.
+            primary_local_index = max(
+                range(len(group_events)),
+                key=lambda i: len(
+                    str(group_events[i].get("class_name", ""))
+                )
+            )
+
+            primary = group_events[primary_local_index]
+            primary_global_index = indices[primary_local_index]
+
+            merged_sources = list(primary.get("sources", []))
+            merged_records = list(
+                primary.get("source_records", [])
+            )
+
+            for local_i, event in enumerate(group_events):
+
+                if local_i == primary_local_index:
+                    continue
+
+                for source in event.get("sources", []):
+                    if source not in merged_sources:
+                        merged_sources.append(source)
+
+                merged_records.extend(
+                    event.get("source_records", [])
+                )
+
+                if not primary.get("room") and event.get(
+                    "room"
+                ):
+                    primary["room"] = event["room"]
+
+                to_drop.add(indices[local_i])
+
+            primary["sources"] = merged_sources
+            primary["source_records"] = merged_records
+            primary["multi_source"] = len(merged_sources) > 1
+
+        if not to_drop:
+            events = events
+        else:
+            events = [
+                event
+                for index, event in enumerate(events)
+                if index not in to_drop
+            ]
+
+        return self._reconcile_blank_teacher_via_context(
+            events
+        )
+
+    def _reconcile_blank_teacher_via_context(
+        self,
+        events: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+
+        """
+        A record with NO teacher attached (its own source page
+        never named one, and _normalize_subjects_for_fusion
+        couldn't resolve a trailing short code because it was
+        ambiguous - e.g. "MM" matches more than one teacher)
+        can still be identified safely by relational context:
+        if its (day, slot, subject, room, class) combination is
+        IDENTICAL to an already-known, directly-sourced event
+        that DOES have a teacher, that is the same real session,
+        and the known teacher is adopted.
+
+        This is intentionally a SEPARATE, stricter pass from
+        _reconcile_class_granularity: it requires day, slot,
+        subject, room AND class (not just teacher/day/slot/
+        subject/room with a class hierarchy) to match exactly,
+        specifically because it is filling in the teacher field
+        itself rather than merging two already-attributed
+        records. It never resolves a conflict between two
+        different named teachers, and it never merges two
+        blank-teacher records with each other.
+        """
+
+        by_context: Dict[Tuple, List[str]] = defaultdict(list)
+
+        for event in events:
+
+            teacher = str(event.get("teacher", "")).strip()
+
+            if not teacher:
+                continue
+
+            # Room is intentionally EXCLUDED from the grouping
+            # key here (day, slot, subject, class only) because
+            # a blank room on one record just means that source
+            # page didn't repeat the room for this cell - not
+            # that it's a different room. Room agreement is
+            # still checked below before any actual merge, so a
+            # record with a real but DIFFERENT room is never
+            # merged.
+            context = (
+                self.normalize_day(event.get("day", "")),
+                self.normalize_slot(event.get("slot", "")),
+                self.normalize_text(event.get("subject", "")),
+                self.normalize_text(event.get("class_name", "")),
+            )
+
+            if not all(context):
+                continue
+
+            if teacher not in by_context[context]:
+                by_context[context].append(teacher)
+
+        kept = []
+
+        for index, event in enumerate(events):
+
+            teacher = str(event.get("teacher", "")).strip()
+
+            if teacher:
+                kept.append(event)
+                continue
+
+            context = (
+                self.normalize_day(event.get("day", "")),
+                self.normalize_slot(event.get("slot", "")),
+                self.normalize_text(event.get("subject", "")),
+                self.normalize_text(event.get("class_name", "")),
+            )
+
+            candidates = by_context.get(context, [])
+
+            # Only resolve when the context points to exactly
+            # ONE known teacher - a context matching two
+            # different named teachers is left alone rather
+            # than guessing between them.
+            if len(candidates) == 1:
+
+                target_teacher = candidates[0]
+                own_room = self.normalize_text(
+                    event.get("room", "")
+                )
+
+                merged = False
+
+                for other in events:
+
+                    if (
+                        str(
+                            other.get("teacher", "")
+                        ).strip()
+                        != target_teacher
+                    ):
+                        continue
+
+                    if (
+                        self.normalize_day(
+                            other.get("day", "")
+                        ) != context[0]
+                        or self.normalize_slot(
+                            other.get("slot", "")
+                        ) != context[1]
+                        or self.normalize_text(
+                            other.get("subject", "")
+                        ) != context[2]
+                        or self.normalize_text(
+                            other.get("class_name", "")
+                        ) != context[3]
+                    ):
+                        continue
+
+                    other_room = self.normalize_text(
+                        other.get("room", "")
+                    )
+
+                    # Never merge two records that both name a
+                    # real room but DISAGREE on which one.
+                    if own_room and other_room and (
+                        own_room != other_room
+                    ):
+                        continue
+
+                    for source in event.get("sources", []):
+                        if source not in other["sources"]:
+                            other["sources"].append(source)
+
+                    other["source_records"].extend(
+                        event.get("source_records", [])
+                    )
+
+                    other["multi_source"] = (
+                        len(other["sources"]) > 1
+                    )
+
+                    if not other.get("room") and event.get(
+                        "room"
+                    ):
+                        other["room"] = event["room"]
+
+                    merged = True
+                    break
+
+                if merged:
+                    continue
+
+            kept.append(event)
+
+        return kept
+
     def match(
         self,
         records: Optional[
@@ -1042,6 +1692,15 @@ class CanonicalEventMatcher:
         records = self.records
 
         self.raw_record_count = len(
+            records
+        )
+
+        # =====================================================
+        # CROSS-FILE SUBJECT NORMALIZATION (see
+        # _normalize_subjects_for_fusion for full rationale)
+        # =====================================================
+
+        records = self._normalize_subjects_for_fusion(
             records
         )
 
@@ -1266,6 +1925,10 @@ class CanonicalEventMatcher:
             self.matched_groups[
                 key
             ] = grouped_records
+
+        self.events = self._reconcile_class_granularity(
+            self.events
+        )
 
         return self.events
 
