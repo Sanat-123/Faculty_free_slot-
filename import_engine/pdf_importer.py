@@ -1021,13 +1021,22 @@ class PDFImporter:
     # DIVISION / SECTION SUFFIX DETECTION
     #
     # Some timetables split one numbered class (e.g. "5CS") into
-    # lettered sections/divisions (e.g. "AI-A", "AI-B", "DV-R")
-    # that appear in the cell text as a SEPARATE trailing token,
-    # not glued onto the digit-prefixed class code detect_class()
+    # lettered sections/divisions (e.g. "AI-A", "AI-B") that
+    # appear in the cell text as a SEPARATE trailing token, not
+    # glued onto the digit-prefixed class code detect_class()
     # already finds. This is a shape-based pattern (short letter
     # group, hyphen, one or two letters) - not a list of known
     # section names - so it generalizes to any uploaded
     # timetable's own section naming.
+    #
+    # A genuine division suffix always comes AFTER something else
+    # in the cell - the subject, a room, and/or the class digits
+    # it refines (e.g. "CGMT 404 5CS AI-A"). It is never the very
+    # first token. A subject/course CODE that merely happens to
+    # share this same shape (e.g. "DV-R") sits right where a
+    # cell's subject always starts - at the very beginning - so
+    # rejecting a match at position 0 is what tells the two apart
+    # without needing to know either string by name.
     # ==========================================================
 
     @staticmethod
@@ -1042,6 +1051,9 @@ class PDFImporter:
         )
 
         if not match:
+            return ""
+
+        if match.start() == 0:
             return ""
 
         return match.group(0)
