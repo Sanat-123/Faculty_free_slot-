@@ -1593,6 +1593,15 @@ class FacultyAIChatbot:
 
         # --------------------------------------------------
         # Response
+        #
+        # Each free faculty member's semester(s)/subject(s)
+        # are looked up from the SAME teacher_search() records
+        # FIND_SUBJECT already uses - nothing is hard-coded,
+        # this is purely derived from whatever timetable data
+        # is currently loaded. Semester numbers reuse
+        # QueryEngine._semester_from_class_name(), the same
+        # class-name-driven derivation semester_schedule()
+        # already relies on.
         # --------------------------------------------------
 
         lines = []
@@ -1604,13 +1613,74 @@ class FacultyAIChatbot:
 
         lines.append("")
 
+        lines.append(
+            "| # | Faculty | Semester(s) | Subject(s) |"
+        )
+
+        lines.append(
+            "|---|---|---|---|"
+        )
+
         for index, teacher in enumerate(
             teachers,
             start=1
         ):
 
+            teacher_records = (
+                self.query_engine.teacher_search(
+                    teacher
+                ).get(
+                    "results",
+                    []
+                )
+            )
+
+            semesters = set()
+            subjects = set()
+
+            for record in teacher_records:
+
+                if not isinstance(record, dict):
+                    continue
+
+                record_class = record.get(
+                    "class_name"
+                ) or record.get(
+                    "class"
+                )
+
+                semester = (
+                    self.query_engine.
+                    _semester_from_class_name(
+                        record_class
+                    )
+                )
+
+                if semester is not None:
+                    semesters.add(semester)
+
+                record_subject = str(
+                    record.get(
+                        "subject",
+                        ""
+                    )
+                ).strip()
+
+                if record_subject:
+                    subjects.add(record_subject)
+
+            semester_text = ", ".join(
+                str(s)
+                for s in sorted(semesters)
+            ) or "—"
+
+            subject_text = ", ".join(
+                sorted(subjects)
+            ) or "—"
+
             lines.append(
-                f"{index}. {teacher}"
+                f"| {index} | {teacher} | "
+                f"{semester_text} | {subject_text} |"
             )
 
         lines.append("")
