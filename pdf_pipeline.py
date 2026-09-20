@@ -263,6 +263,10 @@ def build_database(database: dict, db_path: str | None = None):
 # 3. Activation
 # ------------------------------------------------------------------
 
+# The data-driven query engine built from the ACTIVE (uploaded) database.
+_SMART_ENGINE = None
+
+
 def activate(db_path: str) -> None:
     """
     Point every database reader in the project at the new database.
@@ -283,6 +287,20 @@ def activate(db_path: str) -> None:
         free_slot_engine.DB_FILE = db_path
     except Exception:
         pass
+
+    # Build the data-driven query engine from the very same database, so
+    # every answer about the uploaded PDF comes from that PDF's data.
+    global _SMART_ENGINE
+
+    try:
+        from engine.smart_query import SmartQueryEngine
+        from engine.timetable_model import TimetableModel
+
+        _SMART_ENGINE = SmartQueryEngine(
+            TimetableModel.from_sqlite(db_path)
+        )
+    except Exception:
+        _SMART_ENGINE = None
 
 
 # ------------------------------------------------------------------
@@ -306,6 +324,40 @@ def answer_query(query: str, entity_extractor=None) -> dict:
     from database.knowledge_loader import KnowledgeLoader
     from database.db_manager import execute_query
     from database.timetable_repository import TimetableRepository
+
+    # --------------------------------------------------------------
+    # 1. The data-driven engine answers first (built from the active
+    #    database in activate()).  If it understood the question the
+    #    result is returned in the same dict shape as before.
+    # --------------------------------------------------------------
+
+    if _SMART_ENGINE is not None:
+
+        smart_text = _SMART_ENGINE.answer(query)
+
+        if smart_text is None:
+            smart_text = _SMART_ENGINE.fallback_text()
+            smart_intent = "UNKNOWN"
+        else:
+            smart_intent = str(
+                _SMART_ENGINE.last_route or "SMART"
+            ).upper()
+
+        return {
+            "query": query,
+            "intent": smart_intent,
+            "day": None,
+            "slot": None,
+            "entities": {},
+            "rows": [],
+            "text": smart_text,
+            "detection": {
+                "intent": smart_intent,
+                "day": None,
+                "slot": None,
+                "entities": {},
+            },
+        }
 
     tokens = QueryTokenizer.tokenize(query)
     filtered = StopWordFilter.filter(tokens)

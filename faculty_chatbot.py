@@ -23,6 +23,7 @@ from scheduling.exam_duty_store import ExamDutyStore
 from scheduling.exam_duty_planner import ExamDutyCoordinator
 from query_engine import QueryEngine
 from query_engine.natural_language_query import NaturalLanguageQuery
+from engine.smart_query import SmartQueryEngine
 
 
 
@@ -327,6 +328,22 @@ class FacultyAIChatbot:
         self._pending_exam_duty_plan = None
 
         print("Exam Duty Coordinator ready.")
+
+        # --------------------------------------------------
+        # SMART QUERY ENGINE
+        #
+        # Data-driven natural-language layer (engine/smart_query.py).
+        # It is built from the SAME canonical events the rest of the
+        # chatbot uses, so every day, slot, faculty, subject, class and
+        # room it understands comes from the loaded timetable - nothing
+        # is hard-coded. process_query() offers each question to it
+        # first; questions it does not own (absence planning, exam duty,
+        # lab shifts, what-if ...) fall through to the original pipeline.
+        # --------------------------------------------------
+
+        self.smart_engine = SmartQueryEngine.from_matcher(self.matcher)
+
+        print("Smart Query Engine ready.")
 
         self.nl_query = NaturalLanguageQuery(
             self.query_engine
@@ -1747,6 +1764,61 @@ class FacultyAIChatbot:
     
 
     def process_query(self, query):
+        """
+        Answer one chat message.
+
+        1. Pending confirmations ("confirm" after an exam-duty or lab-shift
+           proposal) always go to the original pipeline.
+        2. Everything else is offered to the data-driven SmartQueryEngine
+           first (free/busy lists, multi-slot conditions, teacher status,
+           subjects, classes, rooms, labs, rankings, conflicts, follow-ups).
+        3. Questions the smart engine does not own - absence and
+           substitutes, exam duty, lab shifts, what-if, workload dashboards -
+           are handled by the original pipeline (_legacy_process_query).
+        4. If nothing understood the message, a helpful fallback with
+           examples built from the loaded data is returned.
+        """
+
+        query = str(query).strip()
+
+        if not query:
+            return "Please enter a query."
+
+        lowered = query.lower()
+
+        awaiting_confirmation = (
+            (
+                self._pending_exam_duty_plan is not None
+                or self._pending_lab_shift_plan is not None
+            )
+            and any(
+                word in lowered
+                for word in ("confirm", "yes confirm", "go ahead")
+            )
+        )
+
+        if not awaiting_confirmation:
+
+            answer = self.smart_engine.answer(query)
+
+            if answer is not None:
+                return answer
+
+        response = self._legacy_process_query(query)
+
+        if (
+            response is None
+            or not str(response).strip()
+            or re.match(
+                r"^I could not understand (?:the|that timetable) query",
+                str(response).strip(),
+            )
+        ):
+            return self.smart_engine.fallback_text()
+
+        return response
+
+    def _legacy_process_query(self, query):
 
         query = str(query).strip()
 
@@ -3397,10 +3469,18 @@ class FacultyAIChatbot:
 
                 try:
 
+                    # a "slot N" in the question narrows the cover
+                    # request to that period only
+                    requested_slot = self._extract_slot(query)
+
                     result = (
                         self.absence_engine.replacement_candidates(
                             teacher,
-                            day
+                            day,
+                            slots=(
+                                [requested_slot]
+                                if requested_slot else None
+                            ),
                         )
                     )
 

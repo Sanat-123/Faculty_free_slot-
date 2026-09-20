@@ -4,13 +4,38 @@ class QueryPlanner:
     Connects the NLP chatbot with the existing QueryEngine.
     """
 
+    _default_engine = None
+
+    @classmethod
+    def default_query_engine(cls):
+        """
+        The QueryEngine of the project's default dataset, built lazily
+        once.  Used only when plan() is called without an explicit
+        query_engine (older scripts/tests call it with three arguments).
+        """
+
+        if cls._default_engine is None:
+
+            import contextlib
+            import io
+
+            from faculty_chatbot import FacultyAIChatbot
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                cls._default_engine = FacultyAIChatbot().query_engine
+
+        return cls._default_engine
+
     @staticmethod
     def plan(
         intent,
         entities,
         day_slot,
-        query_engine
+        query_engine=None
     ):
+
+        if query_engine is None:
+            query_engine = QueryPlanner.default_query_engine()
 
         # ==================================================
         # EXTRACT ENTITIES

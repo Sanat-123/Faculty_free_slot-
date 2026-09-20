@@ -1,6 +1,8 @@
 from collections import defaultdict
 import re
 
+from utils.faculty_names import find_composites, is_placeholder_name
+
 
 class FacultyAbsenceEngine:
 
@@ -577,11 +579,19 @@ class FacultyAbsenceEngine:
         if not day_key or target_slot is None:
             return False
 
+        composite_parts = self._composite_parts()
+
         for event in self._events():
 
+            event_teacher = self._text(event.get("teacher")).lower()
+
             if (
-                self._text(event.get("teacher")).lower()
-                == teacher_key
+                (
+                    event_teacher == teacher_key
+                    or teacher_key in composite_parts.get(
+                        event_teacher, ()
+                    )
+                )
                 and self._normalize_day(event.get("day"))
                 == day_key
                 and self._slot_number(event.get("slot"))
@@ -590,6 +600,39 @@ class FacultyAbsenceEngine:
                 return False
 
         return True
+
+    def _composite_parts(self):
+        """
+        {merged name (lower): {person (lower), ...}}
+
+        A merged entry such as "A B" that is exactly the concatenation of
+        two other teacher names means both people are teaching that slot.
+        Detected structurally from the loaded data (no names hard-coded).
+        """
+
+        events = self._events()
+
+        signature = len(events)
+
+        cache = getattr(self, "_composite_cache", None)
+
+        if cache is not None and cache[0] == signature:
+            return cache[1]
+
+        names = {
+            self._text(e.get("teacher"))
+            for e in events
+            if self._text(e.get("teacher"))
+        }
+
+        parts = {
+            merged.lower(): {a.lower(), b.lower()}
+            for merged, (a, b) in find_composites(sorted(names)).items()
+        }
+
+        self._composite_cache = (signature, parts)
+
+        return parts
 
     def is_faculty_free_for_block(self, teacher, day, block):
 
@@ -614,6 +657,8 @@ class FacultyAbsenceEngine:
 
         faculty = set()
 
+        composites = self._composite_parts()
+
         for event in self._events():
 
             teacher = self._text(event.get("teacher"))
@@ -622,6 +667,14 @@ class FacultyAbsenceEngine:
                 continue
 
             if teacher.lower() == exclude_key:
+                continue
+
+            # codes / placeholders ("AS", "XE2") and merged names are
+            # not people who can be asked to cover a class
+            if is_placeholder_name(teacher):
+                continue
+
+            if teacher.lower() in composites:
                 continue
 
             faculty.add(teacher)
@@ -818,7 +871,7 @@ class FacultyAbsenceEngine:
     # REPLACEMENT CANDIDATES
     # ============================================================
 
-    def replacement_candidates(self, teacher, day):
+    def replacement_candidates(self, teacher, day, slots=None):
 
         day_key = self._normalize_day(day)
 
@@ -837,6 +890,23 @@ class FacultyAbsenceEngine:
             teacher,
             day_key,
         )
+
+        # Optional slot scope: only the absent blocks that touch one of
+        # the requested slots (e.g. "substitute for slot 2").
+        if slots:
+
+            wanted = {
+                self._slot_number(s) for s in slots
+                if self._slot_number(s) is not None
+            }
+
+            blocks = [
+                b for b in blocks
+                if wanted & {
+                    self._slot_number(e.get("slot"))
+                    for e in b.get("events", [])
+                }
+            ]
 
         workload = self._daily_workload_map(
             day_key
@@ -1097,7 +1167,7 @@ class FacultyAbsenceEngine:
     # BEST REPLACEMENT RECOMMENDATIONS
     # ============================================================
 
-    def best_replacements(self, teacher, day):
+    def best_replacements(self, teacher, day, slots=None):
         """
         Select the best replacement faculty for every absent block.
 
@@ -1116,6 +1186,7 @@ class FacultyAbsenceEngine:
         result = self.replacement_candidates(
             teacher,
             day,
+            slots=slots,
         )
 
         if not result.get("blocks"):
