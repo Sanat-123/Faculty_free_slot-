@@ -351,7 +351,48 @@ class IntentDetector:
                 for word in words
             )
 
-            if classes and (class_like_token or not subjects):
+            # ==============================================
+            # 3b. GENUINE SUBJECT vs COINCIDENTAL SUBJECT
+            # ==============================================
+            #
+            # The guard above exists for the coincidental
+            # case: a class-shaped token (e.g. "7cs") is
+            # ALSO what the fuzzy subject matcher matched on
+            # (entities["subjects"][i]["text"] is itself
+            # class-shaped) - there the class interpretation
+            # should win.
+            #
+            # It must NOT fire when a real, separate subject
+            # is present (e.g. "Who teaches AOA in 7CSA?" -
+            # the subject entity's own matched text is "aoa",
+            # not class-shaped) just because the query ALSO
+            # contains a class-like token. That case has BOTH
+            # a genuine subject and a genuine class, and
+            # QueryPlanner's FIND_TEACHER handler filters by
+            # both, so it should win instead.
+            # ==============================================
+
+            subject_matches_are_class_shaped = bool(
+                subjects
+            ) and all(
+                re.fullmatch(
+                    r"\d+[a-z]+(-[a-z0-9]+)*",
+                    str(
+                        entry.get("text", "")
+                        if isinstance(entry, dict)
+                        else entry
+                    ).strip().casefold()
+                )
+                for entry in subjects
+            )
+
+            if classes and (
+                not subjects
+                or (
+                    class_like_token
+                    and subject_matches_are_class_shaped
+                )
+            ):
 
                 return "FIND_CLASS_TEACHER"
 
