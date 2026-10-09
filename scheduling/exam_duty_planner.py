@@ -328,10 +328,18 @@ class ExamDutyCoordinator:
         required_faculty,
         hall=None,
         session_id=None,
+        teachers=None,
     ) -> dict[str, Any]:
         """
         Produces a structured, side-effect-free exam-duty
         proposal. Never writes to ExamDutyStore.
+
+        `teachers` (optional): the specific faculty to assign instead of
+        the top-ranked ones. Each named teacher is checked against the
+        SAME availability rules as every other candidate (free for the
+        whole time range, not already on duty in this session); if any
+        cannot be assigned the proposal is rejected with the reason for
+        each, and nothing is proposed.
         """
 
         try:
@@ -380,7 +388,7 @@ class ExamDutyCoordinator:
             )
         ]
 
-        if not available:
+        if not available and not teachers:
             return {
                 "success": False,
                 "status": "rejected",
@@ -391,7 +399,7 @@ class ExamDutyCoordinator:
                 "end_time": end_time,
             }
 
-        if len(available) < required_count:
+        if not teachers and len(available) < required_count:
             return {
                 "success": False,
                 "status": "rejected",
@@ -407,6 +415,43 @@ class ExamDutyCoordinator:
 
         selected = available[:required_count]
 
+        if teachers:
+
+            by_name = {c["teacher"]: c for c in available}
+
+            all_names = {
+                c["teacher"] for c in candidate_result["results"]
+            }
+
+            unavailable = {}
+
+            selected = []
+
+            for name in teachers:
+
+                if name in by_name:
+                    if by_name[name] not in selected:
+                        selected.append(by_name[name])
+                elif name in all_names:
+                    unavailable[name] = "already_on_duty_in_this_session"
+                else:
+                    unavailable[name] = "not_free_for_the_whole_time_range"
+
+            if unavailable:
+                return {
+                    "success": False,
+                    "status": "rejected",
+                    "reason": "requested_teachers_unavailable",
+                    "exam_date": candidate_result["exam_date"],
+                    "day": candidate_result["day"],
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "unavailable": unavailable,
+                    "available_requested": [c["teacher"] for c in selected],
+                }
+
+            required_count = len(selected)
+
         return {
             "success": True,
             "status": "proposed",
@@ -418,6 +463,9 @@ class ExamDutyCoordinator:
             "session_id": session_id_text or "",
             "session_key": session_key,
             "required_count": required_count,
+            "requested_teachers": (
+                [c["teacher"] for c in selected] if teachers else []
+            ),
             "recommended": selected,
             "existing_duty_counts": {
                 candidate["teacher"]: candidate[
@@ -469,6 +517,8 @@ class ExamDutyCoordinator:
                 "reason": "invalid_plan",
             }
 
+        # A plan made for SPECIFIC people is re-checked for those same
+        # people (still free, not on duty); a ranked plan is re-ranked.
         fresh_plan = self.plan_duty(
             exam_date=exam_date,
             start_time=start_time,
@@ -476,6 +526,7 @@ class ExamDutyCoordinator:
             required_faculty=required_count,
             hall=hall,
             session_id=session_id,
+            teachers=plan.get("requested_teachers") or None,
         )
 
         if not fresh_plan.get("success"):

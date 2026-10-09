@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+
+from utils.file_discovery import state_file
 from typing import Any
 
 
@@ -19,8 +21,9 @@ class AssignmentStore:
         - usable by CLI, chatbot, Streamlit, or future API code
     """
 
-    def __init__(self, path: str | Path = "data/assignments.json"):
-        self.path = Path(path)
+    def __init__(self, path: str | Path | None = None):
+        # no path given -> <FACULTY_STATE_DIR or data>/assignments.json
+        self.path = Path(path) if path else state_file("assignments.json")
 
     # ============================================================
     # INTERNAL HELPERS
