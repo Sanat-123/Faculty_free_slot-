@@ -150,6 +150,52 @@ class CatalogHandlers:
 
         return "\n".join([head, ""] + numbered(names))
 
+    def h_class_subject_teachers(self, f):
+        """Who teaches <subject> to <class> (both named in the question)."""
+
+        subjects = set(f.subjects)
+
+        by_teacher = defaultdict(set)
+
+        for e in self._class_events(f):
+            if e["teacher"] and e["subject"] in subjects:
+                by_teacher[e["teacher"]].add(e["subject"])
+
+        title = (
+            f"{', '.join(f.subjects)} in {', '.join(f.classes)}"
+        )
+
+        if not by_teacher:
+            return (
+                f"No teacher is recorded for {title}."
+            )
+
+        names = _sorted(by_teacher)
+
+        self._last_names = names
+
+        return "\n".join(
+            [f"**Teachers of {title}** · {len(names)}", ""] + numbered(names)
+        )
+
+    def h_list_teachers(self, f):
+
+        names = list(self.model.faculty)
+
+        head = (
+            f"**{plural(len(names), 'teacher')} in the timetable**"
+            if "how_many" in f.cues
+            else f"**All faculty in the timetable** · {len(names)}"
+        )
+
+        self._last_names = names
+
+        return "\n".join([head, ""] + numbered(names))
+
+    def h_teacher_total(self, f):
+
+        return self.h_list_teachers(f)
+
     def _subject_table(self, f, days=None):
 
         m = self.model
@@ -388,10 +434,13 @@ class CatalogHandlers:
 
         names = list(self.model.subjects)
 
-        return "\n".join(
-            [f"**All subjects in the timetable** · {len(names)}", ""]
-            + numbered(names)
+        head = (
+            f"**{plural(len(names), 'subject')} in the timetable**"
+            if "how_many" in f.cues
+            else f"**All subjects in the timetable** · {len(names)}"
         )
+
+        return "\n".join([head, ""] + numbered(names))
 
     def h_lab_only_subjects(self, f):
 
@@ -869,10 +918,14 @@ class CatalogHandlers:
 
         names = list(self.model.classes)
 
-        return "\n".join(
-            [f"**All classes and sections** · {len(names)}", ""]
-            + numbered(names)
+        head = (
+            f"**{plural(len(names), 'class', 'classes')} and sections "
+            f"in the timetable**"
+            if "how_many" in f.cues
+            else f"**All classes and sections** · {len(names)}"
         )
+
+        return "\n".join([head, ""] + numbered(names))
 
     # ------------------------------------------------------------------
     # rooms
@@ -1163,9 +1216,13 @@ class CatalogHandlers:
 
         names = list(self.model.rooms)
 
-        return "\n".join(
-            [f"**All rooms** · {len(names)}", ""] + numbered(names)
+        head = (
+            f"**{plural(len(names), 'room')} in the timetable**"
+            if "how_many" in f.cues
+            else f"**All rooms** · {len(names)}"
         )
+
+        return "\n".join([head, ""] + numbered(names))
 
     # ------------------------------------------------------------------
     # labs
@@ -1227,15 +1284,17 @@ class CatalogHandlers:
             f"{n} × {k} slots" for k, n in sorted(lengths.items())
         )
 
+        tail = f" ({summary})" if summary else ""
+
         if len(multi) == len(blocks):
             head = (
                 f"**All {plural(len(multi), 'lab session')} span more than "
-                f"one slot** ({summary})"
+                f"one slot**{tail}"
             )
         else:
             head = (
                 f"**{plural(len(multi), 'lab session')} span more than one "
-                f"slot** of {len(blocks)} lab sessions ({summary})"
+                f"slot** of {len(blocks)} lab sessions{tail}"
             )
 
         if not multi:
@@ -1452,6 +1511,30 @@ class CatalogHandlers:
             )
 
         return "\n".join(lines)
+
+    def h_slot_times(self, f):
+        """Clock time of the named slots (or of every slot)."""
+
+        m = self.model
+
+        slots = sorted(f.slots) if f.slots else list(m.slots)
+
+        if not any(m.slot_label(x) for x in slots):
+            return (
+                f"This timetable has no clock times; its slots are numbered "
+                f"{m.slots[0]}–{m.slots[-1]}."
+            )
+
+        rows = [[x, m.slot_label(x) or "—"] for x in slots]
+
+        return "\n".join(
+            [
+                "**Slot timings**" if len(slots) > 1
+                else f"**Slot {slots[0]} timing**",
+                "",
+            ]
+            + md_table(["Slot", "Time"], rows)
+        )
 
     def h_data_quality(self, f):
 

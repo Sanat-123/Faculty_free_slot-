@@ -2,9 +2,8 @@
 =====================================================================
 PDF Timetable Ingestion + Chat Answering Pipeline
 =====================================================================
-Parses a faculty-wise timetable PDF (same format as
-``data/Facultywise TT 20 sep.pdf``) into a fresh SQLite database and
-activates it for the NLP engine.
+Parses a faculty-wise timetable PDF (any file; nothing here knows a file
+name) into a fresh SQLite database and activates it for the NLP engine.
 
 How it works
 ------------
@@ -36,32 +35,108 @@ from __future__ import annotations
 
 import io
 import os
+import sys
 import re
 import sqlite3
 import tempfile
 
 import pdfplumber
 
-from parser.data_cleaner import parse_cell
+from parser.data_cleaner import parse_cell            # legacy rule-based parser
+from parser.learned_cell_parser import CellVocabulary  # document-learned parser
 from utils.validator import is_valid_teacher
 
 # ------------------------------------------------------------------
 # Constants
 # ------------------------------------------------------------------
 
-DAY_MAP = {
-    "Mo": "Monday",
-    "Tu": "Tuesday",
-    "We": "Wednesday",
-    "Th": "Thursday",
-    "Fr": "Friday",
-    "Sa": "Saturday",
-}
+def _language_resource(name, default):
+    """Read a generic word list from config/nlu_lexicon.json.
 
-# "Teacher Dr. Mehul Mahrishi" appears at the top of every page
-TEACHER_HEADER = re.compile(r"Teacher\s+(.+)", re.IGNORECASE)
+    Calendar names and header words are language resources, not timetable
+    data: edit the JSON to support another language or PDF layout.
+    """
 
-SLOTS = range(1, 9)  # the timetable has 8 slots per day
+    import json
+
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "config", "nlu_lexicon.json",
+    )
+
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh).get(name) or default
+    except Exception:
+        return default
+
+
+def _teacher_header_regex():
+    """\"Teacher <Name>\" (or another configured header word) + the name."""
+
+    words = _language_resource("teacher_header_words", ["Teacher"])
+
+    return re.compile(
+        r"(?:" + "|".join(re.escape(w) for w in words) + r")\s*[:\-]?\s*(.+)",
+        re.IGNORECASE,
+    )
+
+
+def _day_from_label(label, weekdays):
+    """'Mo' / 'Mon' / 'Monday' / 'Thurs' -> 'Monday' (None if not a day).
+
+    A label is a day when it is a prefix of a weekday name and shares the
+    weekday's first two letters, so Tu/Th and Sa/Su stay distinct.
+    """
+
+    text = re.sub(r"[^a-z]", "", str(label or "").lower())
+
+    if len(text) < 2:
+        return None
+
+    for weekday in weekdays:
+
+        name = weekday.lower()
+
+        if name.startswith(text) or (
+            text.startswith(name[:2]) and name.startswith(text[:3])
+        ):
+            return weekday
+
+    return None
+
+
+CLOCK_RANGE = re.compile(r"\d{1,2}[:.]\d{2}\s*[-\u2013to ]+\s*\d{1,2}[:.]\d{2}")
+
+
+def _slot_columns(header_row):
+    """
+    Read the slot numbers (and clock times) from the table's header row.
+
+    Returns {column_index: (slot_number, "8:15 - 9:15" or "")}.  Slot numbers
+    come from the header text ("1\n8:15 - 9:15" -> 1); when a header cell
+    has no number the column position is used.  Nothing about the number of
+    slots is assumed.
+    """
+
+    columns = {}
+
+    for index, cell in enumerate(header_row or []):
+
+        if index == 0:
+            continue
+
+        text = str(cell or "").strip()
+
+        number = re.match(r"\s*(\d+)", text)
+        clock = CLOCK_RANGE.search(text)
+
+        slot = int(number.group(1)) if number else index
+
+        columns[index] = (slot, clock.group(0).strip() if clock else "")
+
+    return columns
+
 
 TIMETABLE_SCHEMA = """
 CREATE TABLE timetable(
@@ -69,6 +144,7 @@ CREATE TABLE timetable(
     teacher TEXT,
     day TEXT,
     slot INTEGER,
+    slot_time TEXT,
     subject TEXT,
     room TEXT,
     class_name TEXT,
@@ -108,7 +184,15 @@ def parse_faculty_pdf(pdf_bytes: bytes) -> dict:
     timetable (no "Teacher <name>" headers found).
     """
     database = {}
+    pending = []
     teacher_pages = 0
+
+    weekdays = _language_resource(
+        "weekdays",
+        ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+         "Saturday", "Sunday"],
+    )
+    header = _teacher_header_regex()
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
 
@@ -119,7 +203,7 @@ def parse_faculty_pdf(pdf_bytes: bytes) -> dict:
             if not text:
                 continue
 
-            match = TEACHER_HEADER.search(text)
+            match = header.search(text)
 
             if not match:
                 continue
@@ -132,8 +216,7 @@ def parse_faculty_pdf(pdf_bytes: bytes) -> dict:
             teacher_pages += 1
 
             # One page = one teacher's timetable
-            days = {day: [] for day in DAY_MAP.values()}
-            database.setdefault(teacher, days)
+            teacher_days = database.setdefault(teacher, {})
 
             tables = page.extract_tables()
 
@@ -142,44 +225,67 @@ def parse_faculty_pdf(pdf_bytes: bytes) -> dict:
 
             table = tables[0]
 
+            slot_columns = _slot_columns(table[0] if table else [])
+
             for row in table[1:]:
 
                 if not row or not row[0]:
                     continue
 
-                day = str(row[0]).strip()
+                full_day = _day_from_label(row[0], weekdays)
 
-                if day not in DAY_MAP:
+                if full_day is None:
                     continue
 
-                full_day = DAY_MAP[day]
+                lectures = teacher_days.setdefault(full_day, [])
 
-                for slot in SLOTS:
+                for column, (slot, clock) in slot_columns.items():
 
-                    if slot >= len(row):
+                    if column >= len(row):
                         continue
 
-                    cell = row[slot]
+                    cell = row[column]
 
-                    if not cell:
+                    if not cell or not str(cell).strip():
                         continue
 
-                    parsed = parse_cell(cell)
+                    # parsed after the whole PDF is read (see below)
+                    pending.append((lectures, slot, clock, cell))
 
-                    if not parsed or not parsed.get("subject", "").strip():
-                        continue
+    # Learn the document's own vocabulary (rooms, class spellings, group
+    # marker) from ALL its cells, then parse every cell with it.  No room
+    # list, class-code format or department is assumed.
+    # FACULTY_LEGACY_CELL_PARSER=1 switches back to the old rule-based parser.
+    if os.environ.get("FACULTY_LEGACY_CELL_PARSER") == "1":
+        parse_one = parse_cell
+    else:
+        vocabulary = CellVocabulary(
+            [cell for _, _, _, cell in pending],
+            type_keywords=_language_resource("type_keywords", None),
+        )
+        parse_one = vocabulary.parse
 
-                    database[teacher][full_day].append({
-                        "slot": slot,
-                        **parsed,
-                    })
+    for lectures, slot, clock, cell in pending:
+
+        parsed = parse_one(cell)
+
+        if not parsed or not parsed.get("subject", "").strip():
+            continue
+
+        lectures.append({
+            "slot": slot,
+            "slot_time": clock,
+            **parsed,
+        })
 
     if not database:
         raise ValueError(
             "Could not find any faculty timetable in this PDF. "
             "Please upload a faculty-wise timetable PDF (one page per "
-            "teacher, starting with 'Teacher <Name>' and a Mo-Sa slot "
-            "table), like the sample 'Facultywise TT 20 sep.pdf'."
+            "teacher, with a 'Teacher <Name>' heading and a table of "
+            "days by slots). "
+            "Header words and day names can be extended in "
+            "config/nlu_lexicon.json."
         )
 
     return database
@@ -222,15 +328,16 @@ def build_database(database: dict, db_path: str | None = None):
                 cursor.execute(
                     """
                     INSERT INTO timetable(
-                        teacher, day, slot, subject,
+                        teacher, day, slot, slot_time, subject,
                         room, class_name, group_name, type
                     )
-                    VALUES(?,?,?,?,?,?,?,?)
+                    VALUES(?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         teacher,
                         day,
                         lecture["slot"],
+                        lecture.get("slot_time", ""),
                         subject,
                         lecture.get("room", "").strip(),
                         class_name,
@@ -266,6 +373,10 @@ def build_database(database: dict, db_path: str | None = None):
 # The data-driven query engine built from the ACTIVE (uploaded) database.
 _SMART_ENGINE = None
 
+# Optional LLM front end (engine/llm_layer.py) wrapped around _SMART_ENGINE.
+# None unless ANTHROPIC_API_KEY is set; the rule-based engine is the fallback.
+_LLM = None
+
 
 def activate(db_path: str) -> None:
     """
@@ -290,7 +401,9 @@ def activate(db_path: str) -> None:
 
     # Build the data-driven query engine from the very same database, so
     # every answer about the uploaded PDF comes from that PDF's data.
-    global _SMART_ENGINE
+    global _SMART_ENGINE, _LLM
+
+    _LLM = None
 
     try:
         from engine.smart_query import SmartQueryEngine
@@ -302,12 +415,83 @@ def activate(db_path: str) -> None:
     except Exception:
         _SMART_ENGINE = None
 
+    # AI conversation layer (optional): understands any wording and answers
+    # in natural language, using the engine above as its only data source.
+    try:
+        from engine.llm_layer import LLMAssistant
+
+        if _SMART_ENGINE is not None and LLMAssistant.available():
+            _LLM = LLMAssistant(_SMART_ENGINE)
+    except Exception:
+        _LLM = None
+
+
+def find_faculty_pdf(directory=None):
+    """
+    The PDF to use when none is named: $FACULTY_TIMETABLE_PDF, else the newest
+    PDF in the data folder that really IS a faculty-wise timetable (a folder
+    usually also holds class-wise / room-wise PDFs, which are skipped).
+    """
+
+    from utils.file_discovery import list_timetable_pdfs
+
+    explicit = os.environ.get("FACULTY_TIMETABLE_PDF")
+
+    if explicit and os.path.isfile(explicit):
+        return explicit
+
+    for path in list_timetable_pdfs(directory):
+
+        try:
+            with open(path, "rb") as fh:
+                parse_faculty_pdf(fh.read())
+            return str(path)
+        except Exception:
+            continue
+
+    return None
+
+
+def example_questions(limit: int = 6) -> list:
+    """Example questions built from the CURRENTLY LOADED timetable.
+
+    Real teacher / class / subject names come from the data; before anything
+    is loaded generic placeholders are returned.
+    """
+
+    if _SMART_ENGINE is not None:
+        try:
+            found = _SMART_ENGINE.examples()
+            if found:
+                return found[:limit]
+        except Exception:
+            pass
+
+    return [
+        "Who is free on <day> slot <n>?",
+        "Is <teacher> free on <day> slot <n>?",
+        "Show timetable of <teacher or class>",
+        "Who teaches <subject>?",
+        "Which rooms are free on <day> slot <n>?",
+    ][:limit]
+
+
+def _examples_bullets(limit: int = 6) -> str:
+
+    return "\n".join(f"• {q}" for q in example_questions(limit))
+
+
+def ai_enabled() -> bool:
+    """True when answers go through the AI conversation layer."""
+
+    return _LLM is not None
+
 
 # ------------------------------------------------------------------
 # 4. Chat Answering
 # ------------------------------------------------------------------
 
-def answer_query(query: str, entity_extractor=None) -> dict:
+def answer_query(query: str, entity_extractor=None, history=None) -> dict:
     """
     Run one chat question through the NLP pipeline.
 
@@ -330,6 +514,35 @@ def answer_query(query: str, entity_extractor=None) -> dict:
     #    database in activate()).  If it understood the question the
     #    result is returned in the same dict shape as before.
     # --------------------------------------------------------------
+
+    if _LLM is not None:
+
+        # Conversational path. Any failure (network, quota, bad reply)
+        # silently falls through to the rule-based engine below.
+        try:
+
+            reply = _LLM.answer(query, history)
+
+            return {
+                "query": query,
+                "intent": "AI_ASSISTANT",
+                "day": None,
+                "slot": None,
+                "entities": {"Asked the timetable": reply["queries"]}
+                if reply["queries"] else {},
+                "rows": [],
+                "text": reply["text"],
+                "detection": {
+                    "intent": "AI_ASSISTANT",
+                    "day": None,
+                    "slot": None,
+                    "entities": {"Asked the timetable": reply["queries"]}
+                    if reply["queries"] else {},
+                },
+            }
+
+        except Exception:
+            pass
 
     if _SMART_ENGINE is not None:
 
@@ -493,8 +706,7 @@ def answer_query(query: str, entity_extractor=None) -> dict:
 
         text = (
             "Whose timetable would you like to see? 😊\n\n"
-            "• Show timetable of **3CS-DS-A**\n"
-            "• Show timetable of **Dr. Pankaj Dadheech**"
+            "Try, for example:\n" + _examples_bullets(4)
         )
 
     # --------------------------------------------------------------
@@ -539,12 +751,7 @@ def answer_query(query: str, entity_extractor=None) -> dict:
 
         text = (
             "🤔 I couldn't understand that question. Try asking:\n\n"
-            "• Who teaches **Python**?\n"
-            "• Who is free on **Monday slot 3**?\n"
-            "• Show timetable of **3CS-DS-A**\n"
-            "• Where is **Python for DS Lab**?\n"
-            "• Subjects of **Dr. Pankaj Dadheech**\n"
-            "• Which rooms are free on **Tuesday slot 4**?"
+            + _examples_bullets()
         )
 
     # --------------------------------------------------------------
@@ -589,7 +796,18 @@ def answer_query(query: str, entity_extractor=None) -> dict:
 
 if __name__ == "__main__":
 
-    sample = os.path.join("data", "Facultywise TT 20 sep.pdf")
+    # PDF = first command-line argument, else $FACULTY_TIMETABLE_PDF, else
+    # the newest faculty-wise PDF in the data folder; no file name is
+    # built into the code
+    sample = sys.argv[1] if len(sys.argv) > 1 else find_faculty_pdf()
+
+    if not sample:
+        sys.exit(
+            "No timetable PDF found. Usage: python pdf_pipeline.py "
+            "<timetable.pdf>   (or put a PDF in the data folder)"
+        )
+
+    print("Using:", sample)
 
     with open(sample, "rb") as file:
         data = parse_faculty_pdf(file.read())
@@ -604,14 +822,7 @@ if __name__ == "__main__":
     print("Database        :", db_path)
     print()
 
-    for question in [
-        "Who teaches Python?",
-        "Who is free on Monday slot 3?",
-        "Show timetable of 3CS-DS-A",
-        "Where is Python for DS Lab?",
-        "Subjects of Dr. Pankaj Dadheech",
-        "Which rooms are free on Tuesday slot 4?",
-    ]:
+    for question in example_questions():
         answer = answer_query(question)
         print("=" * 70)
         print("Q:", question)

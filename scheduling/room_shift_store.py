@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+
+from utils.file_discovery import state_file
 from typing import Any
 
 
@@ -28,9 +30,10 @@ class RoomShiftStore:
 
     def __init__(
         self,
-        path: str | Path = "data/room_shifts.json"
+        path: str | Path | None = None
     ):
-        self.path = Path(path)
+        # no path given -> <FACULTY_STATE_DIR or data>/room_shifts.json
+        self.path = Path(path) if path else state_file("room_shifts.json")
 
     # ============================================================
     # INTERNAL HELPERS

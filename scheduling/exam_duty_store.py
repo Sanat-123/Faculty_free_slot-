@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+
+from utils.file_discovery import state_file
 from typing import Any
 
 
@@ -34,9 +36,10 @@ class ExamDutyStore:
 
     def __init__(
         self,
-        path: str | Path = "data/exam_duties.json"
+        path: str | Path | None = None
     ):
-        self.path = Path(path)
+        # no path given -> <FACULTY_STATE_DIR or data>/exam_duties.json
+        self.path = Path(path) if path else state_file("exam_duties.json")
 
     # ============================================================
     # INTERNAL HELPERS

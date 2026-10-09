@@ -317,10 +317,8 @@ class FacultyHandlers:
 
         if not days:
 
-            if slots:
-                return self._ask_when("day")
-
-            return self._ask_when("day (and slot, if you like)")
+            # no day named ("when is X free?") -> look at the whole week
+            days = list(m.days)
 
         if not slots:
             return self._teacher_day_view(teacher, days)

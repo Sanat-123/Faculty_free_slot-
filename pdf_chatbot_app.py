@@ -30,18 +30,36 @@ if ROOT not in sys.path:
 import pandas as pd
 import streamlit as st
 
+# API key for the optional AI chat mode: environment variable, or
+# .streamlit/secrets.toml  ->  ANTHROPIC_API_KEY = "sk-..."
+try:
+    if "ANTHROPIC_API_KEY" in st.secrets and not os.environ.get("ANTHROPIC_API_KEY"):
+        os.environ["ANTHROPIC_API_KEY"] = str(st.secrets["ANTHROPIC_API_KEY"])
+except Exception:
+    pass
+
+from utils.file_discovery import list_timetable_pdfs
 from pdf_pipeline import (
     parse_faculty_pdf,
     build_database,
     activate,
     answer_query,
+    ai_enabled,
+    example_questions,
 )
 
 # ----------------------------------------------------------------
 # Constants
 # ----------------------------------------------------------------
 
-SAMPLE_PDF = Path("data") / "Facultywise TT 20 sep.pdf"
+@st.cache_data(show_spinner=False)
+def _default_pdf(listing):
+    """Newest faculty-wise PDF of the folder (cached per folder content)."""
+
+    from pdf_pipeline import find_faculty_pdf
+
+    return find_faculty_pdf()
+
 
 RESULT_COLUMNS = [
     "Teacher",
@@ -56,15 +74,6 @@ RESULT_COLUMNS = [
 
 # Intents whose result rows are rendered as a table
 TABLE_INTENTS = {"SHOW_TIMETABLE", "FIND_ROOM", "FIND_SUBJECT"}
-
-SAMPLE_QUESTIONS = [
-    "Who is free on Monday slot 3?",
-    "Who teaches Python?",
-    "Show timetable of 3CS-DS-A",
-    "Where is Python for DS Lab?",
-    "Subjects of Dr. Pankaj Dadheech",
-    "Which rooms are free on Tuesday slot 4?",
-]
 
 # ----------------------------------------------------------------
 # Page config
@@ -139,7 +148,13 @@ def ask(question: str) -> None:
 
     try:
 
-        answer = answer_query(question)
+        answer = answer_query(
+            question,
+            history=[
+                {"role": m["role"], "content": m["content"]}
+                for m in st.session_state.messages[:-1]
+            ],
+        )
 
     except Exception as exc:
 
@@ -195,16 +210,31 @@ with st.sidebar:
             if load_pdf(uploaded.name, uploaded.getvalue()):
                 st.rerun()
 
-    elif st.button("📥 Load sample PDF", width="stretch"):
+    else:
 
-        if SAMPLE_PDF.exists():
+        # timetables found in the data folder (FACULTY_DATA_DIR), newest first
+        local_pdfs = list_timetable_pdfs()
 
-            if load_pdf(SAMPLE_PDF.name, SAMPLE_PDF.read_bytes()):
-                st.rerun()
+        if local_pdfs:
 
-        else:
+            # preselect the newest PDF that really is a faculty-wise timetable
+            best = _default_pdf(
+                tuple((str(p), p.stat().st_mtime) for p in local_pdfs)
+            )
 
-            st.error("Sample PDF not found in `data/`.")
+            names = [str(p) for p in local_pdfs]
+
+            choice = st.selectbox(
+                "…or pick a PDF from the data folder",
+                local_pdfs,
+                index=names.index(best) if best in names else 0,
+                format_func=lambda p: p.name,
+            )
+
+            if st.button("📥 Load selected PDF", width="stretch"):
+
+                if load_pdf(choice.name, choice.read_bytes()):
+                    st.rerun()
 
     # ------------------- Loaded stats -------------------
 
@@ -232,7 +262,7 @@ with st.sidebar:
 
     st.subheader("💡 Try asking")
 
-    for question in SAMPLE_QUESTIONS:
+    for question in example_questions():
 
         if st.button(question, key=f"sample_{question}", width="stretch"):
 
@@ -246,8 +276,12 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
-    st.caption("Powered by the project's own NLP engine "
-               "(intent → entities → planner → SQLite)")
+    if ai_enabled():
+        st.caption("🤖 AI chat mode — any wording works. Facts always "
+                   "come from your timetable data.")
+    else:
+        st.caption("Rule-based mode. Set ANTHROPIC_API_KEY to chat in any "
+                   "wording (see README).")
 
 
 # ----------------------------------------------------------------
@@ -286,17 +320,18 @@ if not st.session_state.pdf_name:
             """
 ### 🚀 How it works
 
-**1. Upload** a faculty-wise timetable PDF — one page per teacher,
-starting with `Teacher <Name>` and a Mo–Sa slot table.
+**1. Upload** a faculty-wise timetable PDF — one page per teacher, with a
+`Teacher <Name>` heading and a table of days by slots. Days, slots, rooms,
+classes and subjects are all read from your PDF; nothing is assumed.
 
-**2. Chat** with the bot in natural language, for example:
+**2. Chat** with the bot in natural language. Once a timetable is loaded,
+the sidebar shows example questions built from *your* data, such as:
 
-- 👨‍🏫 *"Who is free on Monday slot 3?"*
-- 📖 *"Who teaches Python?"*
-- 📅 *"Show timetable of 3CS-DS-A"*
-- 🚪 *"Where is Python for DS Lab?"*
-- 📋 *"Subjects of Dr. Pankaj Dadheech"*
-- 🪑 *"Which rooms are free on Tuesday slot 4?"*
+- 👨‍🏫 *"Who is free on <day> slot <n>?"*
+- 📖 *"Who teaches <subject>?"*
+- 📅 *"Show timetable of <teacher or class>"*
+- 🕙 *"Who is free at 10 am on <day>?"* (when the PDF has clock times)
+- 🪑 *"Which rooms are free on <day> slot <n>?"*
 
 The PDF is parsed, cleaned and loaded into a temporary SQLite
 database, and every answer comes from the project's own NLP engine.
@@ -306,9 +341,10 @@ database, and every answer comes from the project's own NLP engine.
     with col2:
 
         st.info(
-            "**No PDF yet?**\n\nClick **📥 Load sample PDF** in the "
-            "sidebar to try the chatbot with the bundled timetable "
-            "(`data/Facultywise TT 20 sep.pdf`)."
+            "**No PDF yet?**\n\nUpload a faculty-wise timetable PDF in the "
+            "sidebar. PDFs placed in the data folder can also be picked "
+            "there; nothing is tied to a particular file, so a new "
+            "semester's timetable works the same way."
         )
 
     st.stop()

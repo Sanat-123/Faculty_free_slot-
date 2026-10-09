@@ -16,6 +16,7 @@ from scheduling.workload_engine import FacultyWorkloadEngine
 from scheduling.absence_engine import FacultyAbsenceEngine
 from scheduling.assignment_engine import FacultyAssignmentEngine
 from scheduling.room_shift_store import RoomShiftStore
+from utils.file_discovery import data_dir, discover_timetable_files
 from scheduling.lab_shift_planner import LabShiftCoordinator
 from scheduling.multi_absence_planner import MultiAbsenceCoordinator
 from scheduling.what_if_coordinator import WhatIfCoordinator
@@ -78,13 +79,16 @@ class FacultyAIChatbot:
             # --------------------------------------------------
 
             if files is None:
-                files = [
-                    "data/Facultywise TT 20 sep.pdf",
-                    "data/classwise TT 27 sep.pdf",
-                    "data/Location wise TT 27 sep 2025.pdf",
-                    "data/timetable.xlsx",
-                    "data/test_timetable.csv"
-                ]
+                # no file names are hard-coded: use whatever timetable files
+                # are in the data folder (FACULTY_DATA_DIR, default "data")
+                files = [str(p) for p in discover_timetable_files()]
+
+                if not files:
+                    print(
+                        "\nNo timetable files found in "
+                        f"'{data_dir()}'. Put the PDF / Excel / CSV files "
+                        "there or set FACULTY_DATA_DIR."
+                    )
 
             self.files = files
 
@@ -453,6 +457,73 @@ class FacultyAIChatbot:
         return f"{hour:02d}:{minute:02d}"
 
     # ======================================================
+    # REMOVE CALENDAR DATES FROM TEXT
+    #
+    # Dates and times share digits and dashes ("2026-10-12",
+    # "12/10/2026", "12 October 2026"). Dates are cut out before
+    # looking for a time range so a date can never be mistaken
+    # for one.
+    # ======================================================
+
+    @classmethod
+    def _strip_dates(cls, text):
+
+        text = re.sub(r"\b\d{4}-\d{1,2}-\d{1,2}\b", " ", text)
+        text = re.sub(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{4}\b", " ", text)
+
+        months = "|".join(
+            sorted(cls._MONTH_NAMES, key=len, reverse=True)
+        )
+
+        text = re.sub(
+            rf"\b\d{{1,2}}(?:st|nd|rd|th)?\s+(?:of\s+)?(?:{months})"
+            rf"\.?,?\s+\d{{4}}\b",
+            " ", text,
+        )
+
+        text = re.sub(
+            rf"\b(?:{months})\.?\s+\d{{1,2}}(?:st|nd|rd|th)?,?\s+\d{{4}}\b",
+            " ", text,
+        )
+
+        return text
+
+    # ======================================================
+    # READ A BARE HOUR FROM THE TIMETABLE'S OWN DAY
+    #
+    # "from 2 to 4" means 14:00-16:00 when the working day runs
+    # 08:15-15:00. A time that already lies inside the working
+    # day is kept as typed; one that does not, but does lie
+    # inside it twelve hours later, is moved to that afternoon
+    # hour. An explicit "am" is never moved.
+    # ======================================================
+
+    def _fit_exam_time(self, value, query):
+
+        if not value or re.search(r"\d\s*a\.?m\b", str(query).lower()):
+            return value
+
+        try:
+            span = self.smart_engine._day_span()
+            hour, minute = (int(part) for part in value.split(":"))
+        except Exception:
+            return value
+
+        if span is None:
+            return value
+
+        low, high = span[0] - 60, span[1] + 60
+        minutes = hour * 60 + minute
+
+        if low <= minutes <= high:
+            return value
+
+        if hour < 12 and low <= minutes + 720 <= high:
+            return f"{hour + 12:02d}:{minute:02d}"
+
+        return value
+
+    # ======================================================
     # EXTRACT TIME RANGE
     # ======================================================
 
@@ -488,6 +559,9 @@ class FacultyAIChatbot:
         text = text.replace("–", "-")
         text = text.replace("—", "-")
         text = text.replace("−", "-")
+
+        # A date is not a time: "2026-10-12" must not be read as "10-12"
+        text = cls._strip_dates(text)
 
         # Normalize decimal time
         # Example: 9.15 -> 9:15
@@ -1804,7 +1878,10 @@ class FacultyAIChatbot:
             if answer is not None:
                 return answer
 
-        response = self._legacy_process_query(query)
+        # misspelled / title-less teacher names -> the timetable's spelling
+        response = self._legacy_process_query(
+            self.smart_engine.canonical_query(query)
+        )
 
         if (
             response is None
@@ -2041,6 +2118,9 @@ class FacultyAIChatbot:
                 self._extract_time_range(query)
             )
 
+            start_time = self._fit_exam_time(start_time, query)
+            end_time = self._fit_exam_time(end_time, query)
+
             hall_text = self._extract_room(query)
 
             count_patterns = (
@@ -2091,6 +2171,27 @@ class FacultyAIChatbot:
                         "to 11:00."
                     )
 
+                # "assign exam duty to <teacher> and <teacher> on ..."
+                # - names are resolved from the loaded timetable (typos
+                # and missing titles are fine)
+                named_teachers = []
+
+                try:
+                    parsed = self.smart_engine.parse(query)
+                except Exception:
+                    parsed = None
+
+                if parsed is not None and parsed.ambiguous:
+                    return (
+                        "I found more than one faculty member matching "
+                        "a name in your request. Please use the full "
+                        "name, for example Dr. Jane Doe."
+                    )
+
+                if parsed is not None and parsed.teachers:
+                    named_teachers = list(dict.fromkeys(parsed.teachers))
+                    required_count = len(named_teachers)
+
                 if required_count is not None:
 
                     if required_count <= 0:
@@ -2105,7 +2206,69 @@ class FacultyAIChatbot:
                         end_time=end_time,
                         required_faculty=required_count,
                         hall=hall_text,
+                        teachers=named_teachers or None,
                     )
+
+                    if (
+                        not plan.get("success")
+                        and plan.get("reason")
+                        == "requested_teachers_unavailable"
+                    ):
+
+                        lines = [
+                            "I can't assign everyone you named on "
+                            f"{plan.get('exam_date', exam_date_text)} "
+                            f"from {start_time} to {end_time}:",
+                            "",
+                        ]
+
+                        existing = self.exam_duty_coordinator.duties_for_date(
+                            plan.get("exam_date", exam_date_text)
+                        )
+
+                        for name, why in plan["unavailable"].items():
+
+                            # an exam duty that overlaps the requested time?
+                            clash = next(
+                                (
+                                    d for d in existing
+                                    if d.get("teacher") == name
+                                    and str(d.get("start_time")) < end_time
+                                    and str(d.get("end_time")) > start_time
+                                ),
+                                None,
+                            )
+
+                            if clash:
+                                reason_text = (
+                                    "already on exam duty "
+                                    f"{clash.get('start_time')}-"
+                                    f"{clash.get('end_time')}"
+                                    + (
+                                        f" in {clash['hall']}"
+                                        if clash.get("hall") else ""
+                                    )
+                                )
+                            elif why.startswith("already"):
+                                reason_text = (
+                                    "already on exam duty for this session"
+                                )
+                            else:
+                                reason_text = (
+                                    "has a class during that time"
+                                )
+
+                            lines.append(f"- {name}: {reason_text}")
+
+                        lines.append("")
+                        lines.append(
+                            "Ask \"Who is available for exam duty on "
+                            f"{plan.get('exam_date', exam_date_text)} "
+                            f"from {start_time} to {end_time}?\" to "
+                            "see who can be assigned."
+                        )
+
+                        return "\n".join(lines)
 
                     if plan.get("success"):
 

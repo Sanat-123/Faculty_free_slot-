@@ -37,3 +37,12 @@ data/processed/
 # OS files
 .DS_Store
 Thumbs.db
+venv/
+__pycache__/
+*.pyc
+.env
+.streamlit/secrets.toml
+data/exam_duties.json
+data/room_shifts.json
+data/assignments.json
+question_bank/

@@ -25,6 +25,7 @@ import re
 from collections import defaultdict
 
 from rapidfuzz import fuzz, process
+from rapidfuzz.distance import OSA
 
 from engine.smart_format import title_day
 from engine.smart_handlers_catalog import CatalogHandlers
@@ -114,6 +115,17 @@ class Frame:
                 setattr(clone, key, value)
 
         return clone
+
+
+
+def _key_text(text):
+    return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
+
+
+
+# Bump when behaviour changes; check with:
+#   python -c "from engine.smart_query import ENGINE_VERSION; print(ENGINE_VERSION)"
+ENGINE_VERSION = "2026-10-time-expressions-v3"
 
 
 class SmartQueryEngine(FacultyHandlers, CatalogHandlers):
@@ -255,6 +267,8 @@ class SmartQueryEngine(FacultyHandlers, CatalogHandlers):
             for phrase in items:
                 for word in re.findall(r"[a-z]+", phrase.lower()):
                     vocab.add(word)
+
+        self.cue_words = {w for w in vocab if len(w) >= 4 and w.isalpha()}
 
         vocab |= set(self.stop)
         vocab |= set(self.titles)
@@ -398,6 +412,12 @@ class SmartQueryEngine(FacultyHandlers, CatalogHandlers):
         if len(key) > self.short_max:
             return True
 
+        # a code with a digit ("3cs", "cl-1") cannot be an everyday word,
+        # so its case / spacing does not matter; bare letters ("me", "os")
+        # must still match exactly
+        if any(ch.isdigit() for ch in key):
+            return True
+
         return text in hit[2]
 
     def _mark(self, words, i, length, kind, entity, eid):
@@ -496,44 +516,182 @@ class SmartQueryEngine(FacultyHandlers, CatalogHandlers):
 
         return runs
 
-    def _match_token(self, token, vocab):
-        """Exact, else a close typo (length >= 5)."""
+    def _extend_prefix_teachers(self, words, f):
+        """
+        "Dinesh Kumar Sharam" must not become the teacher "Dinesh Kumar".
+
+        When a recognised teacher name is only the START of a longer
+        teacher's name ("Mr. Dinesh Kumar" / "Mr. Dinesh Kumar Sharma") and
+        the next word is a close typo of the longer name's next part, the
+        longer teacher is meant.
+        """
+
+        faculty = list(self.model.faculty)
+
+        def tokens(name):
+            return [t for t in name_tokens(name, self.lex) if len(t) >= 3]
+
+        i = 0
+
+        while i < len(words):
+
+            w = words[i]
+
+            if w["kind"] != "teacher" or not w["entity"]:
+                i += 1
+                continue
+
+            eid = w["eid"]
+            j = i
+
+            while j < len(words) and words[j]["eid"] == eid \
+                    and words[j]["kind"] == "teacher":
+                j += 1
+
+            nxt = words[j] if j < len(words) else None
+            name = w["entity"]
+
+            if nxt is None or not self._eligible(nxt):
+                i = j
+                continue
+
+            base = tokens(name)
+
+            longer = []
+
+            for other in faculty:
+
+                other_tokens = tokens(other)
+
+                if (
+                    other != name
+                    and len(other_tokens) > len(base)
+                    and other_tokens[:len(base)] == base
+                ):
+                    longer.append(other_tokens[len(base)])
+
+            if longer:
+
+                near = self._near_tokens(nxt["low"], {t: 1 for t in longer})
+
+                targets = [
+                    other for other in faculty
+                    if other != name and tokens(other)[:len(base)] == base
+                    and len(tokens(other)) > len(base)
+                    and tokens(other)[len(base)] in near
+                ]
+
+                if len(targets) == 1:
+
+                    target = targets[0]
+
+                    self._mark(words, i, j - i + 1, "teacher", target, eid)
+
+                    if name in f.teachers:
+                        f.teachers[f.teachers.index(name)] = target
+
+            i = j
+
+    def _near_tokens(self, token, vocab, min_len=4):
+        """
+        Known words that `token` is a typo of.
+
+        An exact word wins.  Otherwise every word within a small edit
+        distance is returned, closest first: one edit (a missing, extra or
+        wrong letter, or two swapped neighbours - "kajal"/"kaajl") for words
+        of 4+ letters, two edits for long words (9+).  Short words must be
+        exact.  Callers narrow the result by combining it with the other
+        words of the same name, so "sumiti kumar" still means one person.
+        """
 
         if token in vocab:
-            return token
+            return [token]
 
-        if len(token) >= 5:
+        n = len(token)
 
+        if n < min_len:
+            return []
+
+        limit = 2 if n >= 9 else 1
+
+        best, found = limit + 1, []
+
+        for word in vocab:
+
+            if abs(len(word) - n) > limit:
+                continue
+
+            d = OSA.distance(token, word, score_cutoff=limit)
+
+            if d > limit:
+                continue
+
+            if d < best:
+                best, found = d, [word]
+            elif d == best:
+                found.append(word)
+
+        if found:
+            return found
+
+        # long-word similarity the edit-distance rule did not cover
+        if n >= 5:
             hit = process.extractOne(
                 token, list(vocab), scorer=fuzz.ratio, score_cutoff=88
             )
-
             if hit:
-                return hit[0]
+                return [hit[0]]
 
-        return None
+        return []
 
-    def _candidates(self, tokens, vocab_map, fuzzy):
+    def _match_token(self, token, vocab):
+        """One matching word, or None when none / several are close."""
+
+        near = self._near_tokens(token, vocab)
+
+        return near[0] if len(near) == 1 else None
+
+    def _candidates(self, tokens, vocab_map, fuzzy, _min_len=4, short_ok=True):
 
         sets = []
 
         for token in tokens:
 
-            matched = token if token in vocab_map else (
-                self._match_token(token, vocab_map) if fuzzy else None
-            )
+            if token in vocab_map:
+                near = [token]
+            elif fuzzy:
+                near = self._near_tokens(token, vocab_map, _min_len)
+            else:
+                near = []
 
-            if matched is None:
-                return set()
+            if not near:
+                break
 
-            sets.append(vocab_map[matched])
+            matched = set()
 
-        result = set(sets[0])
+            for word in near:
+                matched |= vocab_map[word]
 
-        for s in sets[1:]:
-            result &= s
+            sets.append(matched)
 
-        return result
+        else:
+
+            result = set(sets[0])
+
+            for s in sets[1:]:
+                result &= s
+
+            return result
+
+        # A short word ("Aha Jain" for "Abha Jain") can be a typo too, but
+        # only when the rest of the name pins down exactly one person.
+        if short_ok and fuzzy and len(tokens) >= 2 and _min_len > 3:
+
+            result = self._candidates(tokens, vocab_map, fuzzy, _min_len=3)
+
+            return result if len(result) == 1 else set()
+
+        return set()
 
     def _resolve_partial_teachers(self, words, f):
 
@@ -555,7 +713,7 @@ class SmartQueryEngine(FacultyHandlers, CatalogHandlers):
 
                     sub = tokens[offset:offset + length]
 
-                    fuzzy = has_title or length >= 2
+                    fuzzy = has_title or length >= 2 or len(sub[0]) >= 6
 
                     cands = self._candidates(
                         sub, self.teacher_token_vocab, fuzzy
@@ -681,6 +839,74 @@ class SmartQueryEngine(FacultyHandlers, CatalogHandlers):
 
             if hit:
                 w["low"] = hit[0]
+                continue
+
+            # one missing / extra / wrong letter or one swap ("mondya",
+            # "slto", "rfee"): accepted only when exactly one known word
+            # is that close, so nothing is guessed between two candidates
+            fixed = self._fix_typo(low)
+
+            if fixed:
+                w["low"] = fixed
+
+    def _fix_typo(self, token):
+        """
+        The cue / day word that `token` is a typo of, or None.
+
+        Shaped like real typing slips so ordinary English words are left
+        alone ("share" must not become "spare"):
+          * two swapped neighbours      "slto"   -> "slot"
+          * a missing or extra letter   "mondy"  -> "monday"
+          * a WRONG letter only for long words (7+) and for weekday names,
+            which cannot be mistaken for another word ("mondaf")
+        Exactly one word may be that close, otherwise nothing is changed.
+        """
+
+        n = len(token)
+
+        if n < 4:
+            return None
+
+        days = [d for d in self.day_map if len(d) >= 5]
+
+        targets = (set(self.cue_words) | set(days))
+
+        found = set()
+
+        for word in targets:
+
+            if abs(len(word) - n) > 1:
+                continue
+
+            limit = 2 if n >= 9 else 1
+
+            d = OSA.distance(token, word, score_cutoff=limit)
+
+            if d > limit:
+                continue
+
+            same_len = len(word) == n
+
+            transposed = same_len and sorted(token) == sorted(word)
+
+            substituted = same_len and not transposed
+
+            if substituted and not (n >= 7 or word in days):
+                continue
+
+            found.add(word)
+
+        if len(found) == 1:
+            return next(iter(found))
+
+        # several weekday spellings of the same day ("mon", "monday") count
+        # as one answer
+        if found and all(w in self.day_map for w in found):
+            full = {self.day_map[w] for w in found}
+            if len(full) == 1:
+                return max(found, key=len)
+
+        return None
 
     def _resolve_partial_subjects(self, words, f):
 
@@ -700,8 +926,12 @@ class SmartQueryEngine(FacultyHandlers, CatalogHandlers):
 
             tokens = [words[i]["low"] for i in range(start, end)]
 
+            # exact first; else a typo of a 5+ letter subject word
             cands = self._candidates(
                 tokens, self.subject_token_vocab, fuzzy=False
+            ) or self._candidates(
+                tokens, self.subject_token_vocab, fuzzy=True,
+                _min_len=5, short_ok=False,
             )
 
             if not cands:
@@ -761,6 +991,7 @@ class SmartQueryEngine(FacultyHandlers, CatalogHandlers):
         words = self._tokenize(query)
 
         self._resolve_exact(words, f)
+        self._extend_prefix_teachers(words, f)
         self._resolve_partial_teachers(words, f)
         self._spell_fix(words)
         self._resolve_partial_subjects(words, f)
@@ -779,6 +1010,7 @@ class SmartQueryEngine(FacultyHandlers, CatalogHandlers):
 
         self._resolve_numeric_rooms(f, words, residual)
         self._detect_unresolved_class(f, words)
+        self._detect_unresolved_room(f, words)
 
         f.text = text
 
@@ -933,13 +1165,235 @@ class SmartQueryEngine(FacultyHandlers, CatalogHandlers):
 
         return numbers, mode
 
+    def _day_span(self):
+        """(first start, last end) in minutes over the slots that have times."""
+
+        info = [
+            v for v in self.model.slot_info.values()
+            if v.get("start") is not None
+        ]
+
+        if not info:
+            return None
+
+        return (
+            min(v["start"] for v in info),
+            max(v["end"] for v in info),
+        )
+
+    # ------------------------------------------------------------------
+    # time expressions
+    # ------------------------------------------------------------------
+
+    def _fit_minutes(self, hour, minute=0):
+        """
+        am / pm for a bare hour, read from the timetable's own working day:
+        the 24-hour reading that lies inside the day (give or take an hour).
+        Returns the candidate minutes, earliest first.
+        """
+
+        span = self._day_span()
+
+        if span is None:
+            return []
+
+        first, last = span
+
+        options = [hour] if hour >= 12 else [hour, hour + 12]
+
+        return [
+            h * 60 + minute for h in options
+            if first - 60 <= h * 60 + minute <= last + 60
+        ]
+
+    def _normalize_times(self, work):
+        """
+        Rewrite every spoken time expression as explicit 24-hour clock text
+        that the clock parser below understands:
+
+            "from 9 to 11"      -> "9:00 to 11:00"
+            "8 to 9", "9-11"    -> "8:00 to 9:00", "9:00 to 11:00"
+            "8am to 2pm"        -> "8:00 to 14:00"
+            "9am to 11"         -> "9:00 to 11:00"      (am carries over)
+            "11 to 2pm"         -> "11:00 to 14:00"
+            "after 12", "at 10" -> "after 12:00", "at 10:00"
+            "nine to eleven"    -> "9:00 to 11:00"
+
+        Only when the timetable has clock times.  Plain slot talk is left
+        alone: "slot 2 to 4", "2 to 4 periods", and bare "from 2 to 4" where
+        both numbers are valid slot numbers in increasing order.
+        """
+
+        span = self._day_span()
+
+        if span is None:
+            return work
+
+        phrases = self.lex.get("phrases", {})
+        max_slot = max(self.model.slots) if self.model.slots else 0
+
+        # "a.m." -> "am"
+        work = re.sub(r"\b([ap])\.m\.?", r"\1m", work)
+
+        # spoken hour words, only where a time is expected
+        words = self.lex.get("hour_words") or {}
+
+        if words:
+
+            alt = "|".join(sorted(map(re.escape, words), key=len, reverse=True))
+
+            def digits(m):
+                return m.group(1) + str(words[m.group(2)])
+
+            work = re.sub(
+                rf"\b((?:from|between|at|around|about|by|after|before|to|till|until|and)\s+)({alt})\b(?=\s*(?:to|till|until|and|-|am|pm|\b(?:on|in|at|for)\b|$|[?.,!]))",
+                digits, work,
+            )
+
+        slot_word = (
+            r"(?:slots?|periods?|lectures?|hours?|classes|class|sessions?)"
+        )
+
+        token = (
+            r"(?<![\d:.])(?P<h{i}>\d{{1,2}})(?:[:.](?P<m{i}>\d{{2}}))?"
+            r"(?:\s*(?P<a{i}>am|pm))?(?![\d:.]\d)"
+        )
+
+        pattern = re.compile(
+            r"(?P<lead>(?:from|between|during)\s+)?"
+            + token.format(i=1)
+            + r"\s*(?P<conn>to|till|until|through|and|-|–|—)\s*"
+            + token.format(i=2)
+        )
+
+        def hhmm(t):
+            return f"{t // 60}:{t % 60:02d}"
+
+        def to_min(h, mi, ap):
+            if ap == "pm" and h < 12:
+                h += 12
+            if ap == "am" and h == 12:
+                h = 0
+            return h * 60 + mi
+
+        def range_replace(m):
+
+            before = work_ref[0][:m.start()]
+            after = work_ref[0][m.end():]
+
+            if re.search(slot_word + r"\s*(?:no\.?\s*|number\s*|#\s*)?$", before):
+                return m.group(0)                      # "slot 2 to 4"
+
+            if re.match(r"\s*(?:st|nd|rd|th)?\s*" + slot_word + r"\b", after):
+                return m.group(0)                      # "2 to 4 periods"
+
+            if m.group("conn") == "and" and not m.group("lead"):
+                return m.group(0)
+
+            h1, h2 = int(m.group("h1")), int(m.group("h2"))
+            m1, m2 = int(m.group("m1") or 0), int(m.group("m2") or 0)
+            a1, a2 = m.group("a1"), m.group("a2")
+
+            if h1 > 24 or h2 > 24 or m1 > 59 or m2 > 59:
+                return m.group(0)
+
+            explicit = bool(a1 or a2 or m.group("m1") or m.group("m2"))
+
+            # bare "from 2 to 4": both are slot numbers -> a slot range
+            if not explicit and h1 <= max_slot and h2 <= max_slot and h1 < h2:
+                return f" slots {h1} to {h2} "
+
+            if a1 and a2:
+                t1, t2 = to_min(h1, m1, a1), to_min(h2, m2, a2)
+
+            elif a1:                                   # "9am to 11"
+                t1 = to_min(h1, m1, a1)
+                t2 = to_min(h2, m2, a1)
+                if t2 <= t1:
+                    t2 = to_min(h2, m2, "pm" if a1 == "am" else "am")
+
+            elif a2:                                   # "11 to 2pm"
+                t2 = to_min(h2, m2, a2)
+                t1 = to_min(h1, m1, a2)
+                if t1 >= t2:
+                    t1 = to_min(h1, m1, "am" if a2 == "pm" else "pm")
+
+            else:                                      # bare: read from the day
+                starts = self._fit_minutes(h1, m1)
+                ends = self._fit_minutes(h2, m2)
+                pairs = [(x, y) for x in starts for y in ends if x < y]
+
+                if not pairs:                          # "10 to 9" = 9 to 10
+                    pairs = [(y, x) for x in starts for y in ends if y < x]
+
+                if not pairs:
+                    return m.group(0)
+
+                t1, t2 = min(pairs, key=lambda p: (p[1] - p[0], p[0]))
+
+            if not (0 <= t1 < t2 <= 24 * 60):
+                return m.group(0)
+
+            return f" {hhmm(t1)} to {hhmm(t2)} "
+
+        work_ref = [work]
+        work = pattern.sub(range_replace, work)
+        work_ref[0] = work
+
+        # single time after a joining word: "at 10", "after 12", "before 11"
+        joiners = ["at", "around", "about", "by"]
+        joiners += list(phrases.get("time_after") or [])
+        joiners += list(phrases.get("time_before") or [])
+
+        single = re.compile(
+            r"(?P<kw>(?<![a-z])(?:"
+            + "|".join(sorted(map(re.escape, joiners), key=len, reverse=True))
+            + r")\s+)(?P<h>\d{1,2})(?![\d:.]|\s*(?:st|nd|rd|th|am|pm|"
+            + slot_word + r"))"
+        )
+
+        def single_replace(m):
+
+            h = int(m.group("h"))
+
+            if h > 24 or h <= max_slot:        # "at 3" stays a slot number
+                return m.group(0)
+
+            fits = self._fit_minutes(h)
+
+            return m.group("kw") + hhmm(fits[0]) if fits else m.group(0)
+
+        work = single.sub(single_replace, work)
+
+        return work
+
+    def _time_of_day(self, f, text):
+        """"monday morning" / "in the afternoon" -> a clock window."""
+
+        if f.time_range or f.time_point or self._day_span() is None:
+            return
+
+        for word, (start, end) in (self.lex.get("time_of_day") or {}).items():
+
+            if re.search(rf"\b{re.escape(word)}\b", text):
+                f.time_range = (int(start), int(end))
+                return
+
     def _extract_slots(self, f, text):
 
         model = self.model
 
         work = text
 
+        # ---- spoken time expressions -> explicit 24-hour clock text -------
+        work = self._normalize_times(work)
+
         # ---- clock times -------------------------------------------
+        # "10 am" / "2pm" are clock times too: give them minutes
+        work = re.sub(
+            r"(?<![\d:.])(\d{1,2})\s*(am|pm)\b", r"\1:00 \2", work
+        )
+
         clock = r"(\d{1,2})[:.](\d{2})\s*(am|pm)?"
 
         def to_min(h, mi, ap):
@@ -979,7 +1433,30 @@ class SmartQueryEngine(FacultyHandlers, CatalogHandlers):
                     point.group(1), point.group(2), point.group(3)
                 )
 
+                # "after 2 pm" / "before 10 am" -> open-ended range
+                before_text = work[:point.start()]
+                phrases = self.lex.get("phrases", {})
+
+                def lead(group):
+                    words = phrases.get(group) or []
+                    return bool(words) and re.search(
+                        r"(?:^|\s)(?:"
+                        + "|".join(re.escape(w) for w in words)
+                        + r")\s*$",
+                        before_text,
+                    )
+
+                if lead("time_after"):
+                    f.time_range = (f.time_point, 24 * 60)
+                    f.time_point = None
+                elif lead("time_before"):
+                    f.time_range = (0, f.time_point)
+                    f.time_point = None
+
                 work = work[:point.start()] + " " + work[point.end():]
+
+        # "morning" / "afternoon" / "evening"
+        self._time_of_day(f, work)
 
         # ---- number joiners ----------------------------------------
         work = re.sub(r"(?<=\d)\s*-\s*(?=\d)", " to ", work)
@@ -1084,6 +1561,10 @@ class SmartQueryEngine(FacultyHandlers, CatalogHandlers):
 
             key = match.group(1)
 
+            # "Mj-103" / "MEb301" are (mistyped) codes, not the bare room 103
+            if re.search(r"[A-Za-z]-?$", residual[:match.start()]):
+                continue
+
             if key in self.numeric_rooms and (
                 len(key) >= 3 or has_room_word
             ):
@@ -1138,6 +1619,69 @@ class SmartQueryEngine(FacultyHandlers, CatalogHandlers):
 
                 w["kind"] = "unresolved"
                 w["eid"] = 7000
+
+    def _detect_unresolved_room(self, f, words):
+        """
+        "Is room CL-111 free?" where CL-111 is not a room of this timetable:
+        say so (with close matches) instead of answering about every room.
+        """
+
+        if f.unresolved or f.rooms:
+            return
+
+        room_words = set(
+            self.lex.get("phrases", {}).get("room_words", [])
+        )
+
+        rooms = list(self.model.rooms)
+
+        # alphabetic prefixes of the rooms that have letters ("CL" in CL-11)
+        prefixes = {
+            re.match(r"[a-z]*", alnum_key(r)).group(0)
+            for r in rooms
+            if re.search(r"[a-z]", alnum_key(r))
+        } - {""}
+
+        for i, w in enumerate(words):
+
+            if w["kind"]:
+                continue
+
+            token = w["clean"]
+            key = alnum_key(token)
+
+            if (
+                len(key) < 2
+                or not re.search(r"\d", token)
+                or re.fullmatch(r"\d+(st|nd|rd|th|am|pm)", token, re.I)
+                or re.fullmatch(r"\d{1,2}[:.]\d{2}(am|pm)?", token, re.I)
+            ):
+                continue
+
+            after_room_word = i > 0 and words[i - 1]["low"] in room_words
+
+            lead = re.match(r"[a-z]*", key).group(0)
+
+            looks_like_room = bool(lead) and any(
+                OSA.distance(lead, p) <= 1 for p in prefixes
+            )
+
+            if not (after_room_word or looks_like_room):
+                continue
+
+            hits = process.extract(
+                token.lower(), [r.lower() for r in rooms],
+                scorer=fuzz.WRatio, limit=4, score_cutoff=60,
+            )
+
+            f.unresolved.append(
+                ("room", token, [rooms[h[2]] for h in hits])
+            )
+
+            w["kind"] = "unresolved"
+            w["eid"] = 7100
+
+            return
 
     def _detect_cues(self, f, text):
 
@@ -1286,6 +1830,63 @@ class SmartQueryEngine(FacultyHandlers, CatalogHandlers):
     # ==================================================================
     # routing
     # ==================================================================
+
+    def canonical_query(self, text):
+        """
+        The question with teacher mentions spelled as in the timetable.
+
+        The older handlers (absence / substitutes, exam duty, lab shifts,
+        workload) need the exact name; people write "Manish Bharadwaj" for
+        "Mr. Manish Bhardwaj", or drop the title.  The data-driven resolver
+        already knows who is meant, so each recognised mention is replaced
+        by the canonical name.  Nothing is changed unless every mention is
+        resolved unambiguously.
+        """
+
+        try:
+            f = self.parse(text)
+        except Exception:
+            return text
+
+        if not f.teachers or f.ambiguous:
+            return text
+
+        runs, current = [], []
+
+        for w in f.words:
+            if w["kind"] == "teacher":
+                current.append(w)
+            elif current:
+                runs.append(current)
+                current = []
+
+        if current:
+            runs.append(current)
+
+        if len(runs) != len(f.teachers):
+            return text
+
+        titles = self.lex.get("titles") or []
+
+        title_rx = (
+            r"(?:(?:" + "|".join(re.escape(t) for t in titles) + r")\.?\s+)?"
+            if titles else ""
+        )
+
+        out = text
+
+        for run, name in zip(runs, f.teachers):
+
+            words = [str(w["raw"]) for w in run]
+
+            if _key_text(" ".join(words)) == _key_text(name):
+                continue                        # already spelled correctly
+
+            pattern = title_rx + r"\s+".join(re.escape(w) for w in words)
+
+            out = re.sub(pattern, name, out, count=1, flags=re.IGNORECASE)
+
+        return out
 
     def _is_legacy_owned(self, f):
 
@@ -1443,6 +2044,12 @@ class SmartQueryEngine(FacultyHandlers, CatalogHandlers):
         which_day = has(r"\b(?:which|what|on which)\s+days?\b")
         which_slot = has(r"\b(?:which|what)\s+slots?\b")
 
+        # ---------------- slot timings ("what time is slot 3?") ----
+        if "time_words" in c and not (
+            nT or nS or nC or nR or free or busy or day_given
+        ) and (f.slots or "slot_words" in c or "all_slots" in c):
+            return "slot_times"
+
         # ---------------- data quality / conflicts -------------------
         if "data_quality" in c:
             return "data_quality"
@@ -1496,7 +2103,9 @@ class SmartQueryEngine(FacultyHandlers, CatalogHandlers):
                 "completely" in c or "most" in c or "least" in c
             )
 
-            if which_day and rank:
+            if (which_day and rank) or (
+                "day_word" in c and ("most" in c or "least" in c)
+            ):
                 return "teacher_day_rank"
 
             if "first_last_class" in c:
@@ -1517,8 +2126,14 @@ class SmartQueryEngine(FacultyHandlers, CatalogHandlers):
             if ("doing" in c or "where" in c) and (slot_given or day_given):
                 return "teacher_at"
 
+            if busy and not free and not (slot_given or day_given):
+                return "teacher_timetable"
+
             if free or busy:
                 return "teacher_status"
+
+            if "workload" in c:
+                return "teacher_count"
 
             if "subject_words" in c:
                 return "teacher_subjects"
@@ -1537,8 +2152,13 @@ class SmartQueryEngine(FacultyHandlers, CatalogHandlers):
             if nC >= 1 and ("where" in c or "room_words" in c):
                 return "class_subject_room"
 
-            if free and ("who" in c or "teaches" in c):
+            if free and (
+                "who" in c or "teaches" in c or "teacher_words" in c
+            ):
                 return "subject_free_teachers"
+
+            if nC >= 1 and ("who" in c or "teaches" in c):
+                return "class_subject_teachers"
 
             if "how_many" in c and "teacher_words" in c:
                 return "subject_teacher_count"
@@ -1594,6 +2214,9 @@ class SmartQueryEngine(FacultyHandlers, CatalogHandlers):
         # ---------------- room focused ---------------------------------
         if nR >= 1 and nT == 0:
 
+            if "who" in c and slot_given and not free:
+                return "room_at"
+
             if free or busy:
 
                 if "when" in c or not slot_given:
@@ -1641,7 +2264,7 @@ class SmartQueryEngine(FacultyHandlers, CatalogHandlers):
             if "nosession" in c:
                 return "lab_no_session"
 
-            if "who" in c:
+            if "who" in c or slot_given:
                 return "lab_at"
 
             return "labs_on_day"
@@ -1681,8 +2304,21 @@ class SmartQueryEngine(FacultyHandlers, CatalogHandlers):
 
         if ("most" in c or "least" in c) and (
             "who" in c or "teacher_words" in c
-        ) and (free or "workload" in c or "how_many" in c or busy):
+        ) and (
+            free or "workload" in c or "how_many" in c or busy
+            or "slot_words" in c
+        ):
             return "faculty_rank"
+
+        # ---------------- faculty catalogue ("list all teachers") ------
+        if "teacher_words" in c and not (free or busy) and not (
+            slot_given or day_given
+        ) and not (c & {"followup_starters", "pronouns"}):
+
+            if "how_many" in c:
+                return "teacher_total"
+
+            return "list_teachers"
 
         # ---------------- free / busy lists ---------------------------
         if free and busy and self._split_free_busy(f):
@@ -1698,6 +2334,10 @@ class SmartQueryEngine(FacultyHandlers, CatalogHandlers):
 
         # ---------------- bare day/slot ("Mon 3") ---------------------
         if (day_given or slot_given) and not (c & INTENT_CUES):
+
+            if self._unknown_words(f):
+                return None
+
             return "free_list"
 
         if "who" in c and (day_given or slot_given):
@@ -1706,6 +2346,32 @@ class SmartQueryEngine(FacultyHandlers, CatalogHandlers):
         return None
 
     # ------------------------------------------------------------------
+
+    def _unknown_words(self, f):
+        """Alphabetic words that are neither entities nor known cue/day words.
+
+        Used so a sentence such as "what is the weather today" is not
+        mistaken for the bare "Mon 3" shorthand just because it contains
+        a day word.
+        """
+
+        unknown = []
+
+        for w in f.words:
+
+            if w["kind"]:
+                continue
+
+            word = w["low"]
+
+            if (
+                len(word) >= 3 and word.isalpha()
+                and word not in self.vocab
+                and word not in self.entity_tokens
+            ):
+                unknown.append(word)
+
+        return unknown
 
     def _split_free_busy(self, f):
         """'free at A but busy at B' -> (free_part, busy_part) or None."""

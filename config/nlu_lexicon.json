@@ -1,5 +1,10 @@
 {
   "_comment": "Language resources for the timetable chat assistant. These are generic English/Hinglish cue words, NOT timetable data. Every name (teacher, subject, class, room, day list, slot list) is learned from the loaded timetable at run time. Edit this file to add synonyms or another language.",
+  "type_keywords": {"Lab": ["lab"], "Seminar": ["seminar"], "Project": ["project"]},
+  "hour_words": {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12},
+  "time_of_day": {"morning": [0, 720], "afternoon": [720, 1020], "evening": [1020, 1440]},
+  "weekdays": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
+  "teacher_header_words": ["Teacher", "Faculty Name", "Name of Teacher", "Instructor"],
   "titles": [
     "dr",
     "mr",
@@ -91,6 +96,9 @@
       "all the slots",
       "all the periods"
     ],
+    "time_after": ["after", "later than", "post"],
+    "time_before": ["before", "earlier than", "prior to"],
+    "time_words": ["time", "timing", "timings", "start", "starts", "end", "ends", "baje"],
     "now": [
       "right now",
       "currently",
@@ -139,7 +147,7 @@
       "without class",
       "without classes",
       "without any class",
-      "not busy",
+      "not busy", "empty",
       "fre",
       "avail"
     ],
@@ -574,6 +582,13 @@
       "exam duties",
       "invigilat",
       "invigilation",
+      "invigilator",
+      "invigilators",
+      "assign duty",
+      "assigned duty",
+      "take duty",
+      "can take duty",
+      "who should be assigned",
       "what if",
       "what happens if",
       "lab shift",

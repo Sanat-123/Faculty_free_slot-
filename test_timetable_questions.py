@@ -1274,6 +1274,64 @@ class Suite:
 
         self.safe(section_paraphrases, "13. paraphrases")
 
+        # ============ 14. everyday phrasings (no day given, catalogue) ======
+        def section_everyday():
+
+            # "when is X free?" -> whole-week free slots, no question back
+            q = f"When is {T} free?"
+            r = ask(q)
+            rows = {row[0].lower(): row for row in table_rows(r)}
+            ok = bool(rows) and all(
+                set(slot_numbers("slot " + rows[d][1].replace(",", " slot ")))
+                == {x for x in t.slots if x not in t.periods(T, d)}
+                for d in t.days if d in rows
+            ) and all(d in rows for d in t.days)
+            rec("E1", q, ok, r[:100])
+
+            # "what is X teaching?" -> that teacher's timetable
+            q = f"What is {T} teaching?"
+            rec("E2", q, ask(q) == ask(f"Show {T}'s timetable."), ask(q)[:80])
+
+            # catalogue questions
+            q = "List all teachers"
+            eq("E3", q, names_from(ask(q)), t.fset)
+
+            q = "How many teachers are there?"
+            r = ask(q)
+            rec("E4", q, headline(r).lstrip("*").startswith(str(len(t.fset))),
+                headline(r))
+
+            # subject + class: only that class's teachers
+            ev = next((e for e in t.events
+                       if e["teacher"] in t.fset and e["subject"]
+                       and e["class_name"]), None)
+            if ev:
+                q = f"Who teaches {ev['subject']} to {ev['class_name']}?"
+                want = {e["teacher"] for e in t.events
+                        if e["teacher"] in t.fset
+                        and key(e["subject"]) == key(ev["subject"])
+                        and e["class_name"] == ev["class_name"]}
+                eq("E5", q, names_from(ask(q)), want)
+
+            # "who is in room R at ..." names the teacher, not just yes/no
+            q = f"Who is teaching in room {R} on {cap(rd)} slot {rs}?"
+            r = ask(q)
+            here = {e["teacher"] for e in ev_r
+                    if e["day"] == rd and e["slot"] == rs and e["teacher"]}
+            rec("E6", q, all(x in r for x in here) and "Occupied by" in r,
+                r[:100])
+
+            # "who has the most lectures"
+            q = "Who has the most lectures?"
+            best = max(sum(len(t.periods(x, d)) for d in t.days) for x in t.fset)
+            rec("E7", q, f"({best} of" in ask(q), ask(q)[:100])
+
+            # not a timetable question -> must not be answered with a table
+            q = "What is the weather today?"
+            rec("E8", q, "couldn't map" in ask(q).lower(), ask(q)[:80])
+
+        self.safe(section_everyday, "14. everyday phrasings")
+
         return self.results
     # ------------------------------------------------------------------
     def check_cover(self, qid, q, resp, teacher, day, slot):
