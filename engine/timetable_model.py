@@ -525,14 +525,15 @@ class TimetableModel:
         """
         Slots covered by a clock range [start, end].
 
-        A slot counts when it lies INSIDE the range.  Only if no slot fits
-        entirely inside (an unaligned range such as 10:00-11:00) do slots
-        that merely overlap it count - so "10:15 to 12:15" means the slots
-        that run 10:15-11:15 and 11:15-12:15, not a slot that starts at
-        12:00 (some timetables have slots that overlap in time).
+        A slot counts when it lies INSIDE the range, or when at least half
+        of it does ("9 to 11" covers 10:15-11:15 as well as 09:15-10:15).
+        A slot that only grazes the range (a slot that starts at 12:00 for
+        "10:15 to 12:15") does not count.  Only if nothing qualifies (a very
+        short or unaligned range such as 10:00-10:10) do slots that merely
+        overlap it count.
         """
 
-        inside, touching = [], []
+        chosen, touching = [], []
 
         for slot in self.slots:
 
@@ -541,13 +542,21 @@ class TimetableModel:
             if info["start"] is None:
                 continue
 
-            if info["start"] >= start and info["end"] <= end:
-                inside.append(slot)
+            overlap = min(end, info["end"]) - max(start, info["start"])
 
-            if min(end, info["end"]) - max(start, info["start"]) > 0:
-                touching.append(slot)
+            if overlap <= 0:
+                continue
 
-        return inside or touching
+            touching.append(slot)
+
+            length = info["end"] - info["start"]
+
+            inside = info["start"] >= start and info["end"] <= end
+
+            if inside or overlap * 2 >= length:
+                chosen.append(slot)
+
+        return chosen or touching
 
     def slots_at_minute(self, minute):
         """Slots in progress at a given minute of the day."""
