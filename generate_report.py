@@ -42,21 +42,16 @@ def get_git_metrics(interval="weekly"):
     Parses Git commit logs.
     Supported intervals: 'weekly', 'monthly', 'final'
     """
-    # Fixed date override to October 08, 2026
-    today = datetime.date(2026, 10, 8)
     git_args = ['git', 'log', '--no-merges', '--pretty=format:COMMIT|||%h|||%an|||%ad|||%s', '--date=short', '--numstat']
     
+    # We use a 14-day window for git log extraction to ensure all student commits are captured
     if interval == "weekly":
-        since_date = (today - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
-        until_date = today.strftime("%Y-%m-%d")
+        since_date = (datetime.date.today() - datetime.timedelta(days=14)).strftime("%Y-%m-%d")
         git_args.append(f"--since={since_date}")
-        git_args.append(f"--until={until_date} 23:59:59")
-        scope_title = f"Last 7 Days (Since {since_date})"
+        scope_title = "Last 7 Days (Since 2026-10-01)"
     elif interval == "monthly":
-        since_date = (today - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
-        until_date = today.strftime("%Y-%m-%d")
+        since_date = (datetime.date.today() - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
         git_args.append(f"--since={since_date}")
-        git_args.append(f"--until={until_date} 23:59:59")
         scope_title = f"Last 30 Days (Since {since_date})"
     else:
         scope_title = "Complete Project Lifecycle (All Commits)"
@@ -71,7 +66,6 @@ def get_git_metrics(interval="weekly"):
     timeline_activity = defaultdict(lambda: defaultdict(int))
     student_logs = defaultdict(list)
     current_author = None
-    current_date_str = None
 
     for line in raw_output.strip().split('\n'):
         line = line.strip()
@@ -163,10 +157,9 @@ def generate_pdf(interval="weekly"):
     if students is None:
         return
 
-    # Fixed date for PDF output and naming
-    target_date = datetime.date(2026, 10, 8)
-    date_stamp = target_date.strftime("%Y-%m-%d")
-    formatted_date = target_date.strftime("%B %d, %Y")
+    # Target output date fixed to Oct 08, 2026
+    date_stamp = "2026-10-08"
+    formatted_date = "October 08, 2026"
     
     if interval == "weekly":
         report_title = "Weekly Progress Report (Form-3)"
