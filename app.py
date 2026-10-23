@@ -72,6 +72,25 @@ from query_engine import (
 
 from faculty_chatbot import FacultyAIChatbot
 
+from import_engine import fast_import
+
+
+# ============================================================
+# IMPORT SPEED-UP
+#
+# Start the PDF worker processes once, in the background, so the
+# first upload doesn't pay their start-up cost. Safe no-op on a
+# single-core machine (FACULTY_IMPORT_WORKERS=1 disables it).
+# ============================================================
+
+@st.cache_resource(show_spinner=False)
+def _warm_import_pool():
+    fast_import.warm_up()
+    return True
+
+
+_warm_import_pool()
+
 
 # ============================================================
 # PAGE CONFIGURATION

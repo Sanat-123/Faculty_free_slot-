@@ -22,6 +22,7 @@ from scheduling.multi_absence_planner import MultiAbsenceCoordinator
 from scheduling.what_if_coordinator import WhatIfCoordinator
 from scheduling.exam_duty_store import ExamDutyStore
 from scheduling.exam_duty_planner import ExamDutyCoordinator
+from engine import date_resolver
 from query_engine import QueryEngine
 from query_engine.natural_language_query import NaturalLanguageQuery
 from engine.smart_query import SmartQueryEngine
@@ -840,6 +841,14 @@ class FacultyAIChatbot:
 
     @classmethod
     def _extract_exam_date(cls, query):
+
+        try:
+            resolved = date_resolver.first_iso(str(query))
+        except Exception:
+            resolved = None
+
+        if resolved:
+            return resolved
 
         text = str(query).lower()
 
@@ -1837,6 +1846,64 @@ class FacultyAIChatbot:
 
     
 
+    # ======================================================
+    # REAL CALENDAR DATES
+    #
+    # "15th October", "12/10/26", "next Monday" ... are turned into
+    # the weekday they fall on (real calendar + today's date, nothing
+    # hard-coded) so every feature of the chatbot can answer them.
+    # ======================================================
+
+    def _today(self):
+
+        try:
+            now = self.smart_engine.now_fn()
+            return now.date() if hasattr(now, "date") else now
+        except Exception:
+            return date.today()
+
+    def _resolve_dates(self, query):
+        """(date hits, text for the smart engine, text for the legacy flow)"""
+
+        try:
+            hits = date_resolver.find_dates(query, self._today())
+        except Exception:
+            hits = []
+
+        if not hits:
+            return [], query, query
+
+        smart_text = date_resolver.rewrite(query, hits, mode="smart")
+
+        # exam duty needs the REAL date, so it also keeps the ISO date
+        wants_date = bool(
+            re.search(r"\b(?:exam|invigilat\w*|duty|duties)\b", query, re.I)
+        )
+
+        legacy_text = date_resolver.rewrite(
+            query, hits, mode="legacy", with_iso=wants_date
+        )
+
+        return hits, smart_text, legacy_text
+
+    def _with_date_note(self, response, hits):
+        """Prefix the answer with how the date(s) in the question were read."""
+
+        if not hits or not isinstance(response, str):
+            return response
+
+        shown = [h for h in hits if h.kind != "basic"]
+
+        # replies that already print the exact date need no extra note
+        if shown and all(
+            d.isoformat() in response for h in shown for d in h.dates
+        ):
+            return response
+
+        note = date_resolver.note(hits, self._today())
+
+        return f"{note}\n\n{response}" if note else response
+
     def process_query(self, query):
         """
         Answer one chat message.
@@ -1858,6 +1925,9 @@ class FacultyAIChatbot:
         if not query:
             return "Please enter a query."
 
+        # real calendar dates -> the weekday they fall on
+        date_hits, smart_text, legacy_text = self._resolve_dates(query)
+
         lowered = query.lower()
 
         awaiting_confirmation = (
@@ -1873,14 +1943,14 @@ class FacultyAIChatbot:
 
         if not awaiting_confirmation:
 
-            answer = self.smart_engine.answer(query)
+            answer = self.smart_engine.answer(smart_text)
 
             if answer is not None:
-                return answer
+                return self._with_date_note(answer, date_hits)
 
         # misspelled / title-less teacher names -> the timetable's spelling
         response = self._legacy_process_query(
-            self.smart_engine.canonical_query(query)
+            self.smart_engine.canonical_query(legacy_text)
         )
 
         if (
@@ -1893,7 +1963,7 @@ class FacultyAIChatbot:
         ):
             return self.smart_engine.fallback_text()
 
-        return response
+        return self._with_date_note(response, date_hits)
 
     def _legacy_process_query(self, query):
 

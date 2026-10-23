@@ -220,6 +220,34 @@ class ImportManager:
         file_path: str | Path
     ) -> Dict[str, Any]:
         """
+        Import one timetable file - served from the content-hash
+        cache when this exact file (same bytes, same name, same
+        importer code) has been imported before.
+        """
+
+        from import_engine import fast_import
+
+        cached = fast_import.load_cached(file_path)
+
+        if cached is not None:
+
+            self.imported_files.append(
+                Path(file_path).name
+            )
+
+            return cached
+
+        result = self._import_file_uncached(file_path)
+
+        fast_import.store_cached(file_path, result)
+
+        return result
+
+    def _import_file_uncached(
+        self,
+        file_path: str | Path
+    ) -> Dict[str, Any]:
+        """
         Import one timetable file.
 
         Returns:

@@ -1758,6 +1758,20 @@ class PDFImporter:
             path
         ) as pdf:
 
+            # --------------------------------------------------
+            # FAST PATH: pages are independent, so process them
+            # on several CPU cores at once. Any failure falls
+            # back to the sequential loop below (same result).
+            # --------------------------------------------------
+
+            parallel_records = cls._import_pages_parallel(
+                path,
+                len(pdf.pages)
+            )
+
+            if parallel_records is not None:
+                return parallel_records
+
             for page_number, page in enumerate(
                 pdf.pages,
                 start=1
@@ -1776,6 +1790,61 @@ class PDFImporter:
                 )
 
         return records
+
+    @classmethod
+    def _import_pages_parallel(
+        cls,
+        path: Path,
+        page_count: int
+    ):
+        """
+        Process the pages of a PDF in a shared pool of worker
+        processes. Returns the records in page order, or None when
+        parallel processing isn't worthwhile / available (the
+        caller then uses the normal sequential loop).
+        """
+
+        try:
+
+            from import_engine import fast_import
+
+            if page_count < fast_import.MIN_PAGES_FOR_PARALLEL:
+                return None
+
+            pool = fast_import.get_pool()
+
+            if pool is None:
+                return None
+
+            chunks = fast_import.split_pages(
+                page_count,
+                fast_import.worker_count()
+            )
+
+            results = pool.map(
+                _process_pages_chunk,
+                [str(path)] * len(chunks),
+                chunks,
+                [path.name] * len(chunks)
+            )
+
+            records = []
+
+            for chunk_records in results:
+                records.extend(chunk_records)
+
+            return records
+
+        except Exception:
+
+            # includes BrokenProcessPool, pickling problems, etc.
+            try:
+                from import_engine import fast_import
+                fast_import.shutdown_pool()
+            except Exception:
+                pass
+
+            return None
 
     # ==========================================================
     # INSPECT FILE
@@ -2075,3 +2144,36 @@ if __name__ == "__main__":
         print(
             record
         )
+
+
+
+# ==============================================================
+# WORKER ENTRY POINT (runs inside pool processes)
+# ==============================================================
+
+def _process_pages_chunk(
+    path_str: str,
+    page_numbers,
+    file_name: str
+):
+    """
+    Process a contiguous group of pages of one PDF and return
+    their records (in page order). Module-level so that worker
+    processes can import it by name.
+    """
+
+    records = []
+
+    with pdfplumber.open(path_str) as pdf:
+
+        for page_number in page_numbers:
+
+            records.extend(
+                PDFImporter.process_page(
+                    pdf.pages[page_number - 1],
+                    page_number,
+                    file_name
+                )
+            )
+
+    return records

@@ -85,6 +85,9 @@ class Frame:
         self.bad_slots = []
         self.time_range = None
         self.time_point = None
+        # True only when the question itself contained a clock range
+        # such as "9 to 12" (not 'morning', 'after 2 pm', ...)
+        self.explicit_clock_range = False
 
         self.teachers = []
         self.subjects = []
@@ -1420,6 +1423,7 @@ class SmartQueryEngine(FacultyHandlers, CatalogHandlers):
                 b += 12 * 60
 
             f.time_range = (a, b) if a <= b else (b, a)
+            f.explicit_clock_range = True
 
             work = work[:rng.start()] + " " + work[rng.end():]
 
@@ -2574,6 +2578,9 @@ class SmartQueryEngine(FacultyHandlers, CatalogHandlers):
             g.slot_ref = prev.slot_ref
             g.time_range = prev.time_range
             g.time_point = prev.time_point
+            g.explicit_clock_range = getattr(
+                prev, "explicit_clock_range", False
+            )
 
         if not (("free" in c) or ("busy" in c)) and prev.polarity:
             g.cues.add(prev.polarity)

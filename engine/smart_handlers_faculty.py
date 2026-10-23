@@ -20,7 +20,14 @@ from engine.smart_format import (
     slots_text,
     title_day,
 )
-from engine.timetable_model import consecutive_runs
+from engine.timetable_model import consecutive_runs, fmt_minutes
+
+try:
+    from config.settings import (
+        FREE_RANGE_BUFFER_MINUTES as _DEFAULT_RANGE_BUFFER,
+    )
+except Exception:
+    _DEFAULT_RANGE_BUFFER = 15
 
 
 def _sorted(names):
@@ -70,6 +77,94 @@ class FacultyHandlers:
         return pool
 
     # ------------------------------------------------------------------
+    # exam-duty buffer for explicit clock ranges
+    # ------------------------------------------------------------------
+
+    def _range_buffer_minutes(self, f):
+        """
+        Buffer (minutes) that must also be free before and after a clock
+        range.  Default from config; a question can change it
+        ("30 minutes buffer") or switch it off ("no buffer").
+        """
+
+        text = f.text or ""
+
+        if re.search(
+            r"\b(?:no|without|zero)\s+(?:buffer|gap|margin)\b"
+            r"|\bexact(?:ly)?\s+(?:time|times|range|window)\b",
+            text,
+        ):
+            return 0
+
+        found = (
+            re.search(
+                r"\b(\d{1,3})\s*-?\s*(?:min|mins|minute|minutes)\s*"
+                r"(?:of\s+)?(?:buffer|gap|margin)\b",
+                text,
+            )
+            or re.search(
+                r"\b(?:buffer|gap|margin)\s*(?:of\s+)?(\d{1,3})\s*"
+                r"(?:min|mins|minute|minutes)\b",
+                text,
+            )
+        )
+
+        if found:
+            return int(found.group(1))
+
+        return _DEFAULT_RANGE_BUFFER
+
+    def _buffered_free_window(self, f):
+        """
+        For "who is free from 9 to 12": the slots that overlap the range
+        widened by the buffer on both sides, or None when the rule does
+        not apply.  Returns (slots, note).
+        """
+
+        if not getattr(f, "explicit_clock_range", False):
+            return None
+
+        if not f.time_range or f.slots or f.slot_ref \
+                or f.time_point is not None:
+            return None
+
+        buf = self._range_buffer_minutes(f)
+
+        if buf <= 0:
+            return None
+
+        m = self.model
+
+        start, end = f.time_range
+
+        low = max(0, start - buf)
+        high = min(24 * 60, end + buf)
+
+        slots = []
+
+        for slot in m.slots:
+
+            info = m.slot_info.get(slot) or {}
+
+            if info.get("start") is None or info.get("end") is None:
+                continue
+
+            if min(high, info["end"]) - max(low, info["start"]) > 0:
+                slots.append(slot)
+
+        if not slots:
+            return None
+
+        note = (
+            f"*Exam-duty rule: {fmt_minutes(start)}–{fmt_minutes(end)} "
+            f"plus a {buf}-minute buffer before and after — each teacher "
+            f"must be free from {fmt_minutes(low)} to {fmt_minutes(high)}. "
+            f"Add “no buffer” to use the exact times.*"
+        )
+
+        return sorted(slots), note
+
+    # ------------------------------------------------------------------
     # who is free / busy
     # ------------------------------------------------------------------
 
@@ -97,6 +192,16 @@ class FacultyHandlers:
         )
 
         mode = f.slot_mode
+
+        duty_note = ""
+
+        if polarity == "free":
+
+            buffered = self._buffered_free_window(f)
+
+            if buffered:
+                slots, duty_note = buffered
+                mode = "all"
 
         if not slots:
 
@@ -160,6 +265,9 @@ class FacultyHandlers:
         )
 
         head = f"**{title}**{joiner} · {len(names)} found"
+
+        if duty_note:
+            head += "\n\n" + duty_note
 
         if not names:
             return head + "\n\nNobody matches."

@@ -46,3 +46,11 @@ data/exam_duties.json
 data/room_shifts.json
 data/assignments.json
 question_bank/
+
+# Import result cache
+.import_cache/
+
+# Installer backups and one-time scripts
+*.bak_*
+speedup.patch
+apply_*.py
