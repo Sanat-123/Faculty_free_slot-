@@ -321,7 +321,16 @@ class FacultyAIChatbot:
         self.exam_duty_coordinator = ExamDutyCoordinator(
             self.query_engine,
             self.workload_engine,
-            store=self.exam_duty_store
+            store=self.exam_duty_store,
+            faculty_filter=lambda: getattr(
+                getattr(
+                    getattr(self, "smart_engine", None),
+                    "model",
+                    None
+                ),
+                "faculty_set",
+                None
+            )
         )
 
         # Holds the most recently PROPOSED (not yet confirmed)
@@ -2326,6 +2335,13 @@ class FacultyAIChatbot:
                             else:
                                 reason_text = (
                                     "has a class during that time"
+                                    + (
+                                        " (or within the "
+                                        f"{plan['buffer_minutes']}"
+                                        "-minute buffer around it)"
+                                        if plan.get("buffer_minutes")
+                                        else ""
+                                    )
                                 )
 
                             lines.append(f"- {name}: {reason_text}")
@@ -2355,6 +2371,16 @@ class FacultyAIChatbot:
                             )
                             + ":"
                         ]
+
+                        if plan.get("buffer_minutes"):
+                            lines.append("")
+                            lines.append(
+                                "Everyone listed is free from "
+                                f"{plan['availability_start']} to "
+                                f"{plan['availability_end']} "
+                                f"({plan['buffer_minutes']}-minute buffer "
+                                "before and after the duty)."
+                            )
 
                         lines.append("")
 

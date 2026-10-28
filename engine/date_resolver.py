@@ -22,12 +22,13 @@ Understood (examples):
     tomorrow   day after tomorrow   in 3 days   3 days later
     next Monday   this Friday   coming Tuesday   last Wednesday
 
-Rules for dates written without a year:  the next date on or after today
-(so "15th October" asked in November means NEXT year's 15 October).  Add
-a year ("15th October 2025") to ask about another one.  Numeric dates are
-read day-first (12/10/26 = 12 October 2026) unless the first number is
-impossible as a day (10/25/26 = 25 October) or the environment variable
-FACULTY_DATE_ORDER is set to "mdy".
+Rules for dates written without a year:  the year (and month, for "the
+15th") is taken from the system clock - "15th October" typed in 2026 means
+15 October 2026, typed in 2027 it means 2027.  Add a year ("15th October
+2025") to ask about another one.  Numeric dates are read day-first
+(12/10/26 = 12 October 2026) unless the first number is impossible as a
+day (10/25/26 = 25 October) or the environment variable FACULTY_DATE_ORDER
+is set to "mdy".
 
 Public functions:
 
@@ -159,21 +160,29 @@ def _valid(year: int, month: int, day: int) -> Optional[datetime.date]:
 
 
 def _upcoming(month: int, day: int, today: datetime.date):
-    """Next occurrence of month/day on or after today (looks 8 years ahead
-    so 29 February is found too).  Returns (date | None, year_assumed)."""
+    """
+    The date with this month/day in the CURRENT year (the year comes
+    from the system clock, never from a fixed number).  Only when that
+    date does not exist - 29 February in a non-leap year - the next year
+    that has it is used.
+    """
 
     for year in range(today.year, today.year + 9):
 
         found = _valid(year, month, day)
 
-        if found and found >= today:
+        if found:
             return found
 
     return None
 
 
 def _upcoming_day_of_month(day: int, today: datetime.date):
-    """Next date on or after today whose day-of-month is `day`."""
+    """
+    "the 15th" -> the 15th of the CURRENT month (from the system clock);
+    if this month has no such day (31st in a 30-day month) the next
+    month that has it.
+    """
 
     year, month = today.year, today.month
 
@@ -181,7 +190,7 @@ def _upcoming_day_of_month(day: int, today: datetime.date):
 
         found = _valid(year, month, day)
 
-        if found and found >= today:
+        if found:
             return found
 
         month += 1
@@ -471,6 +480,58 @@ def _find_day_lists(text, today):
     return hits
 
 
+def _find_date_ranges(text, today):
+    """10 Nov to 12 Nov / 28 Oct - 2 Nov 2026 -> every day in between"""
+
+    hits = []
+
+    pattern = (
+        rf"(?<![\d:.])(\d{{1,2}})(?:{_ORD})?[\s\-/.]*([a-z]{{3,10}})(?![a-z])\.?"
+        rf"(?:[\s,]+(\d{{4}})\b)?\s*(?:-|–|—|to|till|until|through)\s*"
+        rf"(\d{{1,2}})(?:{_ORD})?[\s\-/.]*([a-z]{{3,10}})(?![a-z])\.?"
+        rf"(?:[\s,]+(\d{{4}})\b)?"
+    )
+
+    for m in re.finditer(pattern, text):
+
+        month_a, month_b = _month_of(m.group(2)), _month_of(m.group(5))
+
+        if not month_a or not month_b:
+            continue
+
+        year_b = int(m.group(6)) if m.group(6) else None
+        year_a = int(m.group(3)) if m.group(3) else year_b
+
+        start = (
+            _valid(year_a, month_a, int(m.group(1))) if year_a
+            else _upcoming(month_a, int(m.group(1)), today)
+        )
+
+        if year_b:
+            end = _valid(year_b, month_b, int(m.group(4)))
+        elif start:
+            end = _valid(start.year, month_b, int(m.group(4)))
+            if end and end < start:
+                end = _valid(start.year + 1, month_b, int(m.group(4)))
+        else:
+            end = None
+
+        if not start or not end or end < start or (end - start).days > 60:
+            continue
+
+        days = [
+            start + datetime.timedelta(days=n)
+            for n in range((end - start).days + 1)
+        ]
+
+        hits.append(DateHit(
+            m.start(), m.end(), days,
+            year_assumed=not (m.group(3) or m.group(6)), is_list=True,
+        ))
+
+    return hits
+
+
 def _find_ordinal_only(text, today):
     """'on the 15th' / 'for 15th' -> the next 15th of a month"""
 
@@ -600,7 +661,8 @@ def find_dates(text, today=None) -> List[DateHit]:
     hits: List[DateHit] = []
 
     for finder in (
-        _find_iso, _find_numeric, _find_day_lists, _find_text_dmy,
+        _find_iso, _find_numeric, _find_date_ranges, _find_day_lists,
+        _find_text_dmy,
         _find_text_mdy, _find_month_relative, _find_ordinal_only,
         _find_relative,
     ):

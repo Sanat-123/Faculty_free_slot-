@@ -53,4 +53,8 @@ question_bank/
 # Installer backups and one-time scripts
 *.bak_*
 speedup.patch
+
+
+# one-time installer scripts and backups
 apply_*.py
+*.bak_*

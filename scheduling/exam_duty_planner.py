@@ -100,18 +100,60 @@ from typing import Any
 
 from scheduling.exam_duty_store import ExamDutyStore
 
+try:
+    from config.settings import (
+        FREE_RANGE_BUFFER_MINUTES as _DUTY_BUFFER_MINUTES,
+    )
+except Exception:
+    _DUTY_BUFFER_MINUTES = 15
+
+
+def _clock(minutes: int) -> str:
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
 
 class ExamDutyCoordinator:
+
+    # ============================================================
+    # BUFFER: a duty from 09:00 to 12:00 needs the teacher free from
+    # 08:45 to 12:15 (a few minutes before the exam to settle in and
+    # after it to collect papers). Only the AVAILABILITY check uses
+    # the widened window - the saved duty keeps its real times.
+    # ============================================================
+
+    @staticmethod
+    def _buffered_times(start_minutes: int, end_minutes: int):
+        buffer = max(0, int(_DUTY_BUFFER_MINUTES or 0))
+
+        low = max(0, start_minutes - buffer)
+        high = min(24 * 60 - 1, end_minutes + buffer)
+
+        return buffer, _clock(low), _clock(high)
 
     def __init__(
         self,
         query_engine,
         workload_engine,
         store=None,
+        faculty_filter=None,
     ):
         self.query_engine = query_engine
         self.workload_engine = workload_engine
         self.store = store or ExamDutyStore()
+
+        # Optional callable returning the set of names that count as
+        # real faculty (looked up lazily, at proposal time). Anyone
+        # else found in the timetable data (code-style rows etc.) is
+        # never proposed for exam duty.
+        self.faculty_filter = faculty_filter
+
+    def _real_faculty(self):
+        try:
+            allowed = self.faculty_filter() if self.faculty_filter else None
+        except Exception:
+            return None
+
+        return set(allowed) if allowed else None
 
     # ============================================================
     # BASIC HELPERS
@@ -236,10 +278,14 @@ class ExamDutyCoordinator:
         weekday = self._derive_weekday(parsed_date)
         exam_date_key = parsed_date.isoformat()
 
+        buffer_minutes, available_from, available_to = (
+            self._buffered_times(start_minutes, end_minutes)
+        )
+
         base_result = self.workload_engine.exam_duty_candidates(
             weekday,
-            start_time,
-            end_time,
+            available_from,
+            available_to,
         )
 
         duty_counts = self.store.duty_counts()
@@ -247,11 +293,16 @@ class ExamDutyCoordinator:
         results = []
         conflicts = []
 
+        real_faculty = self._real_faculty()
+
         for candidate in base_result.get("results", []):
 
             teacher = self._text(candidate.get("teacher"))
 
             if not teacher:
+                continue
+
+            if real_faculty is not None and teacher not in real_faculty:
                 continue
 
             if self.store.teacher_has_overlap(
@@ -311,6 +362,9 @@ class ExamDutyCoordinator:
             "day": weekday,
             "start_time": start_time,
             "end_time": end_time,
+            "buffer_minutes": buffer_minutes,
+            "availability_start": available_from,
+            "availability_end": available_to,
             "count": len(results),
             "results": results,
             "conflicts": conflicts,
@@ -447,6 +501,9 @@ class ExamDutyCoordinator:
                     "start_time": start_time,
                     "end_time": end_time,
                     "unavailable": unavailable,
+                    "buffer_minutes": candidate_result.get(
+                        "buffer_minutes", 0
+                    ),
                     "available_requested": [c["teacher"] for c in selected],
                 }
 
@@ -460,6 +517,15 @@ class ExamDutyCoordinator:
             "start_time": start_time,
             "end_time": end_time,
             "hall": hall_text or "",
+            "buffer_minutes": candidate_result.get(
+                "buffer_minutes", 0
+            ),
+            "availability_start": candidate_result.get(
+                "availability_start", start_time
+            ),
+            "availability_end": candidate_result.get(
+                "availability_end", end_time
+            ),
             "session_id": session_id_text or "",
             "session_key": session_key,
             "required_count": required_count,
