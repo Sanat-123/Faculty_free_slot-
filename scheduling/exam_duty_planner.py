@@ -136,10 +136,15 @@ class ExamDutyCoordinator:
         workload_engine,
         store=None,
         faculty_filter=None,
+        unavailable_store=None,
     ):
         self.query_engine = query_engine
         self.workload_engine = workload_engine
         self.store = store or ExamDutyStore()
+
+        # Optional ExamUnavailableStore: faculty explicitly marked
+        # unavailable (leave, travel, ...) are never proposed for that date.
+        self.unavailable_store = unavailable_store
 
         # Optional callable returning the set of names that count as
         # real faculty (looked up lazily, at proposal time). Anyone
@@ -295,6 +300,14 @@ class ExamDutyCoordinator:
 
         real_faculty = self._real_faculty()
 
+        try:
+            marked_unavailable = (
+                self.unavailable_store.for_date(exam_date_key)
+                if self.unavailable_store else {}
+            )
+        except Exception:
+            marked_unavailable = {}
+
         for candidate in base_result.get("results", []):
 
             teacher = self._text(candidate.get("teacher"))
@@ -303,6 +316,18 @@ class ExamDutyCoordinator:
                 continue
 
             if real_faculty is not None and teacher not in real_faculty:
+                continue
+
+            unavailable_reason = marked_unavailable.get(
+                " ".join(teacher.lower().split())
+            )
+
+            if unavailable_reason:
+                conflicts.append({
+                    "teacher": teacher,
+                    "reason": "marked_unavailable",
+                    "detail": unavailable_reason,
+                })
                 continue
 
             if self.store.teacher_has_overlap(

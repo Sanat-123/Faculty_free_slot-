@@ -252,6 +252,30 @@ def parse_rooms(text: str) -> Tuple[List[str], Optional[int]]:
             if not part:
                 continue
 
+            # "B1 B2 B3" - several room names separated only by spaces.
+            # Each piece must be a room-like token that contains a letter
+            # (so a time such as "9" or "12" is never taken for a room), and
+            # only the leading run of such pieces counts.
+            pieces = part.split()
+
+            if len(pieces) > 1:
+
+                run = []
+
+                for piece in pieces:
+
+                    if re.fullmatch(
+                        r"[A-Za-z]{1,4}-?\d{1,4}[A-Za-z]{0,2}|\d{3,4}[A-Za-z]{0,2}",
+                        piece,
+                    ):
+                        run.append(piece)
+                    else:
+                        break
+
+                if len(run) > 1:
+                    rooms.extend(x.upper() for x in run)
+                    break
+
             ranged = _ROOM_RANGE.match(part) or _ROOM_RANGE_START.match(part)
 
             if ranged and abs(int(ranged.group(3)) - int(ranged.group(2))) < 60:
@@ -424,6 +448,9 @@ class ParsedRequest:
     avoid_consecutive: bool = False
     rich: bool = False
     words: int = 0
+    excluded: set = field(default_factory=set)            # normalised names
+    exclusion_notes: List[str] = field(default_factory=list)
+    setup_reused: str = ""
 
 
 def is_exam_duty_text(text: str) -> bool:
@@ -514,6 +541,247 @@ def parse_request(text: str, today: date) -> ParsedRequest:
     return req
 
 
+
+
+# ======================================================================
+# naming people: exclusions / "unavailable" statements
+#
+# Faculty are found in the question by matching it against the timetable's
+# own list of names - there is no list of surnames or departments here.
+# Titles are learned from the data (the word most names start with); the
+# few generic ones below only cover titles the timetable itself does not use.
+# ======================================================================
+
+_GENERIC_TITLES = {
+    "dr", "prof", "professor", "mr", "mrs", "ms", "miss", "mx", "sir",
+    "madam", "mam", "shri", "smt", "sri", "er",
+}
+
+_VERB = (
+    r"assign|include|use|select|consider|allocate|pick|choose|give|put|"
+    r"schedule|appoint|take|involve|nominate|add|count"
+)
+
+_EXCLUDE_TRIGGER = re.compile(
+    r"\b(?:exclud(?:e|es|ing|ed)|except(?:ing)?|exempt(?:ing|ed|s)?|"
+    r"omit(?:ting|ted|s)?|skip(?:ping|ped|s)?|ignor(?:e|es|ing|ed)|"
+    r"without|leave\s+out|leaving\s+out|other\s+than|apart\s+from|"
+    r"besides|but\s+not|barring|keep\s+out|remove|drop|"
+    rf"not\s+(?:to\s+)?(?:{_VERB})|"
+    rf"(?:do|does|did|should|must|shall|can|could|will|would)\s*(?:not|n['’]t)\s+(?:{_VERB})|"
+    rf"(?:don|doesn|didn|shouldn|mustn|can|couldn|won|wouldn)['’]?t\s+(?:{_VERB})|"
+    rf"never\s+(?:{_VERB})|avoid|no\s+duty\s+(?:for|to)|"
+    r"leave\s+.{0,20}\s+out)\b",
+    re.I,
+)
+
+_STATUS = re.compile(
+    r"(?P<who>[^.;\n?!]{2,160}?)\s+"
+    r"(?:is|are|will\s+be|remains?|stays?|was|were|has\s+been|have\s+been)\s+"
+    r"(?:currently\s+|also\s+|both\s+)?(?:marked\s+(?:as\s+)?)?"
+    r"(?:not\s+available|unavailable|on\s+(?:medical\s+|casual\s+|earned\s+)?leave|"
+    r"absent|away|out\s+of\s+station|travell?ing|off\s+duty|on\s+tour|sick|ill)\b",
+    re.I,
+)
+
+_MARK = re.compile(
+    r"^\W*(?:please\s+)?(?:can\s+you\s+)?(?:mark|set|record|note|register|flag)"
+    r"\s+(?P<who>.+?)\s+(?:as\s+|to\s+be\s+)?"
+    r"(?:not\s+available|unavailable|on\s+leave|absent|away)\b(?P<rest>.*)$",
+    re.I | re.S,
+)
+
+_CLEAR = re.compile(
+    r"\b(?:clear|reset|remove|delete|undo|cancel)\b.{0,40}"
+    r"\b(?:unavailab\w+|leave|absence)\b"
+    r"|\b(?:unavailab\w+|leave)\b.{0,30}\b(?:clear|reset|removed?|cancel\w*)\b",
+    re.I,
+)
+
+_SHOW_UNAVAILABLE = re.compile(
+    r"\b(?:who|which|show|list|display|see|what)\b.{0,50}"
+    r"\b(?:unavailab\w+|not\s+available)\b",
+    re.I,
+)
+
+
+def _word_tokens(text: str) -> List[str]:
+
+    return re.findall(r"[a-z]+", str(text or "").lower())
+
+
+def learn_titles(faculty) -> set:
+    """Titles used by this timetable: first words shared by several names."""
+
+    first: Dict[str, int] = defaultdict(int)
+
+    for name in faculty:
+        tokens = _word_tokens(name)
+        if len(tokens) > 1:
+            first[tokens[0]] += 1
+
+    learned = {t for t, n in first.items() if n >= 3 and len(t) <= 6}
+
+    return learned | _GENERIC_TITLES
+
+
+def resolve_faculty_phrase(phrase: str, faculty, titles: set) -> List[str]:
+    """
+    Every faculty member whose name contains all the (non-title) words of
+    `phrase`.  Small typos are tolerated; one-letter words match initials.
+    An ambiguous phrase (a surname shared by several people) therefore
+    returns all of them - the caller decides what to do with that.
+    """
+
+    import difflib
+
+    words = [w for w in _word_tokens(phrase) if w not in titles]
+
+    if not words or len(words) > 4:
+        return []
+
+    found = []
+
+    for name in faculty:
+
+        have = [t for t in _word_tokens(name) if t not in titles]
+
+        if not have:
+            continue
+
+        def hit(word):
+            for t in have:
+                if word == t:
+                    return True
+                if len(word) == 1 and t.startswith(word):
+                    return True
+                if len(word) >= 5 and len(t) >= 5 and \
+                        difflib.SequenceMatcher(None, word, t).ratio() >= 0.86:
+                    return True
+            return False
+
+        if all(hit(w) for w in words):
+            found.append(name)
+
+    return found
+
+
+def _clause_end(text: str, start: int, titles: set) -> int:
+    """End of the sentence that begins at `start` ('Dr.' is not an end)."""
+
+    i = start
+
+    while i < len(text):
+
+        ch = text[i]
+
+        if ch in ";?!\n":
+            return i
+
+        if ch == ".":
+
+            before = re.search(r"([A-Za-z]+)$", text[:i])
+            word = before.group(1).lower() if before else ""
+
+            if word not in titles and len(word) > 1:
+                return i
+
+        i += 1
+
+    return len(text)
+
+
+def _split_items(chunk: str) -> List[str]:
+
+    chunk = re.sub(
+        r"\b(?:as\s+requested|as\s+asked|please|from\s+(?:the\s+)?(?:exam\s+)?"
+        r"(?:duty|duties|list|allocation|plan)|for\s+(?:this|the)\s+\w+)\b",
+        " ", chunk, flags=re.I,
+    )
+
+    parts = re.split(r"\s*(?:,|&|/|\band\b|\bor\b|\bplus\b|\bnor\b)\s*", chunk, flags=re.I)
+
+    return [x.strip(" .:()[]\"'") for x in parts if x.strip(" .:()[]\"'")]
+
+
+def parse_exclusions(text: str, faculty, titles: set):
+    """
+    Faculty the request wants left out - by an instruction ("exclude Dr. A and
+    B", "except C", "don't use D") or a statement ("E is on leave").
+
+    Returns (excluded names, notes, spans) where notes explain each phrase
+    and spans are the text ranges that were used (so those names are not also
+    treated as people to *assign*).
+    """
+
+    text = str(text or "")
+
+    phrases: List[Tuple[str, int, int]] = []
+
+    for m in _EXCLUDE_TRIGGER.finditer(text):
+
+        end = _clause_end(text, m.end(), titles)
+
+        phrases.append((text[m.end():end], m.end(), end))
+
+    for m in _STATUS.finditer(text):
+
+        phrases.append((m.group("who"), m.start("who"), m.end("who")))
+
+    excluded: Dict[str, str] = {}
+    notes: List[str] = []
+    spans: List[Tuple[int, int]] = []
+
+    for chunk, start, end in phrases:
+
+        used = False
+
+        for item in _split_items(chunk):
+
+            matches = resolve_faculty_phrase(item, faculty, titles)
+
+            if not matches:
+
+                # a capitalised name (or one with a title) that nobody in the
+                # timetable has: say so instead of silently ignoring it
+                words = re.findall(r"[A-Za-z][A-Za-z.]*", item)
+
+                looks_like_name = (
+                    1 <= len(words) <= 4
+                    and all(w[0].isupper() for w in words)
+                    and any(
+                        w.strip(".").lower() not in titles for w in words
+                    )
+                )
+
+                if looks_like_name:
+                    notes.append(
+                        f"“{item}” — no faculty with that name in the "
+                        f"timetable, so nobody was excluded for it"
+                    )
+
+                continue
+
+            used = True
+
+            for name in matches:
+                excluded[_norm(name)] = name
+
+            if len(matches) == 1:
+                notes.append(f"“{item}” → {matches[0]}")
+            else:
+                notes.append(
+                    f"“{item}” matches {len(matches)} faculty "
+                    f"({', '.join(matches[:6])}{'…' if len(matches) > 6 else ''}) "
+                    f"— all were excluded; give the full name to exclude only one"
+                )
+
+        if used:
+            spans.append((start, end))
+
+    return set(excluded), list(dict.fromkeys(notes)), spans
+
+
 # ======================================================================
 # allocation
 # ======================================================================
@@ -563,6 +831,7 @@ class ExamDutyAllocator:
         slots: List[str],
         fair_first: bool = False,
         avoid_consecutive: bool = True,
+        excluded: Optional[set] = None,
     ) -> Dict[str, Any]:
         """
         sessions: [(date, 'HH:MM', 'HH:MM'), ...]
@@ -624,7 +893,10 @@ class ExamDutyAllocator:
                     "reason": cand.get("reason", "candidates_failed"),
                 }
 
-            pool = list(cand["results"])
+            pool = [
+                c for c in cand["results"]
+                if _norm(c["teacher"]) not in (excluded or set())
+            ]
 
             chosen: List[Dict[str, Any]] = []
             shortage: List[str] = []
@@ -811,9 +1083,15 @@ class ExamDutyRequestHandler:
         today_getter: Callable[[], date],
         has_named_teachers: Callable[[str], bool],
         unknown_branch: Optional[Callable[[str], Optional[str]]] = None,
+        unavailable_store=None,
     ):
 
         self.coordinator = coordinator
+        self.unavailable_store = unavailable_store
+
+        # rooms / invigilators of the last request that gave them, so a later
+        # "prepare the allocation ... list unfilled rooms" need not repeat them
+        self.last_setup: Optional[Dict[str, Any]] = None
         self.allocator = ExamDutyAllocator(coordinator)
         self.model_getter = model_getter
         self.branch_getter = branch_getter
@@ -858,6 +1136,12 @@ class ExamDutyRequestHandler:
         if not is_exam_duty_text(text):
             return None
 
+        # ----- "mark Dr X unavailable", "who is unavailable", "clear ..." -----
+        availability_reply = self._availability_command(text)
+
+        if availability_reply is not None:
+            return availability_reply
+
         # "... from the mechanical branch" when no such branch exists:
         # say so instead of silently ignoring it
         if self.unknown_branch is not None:
@@ -871,10 +1155,27 @@ class ExamDutyRequestHandler:
 
         req = parse_request(text, today)
 
+        # faculty the request leaves out ("exclude Dr. A", "B is on leave")
+        faculty = self._faculty_names()
+
+        titles = learn_titles(faculty)
+
+        excluded, notes, spans = parse_exclusions(text, faculty, titles)
+
+        req.excluded = excluded
+        req.exclusion_notes = notes
+
         if not req.intent:
             return None
 
-        named = self.has_named_teachers(text)
+        # people named only inside an exclusion are not people to ASSIGN
+        remaining = list(text)
+
+        for a, b in spans:
+            for i in range(a, min(b, len(remaining))):
+                remaining[i] = " "
+
+        named = self.has_named_teachers("".join(remaining))
 
         # ----- which requests belong here -----
         if req.intent == "eligible":
@@ -911,6 +1212,9 @@ class ExamDutyRequestHandler:
             multi = bool(
                 req.rooms or req.room_count or req.per_room
                 or len(req.dates) > 1
+                or req.excluded
+                or (self.last_setup and req.dates and req.start
+                    and not req.total)
             )
 
             # a plain "assign 3 faculty for exam duty on <date> <time>" (or
@@ -923,6 +1227,135 @@ class ExamDutyRequestHandler:
         return None
 
     # ---------------- pieces ------------------------------------------
+
+    # ---------------- helpers shared by the replies --------------------
+
+    def _faculty_names(self) -> List[str]:
+
+        model = self.model_getter()
+
+        everyone = set(getattr(model, "faculty_set", None) or [])
+
+        try:
+            allowed = self.coordinator._real_faculty()
+            if allowed is not None:
+                everyone &= set(allowed)
+        except Exception:
+            pass
+
+        return sorted(everyone)
+
+    def _exclusion_lines(self, req: ParsedRequest) -> List[str]:
+
+        if not req.exclusion_notes:
+            return []
+
+        return [
+            "*Left out as requested:* " + "; ".join(req.exclusion_notes) + ".",
+        ]
+
+    def _availability_command(self, text: str) -> Optional[str]:
+        """Mark / clear / list faculty who are unavailable for exam duty."""
+
+        store = self.unavailable_store
+
+        if store is None:
+            return None
+
+        faculty = self._faculty_names()
+        titles = learn_titles(faculty)
+
+        mark = _MARK.match(text)
+
+        if mark:
+
+            found: Dict[str, str] = {}
+            unresolved = []
+
+            for item in _split_items(mark.group("who")):
+
+                matches = resolve_faculty_phrase(item, faculty, titles)
+
+                if not matches:
+                    unresolved.append(item)
+
+                elif len(matches) > 1:
+                    return (
+                        f"“{item}” matches {len(matches)} faculty "
+                        f"({', '.join(matches[:6])}). Please use the full name "
+                        f"so I mark the right person."
+                    )
+
+                else:
+                    found[_norm(matches[0])] = matches[0]
+
+            if not found:
+                return None
+
+            hits = date_resolver.find_dates(text, self.today_getter())
+            when = hits[0].dates[0].isoformat() if hits and hits[0].dates else ""
+
+            reason = re.search(
+                r"\b(?:on\s+leave|absent|away|sick|travell?ing)\b",
+                text, re.I,
+            )
+
+            for name in found.values():
+                store.add(name, when, reason.group(0).lower() if reason else "")
+
+            scope = (
+                f"on {self._pretty_day(date.fromisoformat(when))}"
+                if when else "until cleared"
+            )
+
+            return (
+                f"Marked unavailable for exam duty {scope}: "
+                + ", ".join(found.values()) + "."
+                + (f" (Not recognised: {', '.join(unresolved)}.)" if unresolved else "")
+                + " They will not be proposed or assigned."
+            )
+
+        if _CLEAR.search(text):
+
+            found = {}
+
+            for item in _split_items(re.sub(
+                r"(?i)\b(?:clear|reset|remove|delete|undo|cancel|unavailab\w+|"
+                r"leave|absence|exam|duty|duties|for|from|the|of|all)\b", " ", text
+            )):
+                for name in resolve_faculty_phrase(item, faculty, titles):
+                    found[_norm(name)] = name
+
+            if found:
+                removed = sum(store.remove(n) for n in found.values())
+                return (
+                    f"Removed {removed} unavailability "
+                    f"entr{'y' if removed == 1 else 'ies'} for "
+                    + ", ".join(found.values()) + "."
+                )
+
+            if re.search(r"\ball\b", text, re.I):
+                return f"Cleared {store.clear()} unavailability entries."
+
+            return None
+
+        if _SHOW_UNAVAILABLE.search(text) and not _ASSIGN.search(text.lower()) \
+                and not re.search(r"\b(?:free|eligible|available\s+for)\b", text, re.I):
+
+            rows = store.all()
+
+            if not rows:
+                return "Nobody is currently marked unavailable for exam duty."
+
+            lines = ["**Marked unavailable for exam duty**", ""]
+
+            for row in rows:
+                when = row.get("exam_date") or "until cleared"
+                lines.append(f"- {row.get('teacher')} — {when} ({row.get('reason')})")
+
+            return "\n".join(lines)
+
+        return None
 
     def _pretty_day(self, day: date) -> str:
 
@@ -1004,6 +1437,14 @@ class ExamDutyRequestHandler:
         if not cand.get("success"):
             return f"I couldn't check availability ({cand.get('reason')})."
 
+        if req.excluded:
+            cand = dict(cand)
+            cand["results"] = [
+                c for c in cand["results"]
+                if _norm(c["teacher"]) not in req.excluded
+            ]
+            cand["count"] = len(cand["results"])
+
         rows = []
 
         counts = self.allocator.stored_counts()
@@ -1068,6 +1509,8 @@ class ExamDutyRequestHandler:
 
         lines += ["", self._exclusion_summary(cand, req)]
 
+        lines += self._exclusion_lines(req)
+
         return "\n".join(lines)
 
     def _multi_date_eligible_hint(self) -> str:
@@ -1091,7 +1534,18 @@ class ExamDutyRequestHandler:
             pass
 
         eligible = {c["teacher"] for c in cand["results"]}
-        on_duty = {c["teacher"] for c in cand.get("conflicts", [])}
+        on_duty = {
+            c["teacher"] for c in cand.get("conflicts", [])
+            if c.get("reason") != "marked_unavailable"
+        }
+        marked = {
+            c["teacher"] for c in cand.get("conflicts", [])
+            if c.get("reason") == "marked_unavailable"
+        }
+        left_out = {
+            t for t in everyone
+            if _norm(t) in (req.excluded or set())
+        }
 
         lo = int(cand["availability_start"][:2]) * 60 \
             + int(cand["availability_start"][3:])
@@ -1113,12 +1567,18 @@ class ExamDutyRequestHandler:
                         min(hi, info["end"]) - max(lo, info["start"]) > 0:
                     teaching.add(t)
 
-        other = everyone - eligible - on_duty - teaching
+        other = everyone - eligible - on_duty - teaching - marked - left_out
 
         parts = [
-            f"{len(teaching - on_duty)} teaching in that window or its buffer",
+            f"{len(teaching - on_duty - marked - left_out)} teaching in that window or its buffer",
             f"{len(on_duty)} already on a confirmed exam duty then",
         ]
+
+        if marked:
+            parts.append(f"{len(marked)} marked unavailable")
+
+        if left_out:
+            parts.append(f"{len(left_out)} left out as requested")
 
         if other:
             parts.append(
@@ -1199,8 +1659,32 @@ class ExamDutyRequestHandler:
 
             return "\n".join(lines)
 
+        # ---- nothing about rooms said: reuse the last setup, if any ----
+        said_setup = bool(
+            req.rooms or req.room_count or req.per_room or req.total
+        )
+
+        if not said_setup and self.last_setup:
+
+            req.rooms = list(self.last_setup["rooms"])
+            req.room_count = self.last_setup["room_count"]
+            req.per_room = self.last_setup["per_room"]
+            req.total = self.last_setup["total"]
+
+            req.setup_reused = self.last_setup["text"]
+
         # ---- how many seats per session ----
         rooms = list(req.rooms)
+
+        if rooms and req.room_count and len(rooms) < req.room_count:
+
+            return (
+                f"You mentioned {req.room_count} rooms but I could only read "
+                f"{len(rooms)} room name{'s' if len(rooms) != 1 else ''} "
+                f"({', '.join(rooms)}). Please list every room, separated by "
+                f"commas — for example *A101, A102, A103* — or give a range "
+                f"such as *A101–A105*."
+            )
 
         if not rooms and req.room_count and req.room_count > 1:
             rooms = [f"Room {n}" for n in range(1, req.room_count + 1)]
@@ -1243,6 +1727,7 @@ class ExamDutyRequestHandler:
             slots,
             fair_first=req.fair_first,
             avoid_consecutive=True,
+            excluded=req.excluded,
         )
 
         if not plan.get("success"):
@@ -1250,6 +1735,23 @@ class ExamDutyRequestHandler:
 
         plan["rooms"] = rooms
         plan["per_room"] = per_room
+
+        if rooms or req.total:
+
+            if rooms and per_room:
+                text = f"{len(rooms)} rooms × {per_room} invigilators"
+            elif rooms:
+                text = f"{len(rooms)} rooms, {req.total} invigilators"
+            else:
+                text = f"{req.total} invigilators"
+
+            self.last_setup = {
+                "rooms": list(rooms),
+                "room_count": req.room_count,
+                "per_room": per_room,
+                "total": req.total,
+                "text": text,
+            }
 
         assigned = sum(len(s["assignments"]) for s in plan["sessions"])
 
@@ -1292,6 +1794,13 @@ class ExamDutyRequestHandler:
         ]
 
         rooms = plan.get("rooms") or []
+
+        if req.setup_reused:
+            lines += [
+                f"*Using the same room setup as before: {req.setup_reused} "
+                f"(rooms: {', '.join(rooms) if rooms else 'not named'}).*",
+                "",
+            ]
 
         for sess in sessions:
 
@@ -1337,6 +1846,24 @@ class ExamDutyRequestHandler:
                         f"{self._department(a['teacher'])} |"
                     )
 
+            if sess["shortage"] and rooms:
+
+                short = defaultdict(int)
+
+                for room in sess["shortage"]:
+                    short[room] += 1
+
+                lines += [
+                    "",
+                    "**Unfilled rooms:** " + "; ".join(
+                        f"{room} (needs {n} more)" for room, n in short.items()
+                    ),
+                ]
+
+            elif rooms:
+
+                lines += ["", "**Unfilled rooms:** none — every room is fully staffed."]
+
             if sess["shortage"]:
                 lines += [
                     "",
@@ -1369,6 +1896,8 @@ class ExamDutyRequestHandler:
             ]
         elif multi or req.avoid_consecutive:
             lines += ["", "*No consecutive-day or back-to-back duties.*"]
+
+        lines += self._exclusion_lines(req)
 
         total_seats = sum(
             len(s["assignments"]) + len(s["shortage"]) for s in sessions

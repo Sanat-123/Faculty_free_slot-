@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
 import re
+from collections import Counter
 
 import pdfplumber
 
@@ -1236,7 +1237,9 @@ class PDFImporter:
         class_name: str = "",
         room: str = "",
         page_identity_type: str = "",
-        legend: Optional[Dict[str, str]] = None
+        legend: Optional[Dict[str, str]] = None,
+        raw_cell: str = "",
+        page_label: str = ""
     ) -> Dict[str, Any]:
 
         """
@@ -1457,6 +1460,19 @@ class PDFImporter:
 
             "page_identity_type":
                 page_identity_type,
+
+            # Layout evidence kept for the document-learned pass
+            # (see learn_document_layout): the cell WITH its line
+            # structure, and the page's own label line.
+            "raw_cell":
+                raw_cell,
+
+            "page_label":
+                page_label,
+
+            # transient: consumed (and removed) by learn_document_layout
+            "_legend":
+                legend or {},
         }
 
     # ==========================================================
@@ -1518,6 +1534,15 @@ class PDFImporter:
         legend = cls.extract_page_legend(
             page
         )
+
+        try:
+            page_label = cls.clean_label(
+                cls.detect_page_label_line(
+                    page.extract_text() or ""
+                )
+            )
+        except Exception:
+            page_label = ""
 
         teacher = (
             identity_value
@@ -1618,6 +1643,7 @@ class PDFImporter:
                 # ==================================================
 
                 previous_cell_text = None
+                previous_raw_cell = ""
 
                 for column_index, slot_info in slot_headers.items():
 
@@ -1639,10 +1665,12 @@ class PDFImporter:
                         if previous_cell_text:
 
                             cell = previous_cell_text
+                            raw_cell_lines = previous_raw_cell
 
                         else:
 
                             cell = ""
+                            raw_cell_lines = ""
 
                     # --------------------------------------------------
                     # NORMAL CELL
@@ -1651,6 +1679,10 @@ class PDFImporter:
                     else:
 
                         cell = cls.clean_text(
+                            raw_cell
+                        )
+
+                        raw_cell_lines = cls.clean_cell_lines(
                             raw_cell
                         )
 
@@ -1680,7 +1712,9 @@ class PDFImporter:
                         source_file=source_file,
                         source_page=page_number,
                         page_identity_type=identity_type,
-                        legend=legend
+                        legend=legend,
+                        raw_cell=raw_cell_lines,
+                        page_label=page_label
                     )
 
                     records.append(
@@ -1718,6 +1752,7 @@ class PDFImporter:
                         if cell:
 
                             previous_cell_text = cell
+                            previous_raw_cell = raw_cell_lines
 
                         else:
 
@@ -1725,6 +1760,246 @@ class PDFImporter:
                             # This breaks the merged region.
 
                             previous_cell_text = None
+
+        return records
+
+    # ==========================================================
+    # LAYOUT-PRESERVING HELPERS + DOCUMENT-LEARNED PASS
+    # ==========================================================
+
+    @staticmethod
+    def clean_label(value: Any) -> str:
+        """Page label without stray trailing punctuation ('3-CS-IOT.')."""
+
+        text = PDFImporter.clean_text(value)
+
+        return text.strip(" .:;,")
+
+    @staticmethod
+    def canonical_class(value: Any) -> str:
+        """
+        One spelling per class across every file: separators / spaces
+        collapse to a single hyphen ("3CS AI-B", "3CS-AI-B", "3CS - AI-B"
+        -> "3CS-AI-B").  Purely textual - no class format is assumed.
+        """
+
+        text = PDFImporter.clean_label(value)
+
+        return re.sub(r"\s*-\s*|\s+", "-", text)
+
+    @staticmethod
+    def clean_cell_lines(value: Any) -> str:
+        """Clean every line of a cell but KEEP the line structure."""
+
+        if value is None:
+            return ""
+
+        text = str(value).replace("\xa0", " ").replace("\r", "\n")
+
+        lines = [" ".join(x.split()) for x in text.split("\n")]
+
+        return "\n".join(x for x in lines if x)
+
+    @classmethod
+    def learn_document_layout(
+        cls,
+        records: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Data-driven repair, run once over ALL records of one file.
+
+        Nothing here knows a class-code format, a room list or a
+        department; everything is learned from the file itself.
+
+        1. Teacher pages: every cell is "<subject> <room>" on line 1,
+           the class on the next line, the group last.  The file's own
+           cells are used to learn rooms / class spellings / group
+           marker (parser.learned_cell_parser.CellVocabulary) and each
+           cell is re-split with that, so a class such as "3-CS-IOT" can
+           never be glued onto the subject, whatever its spelling.
+
+        2. Class / room pages: a page label is a class or a room.  The
+           file's own majority decides (a class-wise file is made of
+           class pages, a room-wise file of room pages), so pages whose
+           label no pattern recognises are no longer left anonymous and
+           labels that a pattern got wrong are corrected.
+        """
+
+        try:
+            records = cls._learn_teacher_cells(records)
+        except Exception:
+            pass
+
+        try:
+            records = cls._learn_page_orientation(records)
+        except Exception:
+            pass
+
+        for r in records:
+            r.pop("_legend", None)
+
+        return records
+
+    @classmethod
+    def _learn_teacher_cells(cls, records):
+        """
+        Learn each page-type's own cell layout and repair the CLASS.
+
+        Faculty pages ("<subject> <room>" / class / group) and room pages
+        ("<subject> <teacher code>" / class / group) both put the class on
+        a line of its own.  The learned vocabulary finds that line whatever
+        its spelling, so it can never be glued onto the subject.
+        """
+
+        from parser.learned_cell_parser import CellVocabulary
+
+        for identity in ("teacher", "room"):
+
+            rows = [
+                r for r in records
+                if r.get("page_identity_type") == identity
+                and r.get("raw_cell")
+            ]
+
+            if not rows:
+                continue
+
+            # one cell per distinct (page, text): merged spans repeat cells
+            cells = list({
+                (r["source_page"], r["raw_cell"]): r["raw_cell"]
+                for r in rows
+            }.values())
+
+            vocabulary = CellVocabulary(cells)
+
+            for r in rows:
+
+                parsed = vocabulary.parse(r["raw_cell"])
+
+                if not parsed or not parsed.get("subject"):
+                    continue
+
+                learned_class = (parsed.get("class") or "").strip()
+
+                if not learned_class:
+                    continue
+
+                # Only class / group are repaired here: rooms keep the same
+                # extraction as the other files so one lesson still matches
+                # itself across faculty / class / room-wise PDFs.
+                r["class_name"] = cls.canonical_class(learned_class)
+
+                legend = r.get("_legend") or {}
+
+                subject = parsed["subject"]
+
+                if identity == "room":
+
+                    # line 1 is "<subject> <faculty code>": the learned
+                    # "room" slot is that code, resolved by the page legend
+                    code = parsed.get("room", "")
+
+                    if code in legend:
+                        if not r.get("teacher"):
+                            r["teacher"] = cls.clean_text(legend[code])
+                    else:
+                        subject = (
+                            (subject + " " + code).strip() if code else subject
+                        )
+
+                if identity == "room":
+
+                    tokens = subject.split()
+
+                    # any code still trailing is resolved by THIS page's
+                    # own legend, never by a fixed abbreviation list
+                    if len(tokens) > 1 and tokens[-1] in legend:
+                        if not r.get("teacher"):
+                            r["teacher"] = cls.clean_text(legend[tokens[-1]])
+                        subject = " ".join(tokens[:-1])
+
+                r["subject"] = subject
+
+                if not r.get("group_name") and parsed.get("group"):
+                    r["group_name"] = parsed["group"]
+
+                r["type"] = cls.detect_type(r["subject"])
+
+        return records
+
+    @classmethod
+    def _learn_page_orientation(cls, records):
+
+        pages = {}
+
+        for r in records:
+            if r.get("page_identity_type") != "teacher":
+                pages.setdefault(
+                    r["source_page"],
+                    (r.get("page_identity_type") or "", r.get("page_label") or "")
+                )
+
+        if not pages:
+            return records
+
+        votes = Counter(
+            kind for kind, _ in pages.values() if kind in ("class", "room")
+        )
+
+        if not votes:
+            return records
+
+        kind, count = votes.most_common(1)[0]
+
+        # only trust a clear majority (mixed files are left alone)
+        if count / sum(votes.values()) < 0.9:
+            return records
+
+        for r in records:
+
+            page = r["source_page"]
+
+            if page not in pages or r.get("page_identity_type") == "teacher":
+                continue
+
+            current, label = pages[page]
+
+            if not label:
+                continue
+
+            # a class page IS its label: never a regex fragment of it
+            if kind == "class" and current == "class":
+                r["class_name"] = cls.canonical_class(label)
+
+                # the page's own class printed inside the cell is not
+                # part of the subject
+                pattern = re.escape(label).replace(r"\ ", r"[\s-]*").replace(r"\-", r"[\s-]*")
+                cleaned = re.sub(
+                    r"\s*\b" + pattern + r"\b\s*$", "",
+                    r.get("subject", ""), flags=re.IGNORECASE
+                ).strip()
+                if cleaned:
+                    r["subject"] = cleaned
+                continue
+
+            if current == kind:
+                continue
+
+            r["page_identity_type"] = kind
+
+            if kind == "class":
+                r["class_name"] = cls.canonical_class(label)
+                r["room"] = r["room"] if current != "room" else ""
+            else:
+                r["room"] = label
+                if current == "class":
+                    r["class_name"] = ""
+
+            scheduled = bool(r.get("raw_text"))
+
+            suffix = "SCHEDULED" if scheduled else "FREE_SLOT"
+
+            r["record_type"] = f"{kind.upper()}_{suffix}"
 
         return records
 
@@ -1770,7 +2045,7 @@ class PDFImporter:
             )
 
             if parallel_records is not None:
-                return parallel_records
+                return cls.learn_document_layout(parallel_records)
 
             for page_number, page in enumerate(
                 pdf.pages,
@@ -1789,7 +2064,7 @@ class PDFImporter:
                     page_records
                 )
 
-        return records
+        return cls.learn_document_layout(records)
 
     @classmethod
     def _import_pages_parallel(

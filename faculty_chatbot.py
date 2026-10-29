@@ -22,6 +22,9 @@ from scheduling.multi_absence_planner import MultiAbsenceCoordinator
 from scheduling.what_if_coordinator import WhatIfCoordinator
 from scheduling.exam_duty_store import ExamDutyStore
 from scheduling.exam_duty_planner import ExamDutyCoordinator
+from scheduling.exam_unavailable_store import ExamUnavailableStore
+from scheduling.exam_duty_requests import ExamDutyRequestHandler
+from engine.branch_resolver import BranchIndex
 from engine import date_resolver
 from query_engine import QueryEngine
 from query_engine.natural_language_query import NaturalLanguageQuery
@@ -318,10 +321,14 @@ class FacultyAIChatbot:
 
         self.exam_duty_store = ExamDutyStore()
 
+        # faculty explicitly marked unavailable for exam duty
+        self.exam_unavailable_store = ExamUnavailableStore()
+
         self.exam_duty_coordinator = ExamDutyCoordinator(
             self.query_engine,
             self.workload_engine,
             store=self.exam_duty_store,
+            unavailable_store=self.exam_unavailable_store,
             faculty_filter=lambda: getattr(
                 getattr(
                     getattr(self, "smart_engine", None),
@@ -358,6 +365,29 @@ class FacultyAIChatbot:
         self.smart_engine = SmartQueryEngine.from_matcher(self.matcher)
 
         print("Smart Query Engine ready.")
+
+        # --------------------------------------------------
+        # EXAM DUTY REQUESTS (plain-English)
+        #
+        # Eligible-faculty lists with departments and reasons, room
+        # allocations (N rooms x M invigilators), exclusions ("exclude
+        # Dr. X"), fairness / no-consecutive-duty preferences, totals.
+        # Anything it does not own returns None and falls through to the
+        # original exam-duty flow below.
+        # --------------------------------------------------
+
+        self._branch_index_cache = None
+
+        self.exam_duty_requests = ExamDutyRequestHandler(
+            coordinator=self.exam_duty_coordinator,
+            model_getter=lambda: self.smart_engine.model,
+            branch_getter=self._branch_index,
+            today_getter=date.today,
+            has_named_teachers=self._has_named_teachers,
+            unavailable_store=self.exam_unavailable_store,
+        )
+
+        print("Exam Duty Requests ready.")
 
         self.nl_query = NaturalLanguageQuery(
             self.query_engine
@@ -1913,6 +1943,25 @@ class FacultyAIChatbot:
 
         return f"{note}\n\n{response}" if note else response
 
+    def _branch_index(self):
+        """Department of every teacher, learned from the timetable itself."""
+
+        if self._branch_index_cache is None:
+            try:
+                self._branch_index_cache = BranchIndex(self.smart_engine.model)
+            except Exception:
+                return None
+
+        return self._branch_index_cache
+
+    def _has_named_teachers(self, text):
+        """True when the text names specific faculty (typos / no title ok)."""
+
+        try:
+            return bool(self.smart_engine.parse(text).teachers)
+        except Exception:
+            return False
+
     def process_query(self, query):
         """
         Answer one chat message.
@@ -1949,6 +1998,18 @@ class FacultyAIChatbot:
                 for word in ("confirm", "yes confirm", "go ahead")
             )
         )
+
+        # plain-English exam-duty requests (eligible list, room allocation,
+        # exclusions, fairness) and the confirm/cancel that follows them
+        try:
+            duty_reply = self.exam_duty_requests.handle(query)
+        except Exception as error:
+            print(f"Exam duty request handler error: {error}")
+            duty_reply = None
+
+        if duty_reply is not None:
+            self._pending_exam_duty_plan = None
+            return duty_reply
 
         if not awaiting_confirmation:
 
@@ -2146,7 +2207,19 @@ class FacultyAIChatbot:
                 "confirmed exam dut",
             )
 
-            if any(word in text for word in show_duty_words):
+            # "...check their timetable and existing exam duties" inside a
+            # request to FIND / ASSIGN people is not a request to list the
+            # saved duties
+            asks_for_people = re.search(
+                r"\b(?:free|available|eligible|assign\w*|allocat\w*|"
+                r"invigilators?|find|who)\b",
+                text,
+            ) and not re.match(
+                r"\s*(?:show|list|display|view)\b", text
+            )
+
+            if any(word in text for word in show_duty_words) \
+                    and not asks_for_people:
 
                 shown_date = self._extract_exam_date(query)
 
