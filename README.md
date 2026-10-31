@@ -226,3 +226,20 @@ python test_typo_robustness.py    # every teacher x ~16 spelling mistakes, class
 python test_exam_duty_requests.py   # propose -> confirm -> saved, named teachers, refusals, dates vs times
 python test_time_questions.py     # thousands of time questions (9 to 11, 8am to 2pm, after 12, morning ...) vs the raw data; add --app to use the web app's data path
 ```
+## 🧾 Exam-duty assignment with a duty-count rule
+
+Upload (alongside the timetable, in the `app.py` sidebar) **one duty sheet** - any file
+name, PDF / Excel / CSV, listing each teacher and the exam duties already done (one total,
+month-wise or day-wise columns, or tick marks). It is recognised by its *content*, not its name.
+Then just ask, changing the date / number / comparison as you like:
+
+```
+Assign 6 faculty for exam duty on 12th November from 10:00 to 12:00 with duties less than 50
+assign duty to 4 faculty on 20 nov 9 am to 12 pm, only those having fewer than 30 duties
+which faculty have at most 12 duties
+show the duty history          clear the duty history
+```
+
+Nothing is fixed in code: the rule's wording lives in `config/duty_lexicon.json`; the limit is
+checked against *sheet + confirmed + this plan*, so nobody is pushed past it. `python test_duty_history.py`
+runs the checks.

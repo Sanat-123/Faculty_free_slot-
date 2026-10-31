@@ -44,6 +44,8 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from engine import date_resolver
+from engine import text_normalizer
+from scheduling import duty_history
 
 # ======================================================================
 # small language helpers
@@ -115,7 +117,20 @@ def _hour24(hour: int, meridiem: Optional[str]) -> Optional[int]:
 def parse_time_range(text: str) -> Optional[Tuple[str, str]]:
     """'from 9:00 AM to 12:00 PM', '9 to 12', '14:00-17:00' -> ('09:00','12:00')."""
 
+    found = parse_time_ranges(text)
+
+    return found[0] if found else None
+
+
+def parse_time_ranges(text: str) -> List[Tuple[str, str]]:
+    """
+    EVERY time range in the text, left to right:
+    'from 9 to 10:30 and 1 to 2:30' -> [('09:00','10:30'), ('13:00','14:30')].
+    """
+
     low = text.lower()
+
+    out: List[Tuple[str, str]] = []
 
     # "12 noon" / "noon" -> 12 pm,  "midnight" -> 12 am
     low = re.sub(r"\b(?:12\s*)?noon\b", "12 pm", low)
@@ -169,7 +184,7 @@ def parse_time_range(text: str) -> Optional[Tuple[str, str]]:
         elif not mer1 and not mer2:
 
             # exams are daytime events: a bare 1-6 means afternoon
-            if 1 <= a <= 6 and not m1 and a < 7:
+            if 1 <= a <= 6:
                 start_h = a + 12
 
             if 1 <= b <= 6 and b < 12:
@@ -185,9 +200,13 @@ def parse_time_range(text: str) -> Optional[Tuple[str, str]]:
         end = end_h * 60 + int(m2 or 0)
 
         if 0 <= start < end <= 24 * 60:
-            return _clock(start), _clock(min(end, 24 * 60 - 1))
 
-    return None
+            pair = (_clock(start), _clock(min(end, 24 * 60 - 1)))
+
+            if pair not in out:
+                out.append(pair)
+
+    return out
 
 
 # ======================================================================
@@ -364,6 +383,8 @@ def parse_counts(text: str) -> Tuple[Optional[int], Optional[int]]:
         rf"(?:have|get|gets|needs?|requires?|with|has)\s+{_NUM}\b",
         rf"\b{_ROOM_WORD}\s+(?:each\s+)?(?:with|needs?|requires?|gets?)\s+{_NUM}\s+{_PEOPLE}",
         rf"\b{_NUM}\s+(?:each|apiece)\b",
+        # "12 rooms x 2", "rooms × 2 faculty"
+        rf"\b{_ROOM_WORD}\s*[x×*]\s*{_NUM}\b",
     ]
 
     for pattern in patterns:
@@ -385,6 +406,20 @@ def parse_counts(text: str) -> Tuple[Optional[int], Optional[int]]:
 
     if m:
         total = _to_int(m.group(1))
+
+    # "assign duty to 3 faculty", "need exam duty for 6 invigilators ..." -
+    # a plain "<n> <people>" that is not a per-room count
+    if total is None and per_room is None:
+
+        m = re.search(
+            rf"(?<!\bno\s)(?<!\bnot\s)(?<!\bany\s)(?<!\bevery\s)(?<!\bthe\s)"
+            rf"\b(\d{{1,3}}|(?:{'|'.join(w for w in sorted(_NUMBER_WORDS, key=len, reverse=True) if w not in ('a', 'an', 'single', 'pair', 'couple'))}))"
+            rf"\s+{_PEOPLE}\b(?!\s+(?:per|for\s+each|in\s+each|to\s+each|each|every))",
+            low,
+        )
+
+        if m:
+            total = _to_int(m.group(1))
 
     return per_room, total
 
@@ -451,6 +486,10 @@ class ParsedRequest:
     excluded: set = field(default_factory=set)            # normalised names
     exclusion_notes: List[str] = field(default_factory=list)
     setup_reused: str = ""
+    limit: Optional[Tuple[str, float]] = None      # ("<", 50): duties so far must be < 50
+    times: List[Tuple[str, str]] = field(default_factory=list)   # every time window
+    distinct_per_day: bool = False                 # nobody on two sessions of one day
+    invalid_dates: List[tuple] = field(default_factory=list)     # "31 Nov"
 
 
 def is_exam_duty_text(text: str) -> bool:
@@ -472,6 +511,24 @@ def is_exam_duty_text(text: str) -> bool:
     )
 
 
+def clean_text(text: str, protected=()) -> str:
+    """
+    Repair typos and odd time notations in a coordinator's message
+    ("1: to 2:30", "faculities", "less then 50") before it is read.
+    `protected` = words never to touch (faculty-name parts).
+    """
+
+    return text_normalizer.normalize(
+        text, duty_history.lexicon().get("spell_vocabulary", []), protected
+    )
+
+
+def understand(text: str, today: date, protected=()) -> ParsedRequest:
+    """clean_text + parse_request: the full reading of one message."""
+
+    return parse_request(clean_text(text, protected), today)
+
+
 def parse_request(text: str, today: date) -> ParsedRequest:
 
     req = ParsedRequest()
@@ -481,6 +538,15 @@ def parse_request(text: str, today: date) -> ParsedRequest:
     low = original.lower()
 
     req.words = len(re.findall(r"\w+", low))
+
+    # ---- duty-count constraint ("fewer than 50 duties"): read first and take
+    #      its text out so the number is not reused as a date / time / count ----
+    found_limit = duty_history.parse_duty_limit(original)
+
+    if found_limit:
+        req.limit, (a, b) = found_limit
+        original = original[:a] + " " * (b - a) + original[b:]
+        low = original.lower()
 
     # ---- dates (and take their text out so digits aren't reused) ----
     hits = date_resolver.find_dates(original, today)
@@ -499,10 +565,20 @@ def parse_request(text: str, today: date) -> ParsedRequest:
     without_dates = "".join(masked)
 
     # ---- times ----
-    times = parse_time_range(without_dates)
+    req.times = parse_time_ranges(without_dates)
 
-    if times:
-        req.start, req.end = times
+    if req.times:
+        req.start, req.end = req.times[0]
+
+    # ---- dates that do not exist ("31 Nov") ----
+    if not req.dates:
+        req.invalid_dates = date_resolver.find_impossible_dates(original, today)
+
+    # ---- "no two teachers on both timings", "different faculty each time" ----
+    for phrase in duty_history.lexicon().get("distinct_per_day_phrases", []):
+        if re.search(phrase, low):
+            req.distinct_per_day = True
+            break
 
     # ---- rooms and counts ----
     rooms, room_count = parse_rooms(without_dates)
@@ -512,6 +588,21 @@ def parse_request(text: str, today: date) -> ParsedRequest:
 
     req.per_room, req.total = parse_counts(without_dates)
 
+    # "5 faculty each" without any rooms is "5 in every session", not "5 per room"
+    if req.per_room is not None and req.total is None and not rooms and not room_count:
+        req.total, req.per_room = req.per_room, None
+
+    # "5 faculty each", "5 per session / slot / shift" with no rooms: that many seats
+    # in every session
+    if req.total is None and req.per_room is None and not rooms:
+        m = re.search(
+            rf"(?<!\bno\s)\b(\d{{1,3}})\s+(?:{'|'.join(map(re.escape, duty_history.lexicon().get('headcount_nouns', ['faculty', 'teachers', 'teacher', 'invigilators', 'invigilator', 'people', 'members', 'staff'])))})?\s*"
+            rf"(?:each|per\s+(?:session|slot|shift|timing|sitting|time)|in\s+each\s+(?:session|slot|shift|timing))\b",
+            without_dates.lower(),
+        )
+        if m:
+            req.total = int(m.group(1))
+
     # ---- intent: whichever instruction verb comes first ----
     first_assign = _ASSIGN.search(low)
     first_ask = _ASK.search(low)
@@ -520,7 +611,15 @@ def parse_request(text: str, today: date) -> ParsedRequest:
         not first_ask or first_assign.start() < first_ask.start()
     )
 
-    if assign_first:
+    # "I have to assign exam duty on 30 Nov ... so find who is free": the verb
+    # "assign" comes first but what is being ASKED for is a list of free people
+    # (an ask-word + availability words, and no head-count to actually assign)
+    asks_for_list = bool(
+        first_ask and _ELIGIBLE.search(low)
+        and not (req.total or req.per_room or req.rooms or req.room_count)
+    )
+
+    if assign_first and not asks_for_list:
         req.intent = "assign"
     elif _ELIGIBLE.search(low):
         req.intent = "eligible"
@@ -531,8 +630,12 @@ def parse_request(text: str, today: date) -> ParsedRequest:
 
     if not req.intent and (
         req.per_room or req.total or req.rooms or req.room_count
+        or (req.limit and req.dates)
     ):
         req.intent = "assign"
+
+    if req.limit and not req.intent:
+        req.intent = "totals"
 
     req.fair_first = bool(_FAIR.search(low))
     req.avoid_consecutive = bool(_CONSECUTIVE.search(low))
@@ -832,8 +935,16 @@ class ExamDutyAllocator:
         fair_first: bool = False,
         avoid_consecutive: bool = True,
         excluded: Optional[set] = None,
+        limit: Optional[Tuple[str, float]] = None,
+        distinct_per_day: bool = False,
     ) -> Dict[str, Any]:
         """
+        distinct_per_day: nobody is placed in two sessions of the same day
+               (not even at different times).
+        limit: (operator, number) on a teacher's TOTAL exam duties (uploaded duty
+               sheet + confirmed + already planned here), e.g. ("<", 50).  It is
+               re-checked seat by seat, so someone on 49 can take one duty and is
+               then at 50 and no longer eligible.
         sessions: [(date, 'HH:MM', 'HH:MM'), ...]
         slots:    room label for every invigilator seat of ONE session,
                   position-major so every room gets one before any gets two.
@@ -883,7 +994,28 @@ class ExamDutyAllocator:
 
             return False
 
-        for day, start, end in sorted(sessions, key=lambda s: (s[0], s[1])):
+        order = sorted(sessions, key=lambda s: (s[0], s[1]))
+
+        # nobody may serve twice in a day: fill the session with the FEWEST free
+        # people first, so someone who could cover either session is not spent
+        # on the roomier one (the results are put back in time order below)
+        if distinct_per_day and len(order) > 1:
+
+            def pool_size(sess):
+                try:
+                    found = self.coordinator.candidates(sess[0].isoformat(), sess[1], sess[2])
+                    return len([
+                        c for c in found.get("results", [])
+                        if _norm(c["teacher"]) not in {_norm(x) for x in (excluded or ())}
+                        and duty_history.passes_limit(
+                            counts.get(_norm(c["teacher"]), 0), limit)
+                    ])
+                except Exception:
+                    return 10 ** 6
+
+            order = sorted(order, key=lambda sess: (pool_size(sess), sess[0], sess[1]))
+
+        for day, start, end in order:
 
             cand = self.coordinator.candidates(day.isoformat(), start, end)
 
@@ -898,6 +1030,14 @@ class ExamDutyAllocator:
                 if _norm(c["teacher"]) not in (excluded or set())
             ]
 
+            # the duty-count constraint: who the rule removes from today's pool
+            limit_removed = [
+                c["teacher"] for c in pool
+                if not duty_history.passes_limit(
+                    counts.get(_norm(c["teacher"]), 0)
+                    + planned_counts[_norm(c["teacher"])], limit)
+            ]
+
             chosen: List[Dict[str, Any]] = []
             shortage: List[str] = []
             used_here = set()
@@ -908,6 +1048,16 @@ class ExamDutyAllocator:
                     c for c in pool
                     if _norm(c["teacher"]) not in used_here
                     and not overlaps_plan(c["teacher"], day, start, end)
+                    and not (
+                        distinct_per_day
+                        and any(
+                            d == day
+                            for d, _, _ in planned_duties[_norm(c["teacher"])]
+                        )
+                    )
+                    and duty_history.passes_limit(
+                        counts.get(_norm(c["teacher"]), 0)
+                        + planned_counts[_norm(c["teacher"])], limit)
                 ]
 
                 if not options:
@@ -958,10 +1108,16 @@ class ExamDutyAllocator:
                 "conflicts": cand.get("conflicts", []),
                 "assignments": chosen,
                 "shortage": shortage,
+                "limit_removed": len(limit_removed),
+                "eligible_after_limit": cand["count"] - len(limit_removed)
+                if limit else cand["count"],
             })
 
         # ---- per-teacher totals and consecutive-duty report ----
         names = {}
+
+        # filled scarcest-first above: show them in time order again
+        out_sessions.sort(key=lambda sess: (sess["exam_date"], sess["start_time"]))
 
         for sess in out_sessions:
             for a in sess["assignments"]:
@@ -1000,6 +1156,8 @@ class ExamDutyAllocator:
             "totals": totals,
             "consecutive": sorted(consecutive),
             "fair_first": fair_first,
+            "limit": list(limit) if limit else None,
+            "distinct_per_day": distinct_per_day,
             "seats_per_session": len(slots),
             "created": datetime.now(timezone.utc).isoformat(),
         }
@@ -1101,6 +1259,11 @@ class ExamDutyRequestHandler:
 
         self.pending: Optional[Dict[str, Any]] = None
 
+        self._history_synced_with = None
+
+        # a request that only lacked "how many": the next short reply finishes it
+        self.awaiting_count: Optional[ParsedRequest] = None
+
     # ---------------- public ------------------------------------------
 
     def handle(self, query: str) -> Optional[str]:
@@ -1109,6 +1272,14 @@ class ExamDutyRequestHandler:
 
         if not text:
             return None
+
+        # typos / odd clock notations repaired first; names are never touched
+        protected = {
+            tok for name in self._faculty_names()
+            for tok in re.findall(r"[a-z]+", str(name).lower())
+        }
+
+        text = clean_text(text, protected)
 
         low = text.lower()
 
@@ -1133,8 +1304,44 @@ class ExamDutyRequestHandler:
                 self.pending = None
                 return "Okay - the proposed exam-duty allocation was discarded."
 
-        if not is_exam_duty_text(text):
+        # ----- the reply to "how many faculty do you need?" -----
+        if self.awaiting_count is not None:
+
+            finished = self._finish_awaiting(text)
+
+            if finished is not None:
+                return finished
+
+        # ----- "clear confirmed exam duties": forget duties confirmed in the chat -----
+        clear_words = "|".join(map(re.escape, duty_history.lexicon()["clear_words"]))
+
+        if re.search(rf"\b(?:{clear_words})\b.{{0,25}}\bconfirmed\b.{{0,15}}\bdut", text.lower()):
+
+            before = len(self.coordinator.store.confirmed_counts())
+            self.coordinator.store.clear()
+            self.pending = None
+
+            return (
+                f"Cleared the exam duties confirmed in the chat ({before} teacher"
+                f"{'s' if before != 1 else ''} affected). Counts now come only from "
+                f"the uploaded duty sheet."
+                if before else "There were no confirmed exam duties to clear."
+            )
+
+        # ----- the uploaded duty sheet: "show / clear the duty history" -----
+        history_reply = self._history_command(text)
+
+        if history_reply is not None:
+            return history_reply
+
+        if (
+            not is_exam_duty_text(text)
+            and not self._duty_sheet_request(text)
+            and not self._multi_window_free_request(text)
+        ):
             return None
+
+        self._sync_history()
 
         # ----- "mark Dr X unavailable", "who is unavailable", "clear ..." -----
         availability_reply = self._availability_command(text)
@@ -1165,6 +1372,10 @@ class ExamDutyRequestHandler:
         req.excluded = excluded
         req.exclusion_notes = notes
 
+        # a date that does not exist: say so instead of asking for "the date"
+        if req.invalid_dates and not req.dates:
+            return self._invalid_date_reply(req)
+
         if not req.intent:
             return None
 
@@ -1186,11 +1397,18 @@ class ExamDutyRequestHandler:
                 r"\b(?:show|list|existing|confirmed)\s+exam\s+dut", low
             )
 
-            if not req.rich and legacy_ok:
-                return None
+            # the original one-line list is kept only for a plain single-slot
+            # question; anything with several slots / dates, a rule, or an
+            # uploaded duty sheet gets the full tables
+            sheet = self._baseline()
+            sheet_loaded = bool(sheet is not None and sheet.exists())
 
-            if len(req.dates) > 1:
-                return self._multi_date_eligible_hint()
+            if (
+                not req.rich and legacy_ok and not req.limit
+                and len(req.times) <= 1 and len(req.dates) <= 1
+                and not sheet_loaded
+            ):
+                return None
 
             return self._eligible(req)
 
@@ -1199,6 +1417,9 @@ class ExamDutyRequestHandler:
             # the original "how many exam duties ..." report is kept for
             # plain questions; this richer table is for ones asking for
             # departments / branches
+            if req.limit:
+                return self._limit_report(req)
+
             if not re.search(r"\bdepartments?\b|\bdepts?\b|\bbranch(?:es)?\b", low):
                 return None
 
@@ -1212,7 +1433,10 @@ class ExamDutyRequestHandler:
             multi = bool(
                 req.rooms or req.room_count or req.per_room
                 or len(req.dates) > 1
+                or len(req.times) > 1
+                or req.distinct_per_day
                 or req.excluded
+                or req.limit
                 or (self.last_setup and req.dates and req.start
                     and not req.total)
             )
@@ -1421,95 +1645,513 @@ class ExamDutyRequestHandler:
             f"To {what} I still need " + " and ".join(missing) + "."
         )
 
+    # ---------------- the uploaded duty sheet --------------------------
+
+    def _baseline(self):
+        return getattr(self.coordinator.store, "baseline", None)
+
+    def _sync_history(self) -> None:
+        """Match the sheet's names to the timetable's spelling (once per timetable)."""
+
+        base = self._baseline()
+
+        if base is None or not base.exists():
+            return
+
+        faculty = self._faculty_names()
+
+        if self._history_synced_with == len(faculty):
+            return
+
+        base.reconcile(faculty, learn_titles(faculty))
+        self._history_synced_with = len(faculty)
+
+    def _history_notes(self) -> List[str]:
+        """Where the counts came from, and what could not be matched."""
+
+        base = self._baseline()
+
+        if base is None or not base.exists():
+            return []
+
+        info = base.info()
+        counts = base.counts()
+        faculty = self._faculty_names()
+
+        listed = {_norm(n) for n in counts}
+        absent = [t for t in faculty if _norm(t) not in listed]
+
+        notes = [
+            f"*Duty counts: from “{info.get('source') or 'the uploaded duty sheet'}” "
+            f"({info.get('people', len(counts))} names; {info.get('mode') or 'auto-detected'}).*"
+        ]
+
+        if info.get("unmatched"):
+            names = info["unmatched"]
+            notes.append(
+                f"*{len(names)} name(s) in the sheet are not in the timetable and "
+                f"cannot be assigned: {', '.join(names[:6])}{'…' if len(names) > 6 else ''}.*"
+            )
+
+        if info.get("ambiguous"):
+            names = info["ambiguous"]
+            notes.append(
+                f"*{len(names)} name(s) in the sheet match more than one timetable "
+                f"teacher and were left unmatched: {', '.join(names[:6])}.*"
+            )
+
+        if absent:
+            notes.append(
+                f"*{len(absent)} timetable faculty are not in the duty sheet and "
+                f"were counted as 0 duties.*"
+            )
+
+        return ["", *notes]
+
+    def _session_windows(self, req: ParsedRequest):
+        windows = req.times or [(req.start, req.end)]
+        return [(d, s, e) for d in req.dates for (s, e) in windows]
+
+    def _ask_headcount(self, req: ParsedRequest) -> str:
+        """
+        Everything but "how many" is known: remember the request so a short
+        reply ("6", "6 per session") finishes it, and tell the coordinator how
+        many faculty each session can actually draw on under their rule.
+        """
+
+        self.awaiting_count = req
+
+        self._sync_history()
+
+        counts = self.allocator.stored_counts()
+
+        lines = []
+        known = []
+
+        for day, start, end in self._session_windows(req):
+
+            try:
+                cand = self.coordinator.candidates(day.isoformat(), start, end)
+            except Exception:
+                continue
+
+            pool = [
+                c for c in cand["results"]
+                if duty_history.passes_limit(
+                    counts.get(_norm(c["teacher"]), 0), req.limit)
+            ]
+
+            known.append(
+                f"- {self._pretty_day(day)}, {start}–{end}: "
+                f"**{len(pool)}** faculty are free"
+                + (f" and satisfy “exam duties {duty_history.limit_text(*req.limit)}”"
+                   if req.limit else "")
+            )
+
+        lines.append(
+            "I have the "
+            + ("date, " if req.dates else "")
+            + ("time" + ("s" if len(req.times) > 1 else "") + ", " if req.start else "")
+            + ("the duty-count rule" if req.limit else "the schedule")
+            + (" and the rule that nobody is on duty at both timings"
+               if req.distinct_per_day else "")
+            + "."
+        )
+
+        if known:
+            lines += ["", *known]
+
+        lines += [
+            "",
+            "**How many faculty do you need per session?** For example *6 per "
+            "session*, or *2 invigilators per room for rooms A101–A105*. "
+            "Just reply with the number — I’ll keep the rest.",
+        ]
+
+        return "\n".join(lines)
+
+    def _finish_awaiting(self, text: str) -> Optional[str]:
+        """A short reply to _ask_headcount: '6', '6 per session', 'rooms A1-A3 2 each'."""
+
+        pending = self.awaiting_count
+        low = text.lower().strip()
+
+        if re.search(r"\b(cancel|never\s*mind|forget it|stop)\b", low):
+            self.awaiting_count = None
+            return "Okay, I dropped that request."
+
+        # A complete NEW request (its own date / time / long sentence) is never
+        # "the answer": drop the old question and let this one be read on its own.
+        fresh = parse_request(text, self.today_getter())
+
+        if fresh.dates or fresh.times or fresh.limit or len(low.split()) > 14:
+            self.awaiting_count = None
+            return None
+
+        per_room, total = parse_counts(low)
+        rooms, room_count = parse_rooms(text)
+
+        if total is None and per_room is None and not rooms and not room_count:
+            m = re.fullmatch(
+                r"\W*(\d{1,3})\s*(?:faculty|teachers?|invigilators?|per\s+session|each|"
+                r"in\s+total|total|people|members)?\W*", low)
+            if m:
+                total = int(m.group(1))
+
+        if total is None and per_room is None and not rooms and not room_count:
+            self.awaiting_count = None       # not an answer: the user moved on
+            return None
+
+        if total is not None:
+            pending.total = total
+        if per_room is not None:
+            pending.per_room = per_room
+        if rooms or room_count:
+            pending.rooms, pending.room_count = rooms, room_count or len(rooms)
+
+        self.awaiting_count = None
+
+        return self._allocate(pending)
+
+    def _invalid_date_reply(self, req: ParsedRequest) -> str:
+
+        import calendar
+
+        text, day, month, year, last = req.invalid_dates[0]
+
+        name = calendar.month_name[month]
+        nxt_month = month % 12 + 1
+        nxt_year = year + (1 if month == 12 else 0)
+
+        return (
+            f"**{text.strip()}** is not a real date — {name} {year} has only "
+            f"{last} days.\n\n"
+            f"Did you mean **{last} {name} {year}** or "
+            f"**{day - last} {calendar.month_name[nxt_month]} {nxt_year}**? "
+            f"Send the request again with the correct date and I’ll build the "
+            f"allocation."
+        )
+
+    def _multi_window_free_request(self, text: str) -> bool:
+        """
+        "who is free on 30 Nov 9 to 10:30 and 1 to 2:30": the plain free-slot
+        engine reads ONE time range and would silently drop the other, so a
+        question about several windows is answered here, window by window.
+        """
+
+        req = parse_request(text, self.today_getter())
+
+        return bool(
+            req.intent == "eligible" and req.dates and len(req.times) >= 2
+        )
+
+    def _duty_sheet_request(self, text: str) -> bool:
+        """
+        With a duty sheet loaded, "assign duty on 12 november ... fewer than 50
+        duties" is an exam-duty request even without the word "exam".
+        """
+
+        base = self._baseline()
+
+        if base is None or not base.exists():
+            return False
+
+        low = text.lower()
+
+        return bool(
+            re.search(r"\bdut(?:y|ies)\b|\binvigilat", low)
+            and (duty_history.parse_duty_limit(text) or _ASSIGN.search(low))
+        )
+
+    def _history_command(self, text: str) -> Optional[str]:
+        """"clear the duty history" / "show the duty sheet"."""
+
+        base = self._baseline()
+
+        if base is None:
+            return None
+
+        lex = duty_history.lexicon()
+        low = text.lower()
+
+        if not any(w in low for w in lex["history_words"]):
+            return None
+
+        if any(re.search(rf"\b{re.escape(w)}\b", low) for w in lex["clear_words"]):
+            return (
+                "Removed the uploaded duty sheet — counts now come only from "
+                "duties confirmed in this chat."
+                if base.clear() else "No duty sheet is loaded."
+            )
+
+        if not base.exists():
+            return (
+                "No duty sheet is loaded. Upload one (a PDF / Excel / CSV with "
+                "teacher names and their exam-duty counts) in the sidebar."
+            )
+
+        self._sync_history()
+
+        counts = self.allocator.stored_counts()
+        info = base.info()
+
+        rows = sorted(base.counts().items(), key=lambda kv: (kv[1], kv[0].lower()))
+
+        lines = [
+            f"**Duty sheet loaded** — {info.get('people')} teachers, read as "
+            f"{info.get('mode') or 'auto-detected'}.",
+            "",
+            "| Faculty | Duties in sheet | Total now |",
+            "| --- | --- | --- |",
+        ]
+
+        for name, n in rows:
+            lines.append(f"| {name} | {int(n)} | {counts.get(_norm(name), int(n))} |")
+
+        return "\n".join(lines + self._history_notes())
+
+    def _limit_report(self, req: ParsedRequest) -> str:
+        """Who satisfies a duty-count constraint (no date needed)."""
+
+        self._sync_history()
+
+        counts = self.allocator.stored_counts()
+
+        everyone = self._faculty_names()
+
+        rows = sorted(
+            ((counts.get(_norm(t), 0), t) for t in everyone
+             if duty_history.passes_limit(counts.get(_norm(t), 0), req.limit)),
+            key=lambda r: (r[0], r[1].lower()),
+        )
+
+        lines = [
+            f"**Faculty with exam duties {duty_history.limit_text(*req.limit)}** "
+            f"· {len(rows)} of {len(everyone)}",
+            "",
+        ]
+
+        if rows:
+            lines += ["| # | Faculty | Department | Duties so far |", "| --- | --- | --- | --- |"]
+            for n, (c, t) in enumerate(rows, 1):
+                lines.append(f"| {n} | {t} | {self._department(t)} | {int(c)} |")
+        else:
+            lines.append("Nobody satisfies that condition.")
+
+        lines += self._history_notes()
+
+        lines += ["", "*To assign them, add the date, time and how many are needed, "
+                      "e.g. “assign 6 faculty on <date> from <time> to <time> …”.*"]
+
+        return "\n".join(lines)
+
     # ---------------- 1) who is eligible ------------------------------
 
     def _eligible(self, req: ParsedRequest) -> str:
+        """
+        Who is free for exam duty - for ONE or SEVERAL sessions (any number of
+        dates x time windows).  One clean table per session, then who can cover
+        every session and who only fits some.
+        """
 
         ask = self._need_details(req, "list eligible faculty")
 
         if ask:
             return ask
 
-        day = req.dates[0]
+        self._sync_history()
 
-        cand = self.coordinator.candidates(day.isoformat(), req.start, req.end)
+        counts = self.allocator.stored_counts()
+        store = self.coordinator.store
+        has_sheet = bool(getattr(store, "baseline", None) and store.baseline.exists())
 
-        if not cand.get("success"):
-            return f"I couldn't check availability ({cand.get('reason')})."
+        sessions = self._session_windows(req)
 
-        if req.excluded:
-            cand = dict(cand)
-            cand["results"] = [
+        per_session = []          # [(label, {norm: row}, cand, dropped)]
+
+        for day, start, end in sessions:
+
+            cand = self.coordinator.candidates(day.isoformat(), start, end)
+
+            if not cand.get("success"):
+                return f"I couldn't check availability ({cand.get('reason')})."
+
+            results = [
                 c for c in cand["results"]
                 if _norm(c["teacher"]) not in req.excluded
             ]
-            cand["count"] = len(cand["results"])
 
-        rows = []
+            dropped = 0
 
-        counts = self.allocator.stored_counts()
+            if req.limit:
+                kept = [
+                    c for c in results
+                    if duty_history.passes_limit(
+                        counts.get(_norm(c["teacher"]), 0), req.limit)
+                ]
+                dropped = len(results) - len(kept)
+                results = kept
 
-        for item in cand["results"]:
+            rows = {}
 
-            teacher = item["teacher"]
+            for item in results:
 
-            slots, class_text = self._classes_that_day(
-                teacher, cand["day"], req.start, req.end
+                teacher = item["teacher"]
+                slots, _ = self._classes_that_day(teacher, cand["day"], start, end)
+                total = counts.get(_norm(teacher), 0)
+
+                rows[_norm(teacher)] = {
+                    "teacher": teacher,
+                    "dept": self._department(teacher),
+                    "classes": len(slots),
+                    "why": (
+                        f"free {cand['availability_start']}–{cand['availability_end']}; "
+                        + (f"{len(slots)} class{'es' if len(slots) != 1 else ''} that day"
+                           if slots else "no classes that day")
+                    ),
+                    "total": total,
+                    "split": store.duty_breakdown(teacher) if has_sheet else None,
+                }
+
+            per_session.append((
+                f"{self._pretty_day(day)}, {start}–{end}", rows, cand, dropped
+            ))
+
+        def ordered(rows):
+            return sorted(
+                rows.values(),
+                key=lambda r: (r["total"], r["classes"], r["teacher"].lower()),
             )
 
-            duties = counts.get(_norm(teacher), 0)
+        many = len(per_session) > 1
 
-            reason = (
-                f"free {cand['availability_start']}–{cand['availability_end']}"
-                f"; {class_text}"
-                f"; {duties} exam dut{'y' if duties == 1 else 'ies'} so far"
-                f"{', none overlapping' if duties else ''}"
+        if many:
+            title = f"**Faculty eligible for exam duty** · {len(per_session)} sessions"
+        else:
+            title = (
+                f"**Faculty eligible for exam duty — {per_session[0][0]}** · "
+                f"{len(per_session[0][1])} found"
             )
 
-            rows.append((duties, item.get("daily_periods", 0), teacher,
-                         self._department(teacher), reason))
+        lines = [title, ""]
 
-        rows.sort(key=lambda r: (r[0], r[1], r[2].lower()))
+        first_cand = per_session[0][2]
 
-        title = (
-            f"**Faculty eligible for exam duty — {self._pretty_day(day)}, "
-            f"{req.start}–{req.end}** · {len(rows)} found"
-        )
-
-        lines = [
-            title,
-            "",
-            f"*Rule: a teacher is eligible only if free for the whole duty "
-            f"window plus a {cand['buffer_minutes']}-minute buffer on both "
-            f"sides ({cand['availability_start']}–{cand['availability_end']}), "
-            f"has no overlapping confirmed exam duty, and is listed in the "
-            f"faculty timetable. Fewest exam duties first.*",
+        lines += [
+            f"*A teacher is listed only if free for the whole duty window plus a "
+            f"{first_cand['buffer_minutes']}-minute buffer on both sides, with no "
+            f"overlapping confirmed exam duty. Fewest exam duties first.*",
             "",
         ]
 
-        if rows:
-
+        if req.limit:
             lines += [
-                "| # | Faculty | Department | Why eligible |",
-                "| --- | --- | --- | --- |",
+                f"*Duty-count rule applied: exam duties so far "
+                f"{duty_history.limit_text(*req.limit)}.*",
+                "",
             ]
 
-            for number, (_, _, teacher, dept, reason) in enumerate(rows, 1):
-                lines.append(f"| {number} | {teacher} | {dept} | {reason} |")
+        any_unknown_dept = False
 
-        else:
-            lines.append("Nobody is eligible for that window.")
+        for label, rows, cand, dropped in per_session:
 
-        if any(r[3] == "—" for r in rows):
+            lines += [f"### {label} — {len(rows)} free", ""]
+
+            if not rows:
+                lines += ["Nobody is eligible for this window.", ""]
+                continue
+
+            if has_sheet:
+                lines += [
+                    "| # | Faculty | Department | Why eligible | On duty sheet | Confirmed since upload | Total duties |",
+                    "| --- | --- | --- | --- | --- | --- | --- |",
+                ]
+            else:
+                lines += [
+                    "| # | Faculty | Department | Why eligible | Exam duties |",
+                    "| --- | --- | --- | --- | --- |",
+                ]
+
+            for n, r in enumerate(ordered(rows), 1):
+
+                any_unknown_dept |= r["dept"] == "—"
+
+                if has_sheet:
+                    lines.append(
+                        f"| {n} | {r['teacher']} | {r['dept']} | {r['why']} | "
+                        f"{r['split'][0]} | {r['split'][1]} | **{r['total']}** |"
+                    )
+                else:
+                    lines.append(
+                        f"| {n} | {r['teacher']} | {r['dept']} | {r['why']} | "
+                        f"**{r['total']}** |"
+                    )
+
+            if req.limit and dropped:
+                lines += ["", f"*{dropped} otherwise-free faculty were left out by the duty-count rule.*"]
+
+            lines.append("")
+
+        # ---- who covers every session / only some ----
+        if many:
+
+            common = set(per_session[0][1])
+            for _, rows, _, _ in per_session[1:]:
+                common &= set(rows)
+
+            everyone = {}
+            for _, rows, _, _ in per_session:
+                everyone.update(rows)
+
+            lines += ["### Across all sessions", ""]
+
+            lines.append(
+                f"- Free in **every** session ({len(common)}): "
+                + (", ".join(everyone[k]["teacher"] for k in sorted(common, key=lambda k: (everyone[k]["total"], k)))
+                   if common else "nobody")
+            )
+
+            for label, rows, _, _ in per_session:
+                only = [k for k in rows if any(k not in other for _, other, _, _ in per_session)]
+                lines.append(f"- Free for **{label}** but not every session: {len(only)}")
+
             lines += [
                 "",
-                "*“—” = department unknown (the teacher has no classes in "
-                "the timetable to read a branch from).*",
+                "*To give each person only one of these sessions, ask e.g. “assign "
+                "6 faculty per session, nobody in both”.*",
+                "",
             ]
 
-        lines += ["", self._exclusion_summary(cand, req)]
+        if any_unknown_dept:
+            lines += [
+                "*“—” = department unknown (the teacher has no classes in the "
+                "timetable to read a branch from).*",
+                "",
+            ]
 
         lines += self._exclusion_lines(req)
+
+        lines += self._history_notes()
+
+        saved = store.confirmed_summary()
+
+        if has_sheet:
+
+            lines += [
+                "",
+                "*Total duties = duties on the uploaded sheet + duties confirmed in "
+                "chat after the sheet was uploaded"
+                + (f" ({sum(x[3] for x in saved)} so far)." if saved else " (none so far).")
+                + " Duties saved before the sheet was uploaded are not added to it.*",
+            ]
+
+        elif saved:
+
+            lines += [
+                "",
+                f"*Exam duties counted: {sum(x[3] for x in saved)} saved in "
+                f"`{store.path}`. Say “clear confirmed exam duties” to remove them.*",
+            ]
 
         return "\n".join(lines)
 
@@ -1634,6 +2276,47 @@ class ExamDutyRequestHandler:
 
     def _allocate(self, req: ParsedRequest) -> str:
 
+        # ---- a date and/or a duty-count rule given, the rest missing ----
+        if (req.dates or req.limit) and (not req.dates or not req.start):
+
+            self._sync_history()
+
+            have, need = [], []
+
+            if req.dates:
+                have.append(f"the date **{self._pretty_day(req.dates[0])}**")
+            else:
+                need.append("the exam **date(s)**, e.g. *12th November*")
+
+            if req.limit:
+                counts = self.allocator.stored_counts()
+                ok = sum(
+                    1 for t in self._faculty_names()
+                    if duty_history.passes_limit(counts.get(_norm(t), 0), req.limit)
+                )
+                have.append(
+                    f"the rule **exam duties so far "
+                    f"{duty_history.limit_text(*req.limit)}** "
+                    f"({ok} faculty satisfy it right now)"
+                )
+
+            if not req.start:
+                need.append("the **time**, e.g. *9:00 AM to 12:00 PM*")
+
+            if not (req.per_room or req.total or req.rooms or req.room_count):
+                need.append(
+                    "**how many** faculty are needed (e.g. *6 faculty*, or "
+                    "*5 rooms A101–A105 with 2 invigilators each*)"
+                )
+
+            lines = [
+                "I have " + " and ".join(have) + "." if have else "",
+                "To build the proposal I still need:",
+                "",
+            ] + [f"- {item}" for item in need]
+
+            return "\n".join(x for x in lines if x is not None)
+
         # ---- no schedule given: explain what is needed ----
         if not req.dates or not req.start:
 
@@ -1714,13 +2397,11 @@ class ExamDutyRequestHandler:
 
         else:
 
-            return (
-                "How many invigilators do you need? For example *2 "
-                "invigilators per room for rooms A101–A105*, or *10 "
-                "invigilators in total*."
-            )
+            return self._ask_headcount(req)
 
-        sessions = [(d, req.start, req.end) for d in req.dates]
+        windows = req.times or [(req.start, req.end)]
+
+        sessions = [(d, s, e) for d in req.dates for (s, e) in windows]
 
         plan = self.allocator.plan(
             sessions,
@@ -1728,6 +2409,8 @@ class ExamDutyRequestHandler:
             fair_first=req.fair_first,
             avoid_consecutive=True,
             excluded=req.excluded,
+            limit=req.limit,
+            distinct_per_day=req.distinct_per_day,
         )
 
         if not plan.get("success"):
@@ -1756,9 +2439,20 @@ class ExamDutyRequestHandler:
         assigned = sum(len(s["assignments"]) for s in plan["sessions"])
 
         if not assigned:
+
+            why = ""
+
+            if req.limit:
+                gone = sum(x.get("limit_removed", 0) for x in plan["sessions"])
+                why = (
+                    f" The rule “exam duties so far "
+                    f"{duty_history.limit_text(*req.limit)}” alone removed "
+                    f"{gone} otherwise-free faculty - try a different number."
+                )
+
             return (
                 "Nobody is eligible for that time, so no duties could be "
-                "allocated. Try another time or date."
+                "allocated. Try another time or date." + why
             )
 
         self.pending = plan
@@ -1773,25 +2467,62 @@ class ExamDutyRequestHandler:
 
         multi = len(sessions) > 1
 
-        head_dates = ", ".join(
+        head_dates = ", ".join(dict.fromkeys(
             date_resolver.pretty(date.fromisoformat(s["exam_date"]))
             for s in sessions
-        )
+        ))
+
+        windows = list(dict.fromkeys(
+            f"{s['start_time']}–{s['end_time']}" for s in sessions
+        ))
+
+        if len(windows) == 1:
+            free_text = (
+                f"Everyone listed is free from {sessions[0]['availability_start']} "
+                f"to {sessions[0]['availability_end']} "
+                f"({sessions[0]['buffer_minutes']}-minute buffer before and after "
+                f"the duty)"
+            )
+        else:
+            free_text = (
+                f"Everyone listed is free for their whole session "
+                f"({sessions[0]['buffer_minutes']}-minute buffer before and after "
+                f"each duty)"
+            )
 
         lines = [
             f"**Proposed exam-duty allocation — {head_dates}, "
-            f"{sessions[0]['start_time']}–{sessions[0]['end_time']}**",
+            f"{' and '.join(windows)}**",
             "",
-            f"*Everyone listed is free from {sessions[0]['availability_start']} "
-            f"to {sessions[0]['availability_end']} "
-            f"({sessions[0]['buffer_minutes']}-minute buffer before and after "
-            f"the duty), is not in two rooms at once, and has no clashing "
+            f"*{free_text}, is not in two rooms at once, and has no clashing "
             f"confirmed exam duty."
             + (" Faculty with fewer exam duties were preferred."
                if plan["fair_first"] else "")
             + "*",
             "",
         ]
+
+        if plan.get("limit"):
+
+            op, value = plan["limit"]
+            removed = max(s.get("limit_removed", 0) for s in sessions)
+            kept = min(s.get("eligible_after_limit", 0) for s in sessions)
+
+            lines += [
+                f"**Duty-count rule:** only faculty with total exam duties "
+                f"**{duty_history.limit_text(op, value)}** were considered "
+                f"(uploaded duty sheet + confirmed duties + this plan). "
+                f"It removed {removed} otherwise-free faculty and left "
+                f"{kept} eligible.",
+                "",
+            ]
+
+        if plan.get("distinct_per_day") and len(windows) > 1:
+            lines += [
+                "**Each faculty member appears in only one session per day** "
+                "(nobody is on duty at both timings).",
+                "",
+            ]
 
         rooms = plan.get("rooms") or []
 
@@ -1807,7 +2538,11 @@ class ExamDutyRequestHandler:
             day = date.fromisoformat(sess["exam_date"])
 
             if multi:
-                lines += [f"**{self._pretty_day(day)}**", ""]
+                lines += [
+                    f"**{self._pretty_day(day)}, "
+                    f"{sess['start_time']}–{sess['end_time']}**",
+                    "",
+                ]
 
             if rooms:
 

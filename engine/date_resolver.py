@@ -789,3 +789,53 @@ def first_iso(text, today=None) -> Optional[str]:
     hits = find_dates(text, today)
 
     return hits[0].dates[0].isoformat() if hits else None
+
+def find_impossible_dates(text, today=None):
+    """
+    Dates that were written but do not exist ("31 Nov", "30 February 2026").
+
+    find_dates() silently skips them, so a request containing one would look as
+    if it had no date at all.  Returns [(written_text, day, month, year, last_day)].
+    """
+
+    import calendar
+
+    today = _as_date(today)
+    low = str(text or "").lower()
+
+    found = []
+
+    patterns = (
+        # 31 nov [2026] / 31st of november
+        rf"(?<![\d/.-])(\d{{1,2}})(?:\s{{0,2}}(?:st|nd|rd|th))?\s*(?:of\s+)?({_MONTH_RE})\b\.?(?:\s*,?\s*(\d{{4}}))?",
+        # nov 31 [2026]
+        rf"\b({_MONTH_RE})\b\.?\s*(\d{{1,2}})(?:\s{{0,2}}(?:st|nd|rd|th))?(?!\d)(?:\s*,?\s*(\d{{4}}))?",
+    )
+
+    for i, pattern in enumerate(patterns):
+
+        for m in re.finditer(pattern, low):
+
+            if i == 0:
+                day, month_word, year = m.group(1), m.group(2), m.group(3)
+            else:
+                month_word, day, year = m.group(1), m.group(2), m.group(3)
+
+            month = _MONTHS.get(month_word)
+            day = int(day)
+
+            if not month or day < 1:
+                continue
+
+            yr = int(year) if year else today.year
+
+            last = calendar.monthrange(yr, month)[1]
+
+            if day > last:
+                found.append((original_slice(text, m), day, month, yr, last))
+
+    return found
+
+
+def original_slice(text, match):
+    return str(text)[match.start():match.end()].strip()

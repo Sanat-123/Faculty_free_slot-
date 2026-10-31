@@ -58,3 +58,4 @@ speedup.patch
 # one-time installer scripts and backups
 apply_*.py
 *.bak_*
+data/exam_duties*.json

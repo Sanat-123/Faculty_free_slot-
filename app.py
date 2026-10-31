@@ -248,6 +248,9 @@ with st.sidebar:
 - Shift the lab in room \\<room\\> to another room on \\<day\\>
 - Suggest 2 faculty for exam duty on \\<date\\> from
   \\<time\\> to \\<time\\>
+- Upload a duty sheet (names + exam duties done), then: Assign 6
+  faculty for exam duty on \\<date\\> from \\<time\\> to \\<time\\>
+  with fewer than \\<N\\> duties
 
 Any of these that produce a proposal will ask you to reply
 "confirm" before anything is actually saved.
@@ -439,6 +442,76 @@ def import_single_file(uploaded_file):
                 pass
 
 
+
+# ============================================================
+# EXAM-DUTY SHEET (any file name)
+#
+# A file with teacher names + how many exam duties each has
+# already done is NOT a timetable. It is recognised by its
+# CONTENT (never by its name) and saved as the baseline that
+# the exam-duty planner adds to the duties confirmed in the
+# chat - see scheduling/duty_history.py.
+# ============================================================
+
+def import_duty_history(uploaded_file):
+    """Return a file report dict if `uploaded_file` is a duty sheet, else None."""
+
+    from scheduling import duty_history
+    from scheduling.exam_duty_store import ExamDutyStore
+
+    suffix = Path(uploaded_file.name).suffix.lower()
+
+    if suffix not in (".pdf", ".xlsx", ".xls", ".csv"):
+        return None
+
+    temp_dir = tempfile.mkdtemp()
+
+    try:
+
+        path = str(Path(temp_dir) / uploaded_file.name)
+
+        with open(path, "wb") as handle:
+            handle.write(uploaded_file.getbuffer())
+
+        if not duty_history.looks_like_duty_history(path):
+            return None
+
+        parsed = duty_history.parse_duty_history(path)
+
+        if not parsed:
+            return None
+
+        fingerprint = hashlib.sha1(bytes(uploaded_file.getbuffer())).hexdigest()
+
+        store = ExamDutyStore()
+
+        # the same file again (the app rebuilds on every upload change) must not
+        # reset the moment the sheet was loaded - duties confirmed since then count
+        if store.baseline.info().get("file_sha1") != fingerprint:
+            store.baseline.save(
+                parsed["counts"],
+                source=uploaded_file.name,
+                mode=parsed["mode"],
+                file_sha1=fingerprint,
+            )
+
+        return {
+            "name": uploaded_file.name,
+            "file_type": "EXAM_DUTY_HISTORY",
+            "status": "success",
+            "success": True,
+            "record_count": len(parsed["counts"]),
+            "message": f"exam-duty counts for {len(parsed['counts'])} teachers "
+                       f"({parsed['mode']})",
+        }
+
+    except Exception:
+        return None
+
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 # ============================================================
 # COMBINE MULTIPLE UPLOADED FILES INTO ONE DATASET
 # ============================================================
@@ -463,6 +536,12 @@ def build_combined_dataset(uploaded_files):
     file_reports = []
 
     for uploaded_file in uploaded_files:
+
+        duty_report = import_duty_history(uploaded_file)
+
+        if duty_report is not None:
+            file_reports.append(duty_report)
+            continue
 
         file_result = import_single_file(
             uploaded_file

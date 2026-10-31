@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 from utils.file_discovery import state_file
+from scheduling.duty_history import DutyBaselineStore
 from typing import Any
 
 
@@ -40,6 +42,12 @@ class ExamDutyStore:
     ):
         # no path given -> <FACULTY_STATE_DIR or data>/exam_duties.json
         self.path = Path(path) if path else state_file("exam_duties.json")
+
+        # duties done BEFORE this chat, read from an uploaded duty sheet
+        # (scheduling/duty_history.py); lives beside the confirmed duties
+        self.baseline = DutyBaselineStore(
+            self.path.with_name(self.path.stem + "_baseline.json")
+        )
 
     # ============================================================
     # INTERNAL HELPERS
@@ -355,10 +363,107 @@ class ExamDutyStore:
 
         teacher_key = self._key(teacher)
 
-        return sum(
+        before = sum(
+            n for name, n in self.baseline.counts().items()
+            if self._key(name) == teacher_key
+        )
+
+        return before + sum(
             1
-            for duty in self._read()
+            for duty in self._counted()
             if self._key(duty.get("teacher")) == teacher_key
+        )
+
+    def _counted(self) -> list[dict[str, Any]]:
+        """
+        The saved duties that count towards a teacher's total.
+
+        With no duty sheet uploaded: all of them.  Once a duty sheet is uploaded
+        it IS the up-to-date record, so duties saved BEFORE that upload (old
+        sessions, earlier testing) are not added on top of it - only duties
+        confirmed after the upload are.  Nothing is deleted.
+        """
+
+        duties = self._read()
+
+        since = self.baseline.info().get("loaded_at") if self.baseline.exists() else None
+
+        if not since:
+            return duties
+
+        try:
+            cutoff = datetime.fromisoformat(since)
+        except ValueError:
+            return duties
+
+        kept = []
+
+        for duty in duties:
+
+            try:
+                when = datetime.fromisoformat(str(duty.get("confirmed_at", "")))
+            except ValueError:
+                continue                      # no timestamp: older than the sheet
+
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=cutoff.tzinfo)
+
+            if when >= cutoff:
+                kept.append(duty)
+
+        return kept
+
+    def confirmed_counts(self) -> dict[str, int]:
+        """{teacher_key: duties confirmed in the chat} - the uploaded sheet is NOT included."""
+
+        counts: dict[str, int] = {}
+
+        for duty in self._counted():
+
+            teacher = str(duty.get("teacher", "")).strip()
+
+            if teacher:
+                key = self._key(teacher)
+                counts[key] = counts.get(key, 0) + 1
+
+        return counts
+
+    def sheet_counts(self) -> dict[str, float]:
+        """{teacher_key: duties on the uploaded duty sheet}."""
+
+        out: dict[str, float] = {}
+
+        for name, n in self.baseline.counts().items():
+            key = self._key(name)
+            out[key] = out.get(key, 0) + n
+
+        return out
+
+    def confirmed_summary(self) -> list[tuple[str, str, str, int]]:
+        """[(exam_date, start, end, number_of_duties)] of every saved confirmed duty."""
+
+        groups: dict[tuple[str, str, str], int] = {}
+
+        for duty in self._counted():
+
+            key = (
+                str(duty.get("exam_date", "")),
+                str(duty.get("start_time", "")),
+                str(duty.get("end_time", "")),
+            )
+
+            groups[key] = groups.get(key, 0) + 1
+
+        return [(*k, n) for k, n in sorted(groups.items())]
+
+    def duty_breakdown(self, teacher: str) -> tuple[int, int]:
+        """(duties on the uploaded sheet, duties confirmed in the chat)."""
+
+        key = self._key(teacher)
+
+        return (
+            int(self.sheet_counts().get(key, 0)),
+            int(self.confirmed_counts().get(key, 0)),
         )
 
     def duty_counts(self) -> dict[str, int]:
@@ -373,7 +478,7 @@ class ExamDutyStore:
         counts: dict[str, int] = {}
         display_names: dict[str, str] = {}
 
-        for duty in self._read():
+        for duty in self._counted():
 
             teacher = str(duty.get("teacher", "")).strip()
 
@@ -384,6 +489,14 @@ class ExamDutyStore:
 
             display_names.setdefault(key, teacher)
             counts[key] = counts.get(key, 0) + 1
+
+        # duties from the uploaded duty sheet count too
+        for name, before in self.baseline.counts().items():
+
+            key = self._key(name)
+
+            display_names.setdefault(key, str(name).strip())
+            counts[key] = counts.get(key, 0) + before
 
         return {
             display_names[key]: count
