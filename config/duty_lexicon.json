@@ -230,6 +230,9 @@
     "august",
     "availability",
     "available",
+    "belong",
+    "belonging",
+    "belongs",
     "between",
     "both",
     "busy",
@@ -252,6 +255,7 @@
     "every",
     "exam",
     "examination",
+    "examinations",
     "examiner",
     "examiners",
     "exams",
@@ -300,6 +304,9 @@
     "rooms",
     "saturday",
     "schedule",
+    "semester",
+    "semesters",
+    "semister",
     "september",
     "session",
     "sessions",
@@ -327,5 +334,46 @@
     "venues",
     "wednesday",
     "yesterday"
+  ],
+  "ordinal_words": {
+    "first": 1,
+    "second": 2,
+    "third": 3,
+    "fourth": 4,
+    "fifth": 5,
+    "sixth": 6,
+    "seventh": 7,
+    "eighth": 8,
+    "ninth": 9,
+    "tenth": 10,
+    "1st": 1,
+    "2nd": 2,
+    "3rd": 3,
+    "4th": 4,
+    "5th": 5,
+    "6th": 6,
+    "7th": 7,
+    "8th": 8,
+    "9th": 9,
+    "10th": 10
+  },
+  "semester_patterns": [
+    "\\b(\\d{1,2})\\s*(?:st|nd|rd|th)?\\s*[-.]?\\s*sem(?:ester|ister)?s?\\b",
+    "\\bsem(?:ester|ister)?s?\\s*[-:#.]?\\s*(\\d{1,2}|[ivx]{1,4})\\b",
+    "\\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\\s+sem(?:ester|ister)?s?\\b",
+    "\\b([ivx]{1,4})\\s*(?:st|nd|rd|th)?\\s*[-.]?\\s*sem(?:ester|ister)?s?\\b"
+  ],
+  "class_semester_patterns": [
+    "^\\s*(\\d{1,2})(?!\\d)",
+    "sem(?:ester)?[-\\s:_.]*(\\d{1,2})(?!\\d)",
+    "^[A-Za-z]+[-\\s_.]?(\\d{1,2})(?!\\d)"
+  ],
+  "semester_only_phrases": [
+    "belong\\w*",
+    "\\bteach(?:es|ing)?\\b",
+    "\\btaught\\b",
+    "{SEM}\\s+(?:faculty|faculties|teachers?|staff|professors?|members?|invigilators?)",
+    "(?:faculty|faculties|teachers?|staff|professors?|members?)\\s+(?:of|from|in)\\s+(?:the\\s+)?{SEM}",
+    "{SEM}\\s+only"
   ]
 }

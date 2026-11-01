@@ -34,6 +34,9 @@ def fix_clock_slips(text: str) -> str:
     # "a.m." / "p.m." -> am / pm
     t = re.sub(r"\b([ap])\.\s?m\b\.?", lambda m: m.group(1).lower() + "m", t, flags=re.I)
 
+    # "2 nd november", "5 th sem" -> "2nd", "5th"
+    t = re.sub(r"(?<![\d:.])(\d{1,2})\s+(st|nd|rd|th)\b", r"\1\2", t, flags=re.I)
+
     # "1: to 2:30", "9 : to" - a colon with no minutes
     t = re.sub(r"(?<![\d:])(\d{1,2})\s*:(?!\s*\d)", r"\1", t)
 

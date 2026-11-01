@@ -39,6 +39,11 @@ C=[
 ("30 nov 9 to 12 i need 24 faculities", dict(total=24)),
 ("30 nov 9 to 12 12 rooms two teachrs each", dict(room_count=12, per_room=2)),
 ("30 nov 9 to 12 faculty for 8 halls, 3 per hall", dict(room_count=8, per_room=3)),
+("30 nov 9 to 12 allot the teachers in then two teacher in 1 room", dict(per_room=2, room_count=None, total=None)),
+("30 nov 9 to 12 2 faculty in one room", dict(per_room=2, room_count=None, total=None)),
+("30 nov 9 to 12 3 invigilators in a room", dict(per_room=3, room_count=None, total=None)),
+("30 nov 9 to 12 2 teachers in each room", dict(per_room=2, room_count=None)),
+("30 nov 9 to 12 6 faculty for 3 rooms", dict(total=6, room_count=3)),
 # --- limits
 ("assign on 30 nov 9 to 12 6 faculty having duties less then 50", dict(limit=("<",50.0))),
 ("assign on 30 nov 9 to 12 6 faculty with 50 or fewer duties", dict(limit=("<=",50.0))),

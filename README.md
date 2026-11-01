@@ -243,3 +243,19 @@ show the duty history          clear the duty history
 Nothing is fixed in code: the rule's wording lives in `config/duty_lexicon.json`; the limit is
 checked against *sheet + confirmed + this plan*, so nobody is pushed past it. `python test_duty_history.py`
 runs the checks.
+
+## 🎓 Semester exams ("5th sem has exams on 2 November…")
+
+While a semester sits its exam its normal classes do not run, so its teachers and classrooms are free.
+Ask in plain language, e.g.:
+
+```
+5th sem is having exams on 2nd november 9 to 10:30 and 1 to 2:30, allot faculty with fewer than 50 duties
+who teach the 5th sem only
+```
+
+The bot finds the semester's classes from the class names in your timetable (`5CSA`, `3CS-AI-B`, `Sem-5 CSE` …),
+treats those classes as suspended in the exam window, frees their teachers, suggests their classrooms as exam
+halls, and (when you say "belonging to / teaching the 5th sem") considers only that semester's teachers.
+You can also name classes directly (`exam of 5CSA …`). Wording patterns live in `config/duty_lexicon.json`.
+`python test_semester_exam.py` runs the checks.

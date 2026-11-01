@@ -235,8 +235,13 @@ class ExamDutyCoordinator:
         exam_date,
         start_time,
         end_time,
+        extra_free: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         """
+        extra_free: {teacher: remaining periods that day} of teachers to treat as
+        free although the regular timetable shows them busy - e.g. because their
+        class is suspended for an exam (scheduling/semester_exam.py).
+
         Return exam-duty candidates for a specific calendar date
         and clock time range, combining:
 
@@ -292,6 +297,22 @@ class ExamDutyCoordinator:
             available_from,
             available_to,
         )
+
+        if extra_free:
+
+            listed = list(base_result.get("results", []))
+            known = {self._text(c.get("teacher")) for c in listed}
+
+            for name, periods in extra_free.items():
+                if name not in known:
+                    listed.append({
+                        "teacher": name,
+                        "daily_periods": periods,
+                        "priority": "HIGH" if periods <= 2 else "MEDIUM",
+                    })
+
+            base_result = dict(base_result)
+            base_result["results"] = listed
 
         duty_counts = self.store.duty_counts()
 
