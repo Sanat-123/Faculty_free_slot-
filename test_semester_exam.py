@@ -133,6 +133,7 @@ Q2 = (f"here is exam of {ORD} semester on {DATE} {WIN} assign exam duty and also
       f"for {ORD} sem assign teachers whose assigned duties are less then 50 and no teacher must have duties "
       f"in both the slot find number of rooms available for exam for {ORD} sem and allot the teachers in "
       f"then two teacher in 1 room")
+bot.exam_duty_store.clear()          # halls confirmed earlier in this test must not be double-booked
 r = ask(Q2)
 check("one-shot request builds both sessions", r.count("| Normally used by |") == 2, r[:200])
 blocks2 = [b.split("**Exam duties per assigned faculty")[0] for b in re.split(r"\n\*\*\w+day, ", r)[1:]]

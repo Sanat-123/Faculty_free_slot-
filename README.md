@@ -259,3 +259,17 @@ treats those classes as suspended in the exam window, frees their teachers, sugg
 halls, and (when you say "belonging to / teaching the 5th sem") considers only that semester's teachers.
 You can also name classes directly (`exam of 5CSA …`). Wording patterns live in `config/duty_lexicon.json`.
 `python test_semester_exam.py` runs the checks.
+
+## 🏫 Students, room size, reserves and absences
+
+```
+exam of 5th sem on 5th november 9 to 10:30 and 1 to 2:30, i have 500 students and only 30 can sit in a room,
+two teachers in 1 room, duties less than 80, nobody in both slots, 2 teachers may be absent so keep replacements
+Dr. Name is absent, please replace          (works before or after "confirm")
+```
+
+* **Rooms:** 500 ÷ 30 = 17 rooms. A semester's own freed classrooms come first, then other rooms with no class at that time
+  (classrooms before labs); rooms already confirmed for another exam are never offered again; a shortage is reported.
+* **Reserves:** stand-by teachers per session, chosen by the same rules; they are not counted as duties until used.
+* **Absence:** the duty goes to the next stand-by teacher (or the next best free one) and the absent teacher is marked unavailable.
+* Wording lives in `config/duty_lexicon.json`. Checks: `python test_exam_extras.py`.v

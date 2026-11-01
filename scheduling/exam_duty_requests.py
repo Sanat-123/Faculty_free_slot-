@@ -498,6 +498,12 @@ class ParsedRequest:
     times: List[Tuple[str, str]] = field(default_factory=list)   # every time window
     distinct_per_day: bool = False                 # nobody on two sessions of one day
     invalid_dates: List[tuple] = field(default_factory=list)     # "31 Nov"
+    students: Optional[int] = None     # "500 students"
+    capacity: Optional[int] = None     # "only 30 students can sit in a room"
+    rooms_needed: Optional[int] = None  # ceil(students / capacity)
+    reserves: Optional[int] = None     # "2 replacement teachers", "2 may be absent"
+    reserve_pct: Optional[int] = None  # "10% extra"
+    reserve_flag: bool = False         # "replacement must also be there" (no number)
     scope: Any = None            # semester_exam.ExamScope: "5th sem has the exam"
     scope_problem: str = ""      # a semester was named but has no classes
     ask_unit: str = ""           # "per_room" when the bot asked "how many per room?"
@@ -518,6 +524,15 @@ def is_exam_duty_text(text: str) -> bool:
                 re.search(rf"\b{_PEOPLE}\b", low)
                 and re.search(rf"\b{_ROOM_WORD}\b", low)
             )
+            # "exam on 2 nov, 500 students, 30 per room": a student count and a
+            # room size say what is wanted, even without the word "duty"
+            or (
+                re.search(rf"\b{_ROOM_WORD}\b", low)
+                and any(
+                    re.search(p_, low, re.I)
+                    for p_ in duty_history.lexicon().get("students_patterns", [])
+                )
+            )
             # "5th sem exam on 2 nov, need 6 faculty" / "which teachers are free
             # for the exam ..." - no word "duty", but plainly a duty request
             or (
@@ -529,6 +544,33 @@ def is_exam_duty_text(text: str) -> bool:
             )
         )
     )
+
+
+def _to_count(token: str) -> int:
+    return int(str(token).replace(",", ""))
+
+
+def _find_numbered(patterns, text: str, accept=None):
+    """First pattern hit whose number is not the tail of a longer number: (value, (a, b), matched_text)."""
+
+    for pattern in patterns:
+
+        for m in re.finditer(pattern, text, re.I):
+
+            a = m.start(1)
+
+            if a > 0 and (text[a - 1].isdigit() or text[a - 1] in ",."):
+                continue
+
+            if accept and not accept(m):
+                continue
+
+            try:
+                return _to_count(m.group(1)), (m.start(), m.end()), m.group(0)
+            except ValueError:
+                continue
+
+    return None
 
 
 def clean_text(text: str, protected=()) -> str:
@@ -558,6 +600,70 @@ def parse_request(text: str, today: date) -> ParsedRequest:
     low = original.lower()
 
     req.words = len(re.findall(r"\w+", low))
+
+    lex = duty_history.lexicon()
+
+    def mask(span):
+        nonlocal original, low
+        original = original[:span[0]] + " " * (span[1] - span[0]) + original[span[1]:]
+        low = original.lower()
+
+    # ---- stand-by / replacement teachers ("2 may be absent, replacement must be there") ----
+    found = _find_numbered(lex.get("reserve_patterns", []), original)
+
+    if found:
+        value, span, matched = found
+        if "%" in matched:
+            req.reserve_pct = value
+        else:
+            req.reserves = value
+        mask(span)
+
+    if req.reserves is None and req.reserve_pct is None and re.search(
+        r"\b(?:" + "|".join(map(re.escape, lex.get("reserve_default_trigger_words", ["reserve", "reserves", "replacement", "replacements", "standby", "stand-by", "backup", "back-up", "substitute", "substitutes"]))) + r")\b",
+        low,
+    ):
+        req.reserve_flag = True
+
+    # ---- room capacity ("only 30 students can sit in a class") then student count ----
+    def has_students(text_):
+        return any(
+            re.search(p_, text_, re.I) for p_ in lex.get("students_patterns", [])
+        )
+
+    explicit_words = r"student|candidate|seat|bench|desk|capacity|\bsit\b|fit|hold|accommodat|size|strength"
+
+    explicit, bare = [], []
+
+    for pattern in lex.get("capacity_patterns", []):
+
+        for m in re.finditer(pattern, original, re.I):
+
+            a_ = m.start(1)
+
+            if a_ > 0 and (original[a_ - 1].isdigit() or original[a_ - 1] in ",."):
+                continue
+
+            hit = (_to_count(m.group(1)), (m.start(), m.end()))
+
+            if re.search(explicit_words, m.group(0).lower()):
+                explicit.append(hit)
+            elif has_students(low) and not re.search(rf"\b{_PEOPLE}\b", m.group(0).lower()):
+                bare.append(hit)           # "30 per room" - only when students were mentioned
+
+    # a clearly worded capacity wins; a bare "N per room" is read as capacity only when
+    # nothing clearer exists (the reply states the reading, so it can be corrected)
+    pick = min(explicit, key=lambda h: h[1][0]) if explicit else (max(bare, key=lambda h: h[0]) if bare else None)
+
+    if pick:
+        req.capacity = pick[0]
+        mask(pick[1])
+
+    found = _find_numbered(lex.get("students_patterns", []), original)
+
+    if found:
+        req.students, span, _ = found
+        mask(span)
 
     # ---- duty-count constraint ("fewer than 50 duties"): read first and take
     #      its text out so the number is not reused as a date / time / count ----
@@ -607,6 +713,11 @@ def parse_request(text: str, today: date) -> ParsedRequest:
     req.room_count = room_count
 
     req.per_room, req.total = parse_counts(without_dates)
+
+    if req.students and req.capacity:
+        req.rooms_needed = -(-req.students // req.capacity)
+        if not req.rooms and req.room_count in (None, 1):
+            req.room_count = req.rooms_needed
 
     # "two teachers in 1 room": "1 room" is the unit (per room), not "only one room"
     if req.per_room and re.search(
@@ -972,8 +1083,16 @@ class ExamDutyAllocator:
         distinct_per_day: bool = False,
         candidate_fn: Optional[Callable[..., Dict[str, Any]]] = None,
         slots_for: Optional[Callable[..., List[str]]] = None,
+        room_meta_for: Optional[Callable[..., Dict[str, Any]]] = None,
+        reserves: Optional[int] = None,
+        reserve_pct: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
+        reserves / reserve_pct: stand-by teachers per session ("2 replacements",
+               "10% extra") - eligible exactly like the main ones, but NOT counted as
+               duties unless they are called in to replace someone absent.
+        room_meta_for(day, start, end) -> {"notes": {room: text}, "missing": n,
+               "needed": n}: what the table says about each exam hall.
         candidate_fn: replaces coordinator.candidates (e.g. to add teachers freed by
                a suspended semester); slots_for(day, start, end) -> the room label
                of every seat of THAT session, when sessions need different rooms.
@@ -1034,6 +1153,8 @@ class ExamDutyAllocator:
 
         fetch = candidate_fn or self.coordinator.candidates
 
+        pools: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
+
         order = sorted(sessions, key=lambda s: (s[0], s[1]))
 
         # nobody may serve twice in a day: fill the session with the FEWEST free
@@ -1088,6 +1209,8 @@ class ExamDutyAllocator:
                     counts.get(_norm(c["teacher"]), 0)
                     + planned_counts[_norm(c["teacher"])], limit)
             ]
+
+            pools[(day.isoformat(), start, end)] = list(pool)
 
             chosen: List[Dict[str, Any]] = []
             shortage: List[str] = []
@@ -1162,6 +1285,7 @@ class ExamDutyAllocator:
                 "assignments": chosen,
                 "shortage": shortage,
                 "scope": cand.get("scope"),
+                "room_meta": room_meta_for(day, start, end) if room_meta_for else None,
                 "rooms": list(dict.fromkeys(r for r in seats if r)),
                 "free_count": len(pool),
                 "distinct_blocked": len(distinct_blocked),
@@ -1170,11 +1294,75 @@ class ExamDutyAllocator:
                 if limit else cand["count"],
             })
 
-        # ---- per-teacher totals and consecutive-duty report ----
-        names = {}
-
         # filled scarcest-first above: show them in time order again
         out_sessions.sort(key=lambda sess: (sess["exam_date"], sess["start_time"]))
+
+        # ---- stand-by teachers for anyone who turns out to be absent ----
+        reserved_on: Dict[Any, set] = defaultdict(set)
+
+        for sess in out_sessions:
+
+            sess["reserves"] = []
+
+            seats_here = len(sess["assignments"]) + len(sess["shortage"])
+
+            if reserves is not None:
+                want_reserve = reserves
+            elif reserve_pct:
+                want_reserve = -(-seats_here * reserve_pct // 100)
+            else:
+                want_reserve = 0
+
+            if want_reserve <= 0:
+                continue
+
+            day = date.fromisoformat(sess["exam_date"])
+            key = (sess["exam_date"], sess["start_time"], sess["end_time"])
+            placed_here = {_norm(a["teacher"]) for a in sess["assignments"]}
+
+            def reserve_ok(c):
+
+                n = _norm(c["teacher"])
+
+                if n in placed_here or n in reserved_on[day]:
+                    return False
+
+                if not duty_history.passes_limit(
+                    counts.get(n, 0) + planned_counts[n], limit
+                ):
+                    return False
+
+                if overlaps_plan(c["teacher"], day, sess["start_time"], sess["end_time"]):
+                    return False
+
+                if distinct_per_day and any(d == day for d, _, _ in planned_duties[n]):
+                    return False
+
+                return True
+
+            options = sorted(
+                (c for c in pools.get(key, []) if reserve_ok(c)),
+                key=lambda c: (
+                    counts.get(_norm(c["teacher"]), 0) + planned_counts[_norm(c["teacher"])],
+                    c.get("daily_periods", 0),
+                    c["teacher"].lower(),
+                ),
+            )
+
+            for c in options[:want_reserve]:
+
+                n = _norm(c["teacher"])
+                reserved_on[day].add(n)
+
+                sess["reserves"].append({
+                    "teacher": c["teacher"],
+                    "stored_before": counts.get(n, 0) + planned_counts[n],
+                })
+
+            sess["reserves_wanted"] = want_reserve
+
+        # ---- per-teacher totals and consecutive-duty report ----
+        names = {}
 
         for sess in out_sessions:
             for a in sess["assignments"]:
@@ -1392,6 +1580,12 @@ class ExamDutyRequestHandler:
                 f"the uploaded duty sheet."
                 if before else "There were no confirmed exam duties to clear."
             )
+
+        # ----- "Dr. X is absent": replace from the stand-by list -----
+        replaced = self._replacement_command(text)
+
+        if replaced is not None:
+            return replaced
 
         # ----- the uploaded duty sheet: "show / clear the duty history" -----
         history_reply = self._history_command(text)
@@ -1938,6 +2132,22 @@ class ExamDutyRequestHandler:
             self.awaiting_count = None       # not an answer: the user moved on
             return None
 
+        # the bot asked "how many students per room?"
+        if pending.ask_unit == "capacity":
+
+            m = re.search(r"(\d{1,3})", low)
+
+            if not m:
+                return None
+
+            pending.capacity = int(m.group(1))
+            pending.rooms_needed = -(-pending.students // pending.capacity)
+            pending.room_count = pending.rooms_needed
+            pending.ask_unit = ""
+            self.awaiting_count = None
+
+            return self._allocate(pending)
+
         # the bot asked "how many per room?": a bare number is the per-room count
         if pending.ask_unit == "per_room" and total is not None and per_room is None and not room_count:
             per_room, total = total, None
@@ -1973,6 +2183,273 @@ class ExamDutyRequestHandler:
         )
 
     # ---------------- semester exams ----------------------------------
+
+    # ---------------- absence and replacement -------------------------
+
+    def _named_faculty(self, text: str) -> List[str]:
+        """Faculty named in a sentence ("Dr. Mamta Sakpal and Kirti are absent")."""
+
+        faculty = self._faculty_names()
+        titles = learn_titles(faculty)
+        lex = duty_history.lexicon()
+
+        skip = {w.lower() for w in lex.get("filler_words", [])} | {
+            w.lower() for w in lex.get("spell_vocabulary", [])
+        }
+
+        tokens = re.findall(r"[A-Za-z][A-Za-z.\-']*", text)
+
+        found: List[str] = []
+        used: set = set()
+
+        for size in (4, 3, 2, 1):
+            for i in range(len(tokens) - size + 1):
+
+                if any(j in used for j in range(i, i + size)):
+                    continue
+
+                chunk = tokens[i:i + size]
+
+                words = [w.strip(".").lower() for w in chunk]
+
+                if size == 1 and (len(words[0]) < 4 or words[0] in skip):
+                    continue
+
+                if all(w in skip for w in words):
+                    continue
+
+                hits = resolve_faculty_phrase(" ".join(chunk), faculty, titles)
+
+                if len(hits) == 1:
+                    found.append(hits[0])
+                    used.update(range(i, i + size))
+
+        return list(dict.fromkeys(found))
+
+    def _replacement_command(self, text: str) -> Optional[str]:
+        """
+        "Dr. X is absent" / "Dr. X cannot come, replace her": give X's duty to the next
+        stand-by teacher of the same session.  Works on the proposal that is waiting
+        for confirmation, or on duties already confirmed (the stand-by list is saved
+        with them).  Returns None when the sentence is about something else.
+        """
+
+        lex = duty_history.lexicon()
+        low = text.lower()
+
+        if not any(re.search(rf"(?<![a-z]){re.escape(w)}(?![a-z])", low) for w in lex.get("absence_words", [])):
+            return None
+
+        # a request that builds a plan ("2 teachers may be absent, keep reserves") is not this
+        if _ASSIGN.search(low) and not re.search(r"\breplace\w*\b", low):
+            return None
+
+        names = self._named_faculty(text)
+
+        if not names:
+            return None
+
+        store = self.coordinator.store
+        today = self.today_getter()
+
+        hits = date_resolver.find_dates(text, today)
+        wanted_dates = {d.isoformat() for h in hits for d in h.dates}
+
+        # --- where do these people have duties? ---
+        jobs = []           # {"name","date","start","end","hall","plan_session"|"duty_id"}
+
+        plan = self.pending
+
+        for name in names:
+
+            n = _norm(name)
+
+            if plan:
+                for sess in plan["sessions"]:
+                    if wanted_dates and sess["exam_date"] not in wanted_dates:
+                        continue
+                    for a in sess["assignments"]:
+                        if _norm(a["teacher"]) == n:
+                            jobs.append({"name": name, "date": sess["exam_date"], "start": sess["start_time"],
+                                         "end": sess["end_time"], "hall": a["hall"], "sess": sess, "a": a})
+
+            if not jobs or not any(j["name"] == name for j in jobs):
+
+                for duty in store._counted():
+
+                    if _norm(duty.get("teacher", "")) != n:
+                        continue
+                    if wanted_dates and duty.get("exam_date") not in wanted_dates:
+                        continue
+                    if not wanted_dates and str(duty.get("exam_date", "")) < today.isoformat():
+                        continue
+
+                    jobs.append({"name": name, "date": duty["exam_date"], "start": duty["start_time"],
+                                 "end": duty["end_time"], "hall": duty.get("hall", ""), "duty": duty})
+
+        if not jobs:
+            return None                      # no duty to replace: the ordinary "unavailable" flow handles it
+
+        dates = sorted({j["date"] for j in jobs})
+
+        if len(dates) > 1 and not wanted_dates:
+            return (
+                f"{', '.join(dict.fromkeys(j['name'] for j in jobs))} "
+                f"{'has' if len({j['name'] for j in jobs}) == 1 else 'have'} duties on several dates "
+                f"({', '.join(dates)}). On which date should I replace them?"
+            )
+
+        absent_norm = {_norm(j["name"]) for j in jobs}
+
+        rows = []
+        missing = []
+
+        for job in jobs:
+
+            key = (job["date"], job["start"], job["end"])
+
+            # who is already on duty in this session
+            if "sess" in job:
+                busy = {_norm(a["teacher"]) for a in job["sess"]["assignments"]}
+                standby = [r["teacher"] for r in job["sess"].get("reserves", [])]
+            else:
+                busy = {
+                    _norm(d.get("teacher", "")) for d in store._counted()
+                    if (d.get("exam_date"), d.get("start_time"), d.get("end_time")) == key
+                }
+                standby = store.reserves.standby(*key)
+
+            choice = next(
+                (t for t in standby if _norm(t) not in busy and _norm(t) not in absent_norm),
+                None,
+            )
+
+            from_reserve = choice is not None
+
+            if choice is None:
+                choice = self._fresh_replacement(job, busy | absent_norm, plan)
+
+            if choice is None:
+                missing.append(job)
+                continue
+
+            # ---- apply ----
+            if "sess" in job:
+
+                job["a"]["teacher"] = choice
+                job["sess"]["reserves"] = [r for r in job["sess"].get("reserves", []) if _norm(r["teacher"]) != _norm(choice)]
+
+            else:
+
+                store.replace_teacher(job["duty"]["duty_id"], choice, "absent")
+                store.reserves.mark_used(*key, choice, job["name"])
+
+            when = job["date"]
+
+            try:
+                self.unavailable_store.add(job["name"], when, "absent")
+            except Exception:
+                pass
+
+            rows.append((job, choice, from_reserve))
+
+        counts = self.allocator.stored_counts()
+
+        lines = ["**Replacement arranged**" if rows else "**No replacement could be arranged**", ""]
+
+        if rows:
+
+            lines += [
+                "| Date & time | Room | Absent | Replacement | Replacement's duties now |",
+                "| --- | --- | --- | --- | --- |",
+            ]
+
+            for job, choice, from_reserve in rows:
+
+                total = counts.get(_norm(choice), 0) + (1 if "sess" in job else 0)
+
+                lines.append(
+                    f"| {job['date']} {job['start']}–{job['end']} | {job['hall'] or '—'} | {job['name']} | "
+                    f"{choice} ({'from the stand-by list' if from_reserve else 'newly found'}) | {total} |"
+                )
+
+        for job in missing:
+            lines += [
+                "",
+                f"⚠ No eligible teacher is left to replace **{job['name']}** on {job['date']} "
+                f"{job['start']}–{job['end']} (the stand-by list is used up and nobody else is free "
+                f"under the same rules).",
+            ]
+
+        if rows and "sess" in rows[0][0]:
+            lines += ["", "*This is still a proposal — reply **confirm** to save it, or **cancel**.*"]
+
+        left = []
+
+        for date_, start_, end_ in sorted({(j["date"], j["start"], j["end"]) for j, _, _ in rows}):
+
+            sess_ = next((j["sess"] for j, _, _ in rows if "sess" in j and (j["date"], j["start"], j["end"]) == (date_, start_, end_)), None)
+
+            names_left = [r["teacher"] for r in sess_.get("reserves", [])] if sess_ else store.reserves.standby(date_, start_, end_)
+
+            left.append(f"{date_} {start_}–{end_}: " + (", ".join(names_left) if names_left else "none left"))
+
+        if left:
+            lines += ["", "**Stand-by teachers still available** — " + "; ".join(left)]
+
+        return "\n".join(lines)
+
+    def _fresh_replacement(self, job, blocked: set, plan) -> Optional[str]:
+        """Best free teacher for a session when the stand-by list is empty."""
+
+        fetch = getattr(self, "_pending_fetch", None) if "sess" in job else None
+        fetch = fetch or self.coordinator.candidates
+
+        try:
+            cand = fetch(job["date"], job["start"], job["end"])
+        except Exception:
+            return None
+
+        if not cand.get("success"):
+            return None
+
+        counts = self.allocator.stored_counts()
+
+        limit = tuple(plan["limit"]) if plan and plan.get("limit") else None
+
+        options = [
+            c for c in cand["results"]
+            if _norm(c["teacher"]) not in blocked
+            and duty_history.passes_limit(counts.get(_norm(c["teacher"]), 0), limit)
+        ]
+
+        if not options:
+            return None
+
+        return min(options, key=lambda c: (counts.get(_norm(c["teacher"]), 0), c["teacher"].lower()))["teacher"]
+
+    def _booked_halls(self, day, start: str, end: str) -> set:
+        """Halls already used by a confirmed exam that overlaps this window."""
+
+        def mins(v):
+            h, m = str(v).split(":")
+            return int(h) * 60 + int(m)
+
+        out = set()
+
+        try:
+            rows = self.coordinator.store.for_date(day.isoformat())
+        except Exception:
+            return out
+
+        for r in rows:
+            try:
+                if min(mins(end), mins(r["end_time"])) - max(mins(start), mins(r["start_time"])) > 0 and r.get("hall"):
+                    out.add(str(r["hall"]))
+            except (KeyError, ValueError):
+                continue
+
+        return out
 
     def _read_scope(self, text: str, req: ParsedRequest) -> None:
         """Attach the semester / classes the request is about (if any)."""
@@ -2605,78 +3082,92 @@ class ExamDutyRequestHandler:
             h, m = str(hhmm).split(":")
             return int(h) * 60 + int(m)
 
-        # ---- a semester exam with no rooms named: its own (now empty) classrooms ----
-        if req.scope and not req.rooms and req.total and req.room_count and not req.per_room:
+        # ---- students but no room size: ask how many fit in one room ----
+        if req.students and not req.capacity and not req.rooms and not req.room_count:
 
-            model = self.model_getter()
-            want, total_seats = req.room_count, req.total
+            req.ask_unit = "capacity"
+            self.awaiting_count = req
 
-            def slots_for(day, start, end):
+            return (
+                f"For **{req.students} students** I need to know the room size: "
+                f"**how many students can sit in one room?** (for example *30 per room*)."
+            )
 
-                free = semester_exam.exam_rooms(
-                    model, req.scope, day.strftime("%A").lower(), _mins(start), _mins(end)
-                )
+        # ---- rooms found by the bot: a semester's own (now empty) classrooms and/or
+        #      other rooms that nobody uses in the window ----
+        needed = req.rooms_needed or req.room_count
 
-                names = list(free[:want])
-                names += [f"Room {k}" for k in range(len(names) + 1, want + 1)]
+        rooms_from_scope = False
 
-                return [names[i % len(names)] for i in range(total_seats)]
+        if not req.rooms and (req.scope or req.rooms_needed) and (needed or req.per_room or req.total):
 
-            first = slots_for(req.dates[0], windows[0][0], windows[0][1])
-            req.rooms = list(dict.fromkeys(first))
-            req.per_room = None
-            rooms_from_scope = True
-
-        elif req.scope and not req.rooms and not req.total and (req.per_room or req.room_count):
-
-            if not req.per_room:
+            if not req.per_room and not req.total:
 
                 req.ask_unit = "per_room"
                 self.awaiting_count = req
 
                 return (
-                    f"I have {req.room_count} rooms for the {req.scope.label} exam. "
-                    f"How many invigilators should each room get (for example "
-                    f"*2 invigilators per room*)?"
+                    f"I will use {needed} room(s)"
+                    + (f" ({req.students} students ÷ {req.capacity} per room)" if req.students and req.capacity else "")
+                    + ". How many invigilators should each room get "
+                    f"(for example *2 invigilators per room*)?"
                 )
 
             model = self.model_getter()
-            want = req.room_count
             per_each = req.per_room
+            total_seats = req.total
+            cache: Dict[Tuple[Any, str, str], Tuple[List[str], Dict[str, str], int]] = {}
+
+            def _resolved(day, start, end):
+
+                key = (day, start, end)
+
+                if key not in cache:
+                    cache[key] = semester_exam.rooms_for_exam(
+                        model, req.scope, day.strftime("%A").lower(),
+                        _mins(start), _mins(end), needed,
+                        booked=self._booked_halls(day, start, end),
+                    )
+
+                return cache[key]
 
             def slots_for(day, start, end):
 
-                free = semester_exam.exam_rooms(
-                    model, req.scope, day.strftime("%A").lower(), _mins(start), _mins(end)
-                )
+                names, _, _ = _resolved(day, start, end)
 
-                names = list(free[:want] if want else free)
+                if per_each:
+                    return [r for _ in range(per_each) for r in names]
 
-                if want and len(names) < want:
-                    names += [f"Room {k}" for k in range(len(names) + 1, want + 1)]
+                if not names:
+                    return [""] * (total_seats or 0)
 
-                return [r for _ in range(per_each) for r in names]
+                return [names[i % len(names)] for i in range(total_seats)]
+
+            def room_meta_for(day, start, end):
+
+                names, notes, missing = _resolved(day, start, end)
+
+                return {"notes": notes, "missing": missing, "needed": needed or len(names), "rooms": len(names)}
 
             first = slots_for(req.dates[0], windows[0][0], windows[0][1])
 
             if not first:
                 return (
-                    f"None of {req.scope.label}'s classes has a room in the timetable "
-                    f"at that time, so I can't suggest exam rooms. Give a number of "
-                    f"rooms (*10 rooms*), room names, or a total (*20 invigilators*)."
+                    "I couldn't find any free room for the exam at that time "
+                    "(every room has a class or is booked for another exam). Give room "
+                    "names, or a total number of invigilators (*20 invigilators*)."
                 )
 
             req.rooms = list(dict.fromkeys(first))
-            req.per_room = per_each
             rooms_from_scope = True
 
         else:
-            rooms_from_scope = False
+            room_meta_for = None
 
         # ---- how many seats per session ----
         rooms = list(req.rooms)
 
-        if rooms and req.room_count and len(rooms) < req.room_count:
+        if rooms and req.room_count and len(rooms) < req.room_count and not rooms_from_scope:
 
             return (
                 f"You mentioned {req.room_count} rooms but I could only read "
@@ -2732,6 +3223,13 @@ class ExamDutyRequestHandler:
             distinct_per_day=req.distinct_per_day,
             candidate_fn=fetch if req.scope else None,
             slots_for=slots_for,
+            room_meta_for=room_meta_for,
+            reserves=req.reserves,
+            reserve_pct=(
+                req.reserve_pct if req.reserve_pct is not None
+                else (duty_history.lexicon().get("default_reserve_percent", 10)
+                      if req.reserve_flag and req.reserves is None else None)
+            ),
         )
 
         if not plan.get("success"):
@@ -2778,6 +3276,7 @@ class ExamDutyRequestHandler:
 
         self.pending = plan
         self._pending_fetch = fetch if req.scope else None
+        self._pending_req = req
 
         return self._render_plan(plan, req)
 
@@ -2848,6 +3347,13 @@ class ExamDutyRequestHandler:
 
         rooms = plan.get("rooms") or []
 
+        if req.students and req.capacity:
+            lines += [
+                f"**Rooms needed:** {req.students} students ÷ {req.capacity} per room = "
+                f"**{req.rooms_needed} rooms**.",
+                "",
+            ]
+
         lines += self._scope_lines(sessions, req)
 
         if req.setup_reused:
@@ -2870,7 +3376,29 @@ class ExamDutyRequestHandler:
 
             rooms_here = sess.get("rooms") or rooms
 
-            room_info = ((sess.get("scope") or {}).get("room_classes")) or {}
+            meta = sess.get("room_meta") or {}
+
+            room_info = dict(meta.get("notes") or {})
+
+            if not room_info:
+                room_info = {
+                    r_: ", ".join(c_)
+                    for r_, c_ in ((sess.get("scope") or {}).get("room_classes") or {}).items()
+                }
+
+            if meta.get("rooms"):
+
+                freed = sum(1 for v in room_info.values() if not str(v).startswith("free "))
+                other = meta["rooms"] - freed
+
+                lines += [
+                    f"**{meta['rooms']} room(s) for the exam**"
+                    + (f": {freed} freed by the {req.scope.label} classes" if req.scope and freed else "")
+                    + (f"{' + ' if freed and req.scope else ': '}{other} other free classroom(s)/lab(s) with no class then"
+                       if other else "")
+                    + ".",
+                    "",
+                ]
 
             if rooms_here:
 
@@ -2899,7 +3427,7 @@ class ExamDutyRequestHandler:
 
                     cells = people + ["⚠ not filled"] * (width - len(people))
 
-                    used = (", ".join(room_info.get(room, [])) or "—") + " | " if room_info else ""
+                    used = (str(room_info.get(room) or "—")) + " | " if room_info else ""
 
                     lines.append(f"| {room} | {used}" + " | ".join(cells) + " |")
 
@@ -2968,6 +3496,44 @@ class ExamDutyRequestHandler:
                 lines += ["", "*To fill every room you could " + ", ".join(fixes[:-1])
                           + (", or " if len(fixes) > 1 else "") + fixes[-1] + ".*"]
 
+            if meta.get("missing"):
+                lines += [
+                    "",
+                    f"⚠ Only {meta['rooms']} of the {meta['needed']} rooms needed were "
+                    f"available at this time (every other room has a class or is booked "
+                    f"for another exam). Another time slot, or a bigger room size, "
+                    f"would help.",
+                ]
+
+            if sess.get("reserves") is not None and (sess.get("reserves") or sess.get("reserves_wanted")):
+
+                standby = sess["reserves"]
+
+                lines += ["", f"**Reserve / replacement teachers (on standby, {len(standby)})**", ""]
+
+                if standby:
+
+                    lines += ["| # | Faculty | Department | Exam duties so far |", "| --- | --- | --- | --- |"]
+
+                    for n_r, r_ in enumerate(standby, 1):
+                        lines.append(
+                            f"| {n_r} | {r_['teacher']} | {self._department(r_['teacher'])} | {r_['stored_before']} |"
+                        )
+
+                if len(standby) < sess.get("reserves_wanted", 0):
+                    lines += [
+                        "",
+                        f"*Only {len(standby)} of the {sess['reserves_wanted']} reserve teachers "
+                        f"could be found: nobody else is free, under the duty-count rule and "
+                        f"not already on duty that day.*",
+                    ]
+
+                lines += [
+                    "",
+                    "*Reserves are not counted as duties unless called in. If someone is "
+                    "absent, say e.g. “Dr. Name is absent” and I will replace them from this list.*",
+                ]
+
             lines.append("")
 
         # ---- fairness table ----
@@ -3030,7 +3596,21 @@ class ExamDutyRequestHandler:
 
         duties = result["duties"]
 
+        # stand-by teachers are kept (not counted as duties) so an absence can be covered later
+        n_reserve = 0
+
+        for sess in plan.get("sessions", []):
+            if sess.get("reserves") is not None:
+                self.coordinator.store.reserves.set_session(
+                    sess["exam_date"], sess["start_time"], sess["end_time"],
+                    [r["teacher"] for r in sess["reserves"]],
+                )
+                n_reserve += len(sess["reserves"])
+
         lines = [f"**Confirmed {len(duties)} exam duties.**", ""]
+
+        if n_reserve:
+            lines += [f"{n_reserve} reserve teacher(s) are on standby (not counted as duties).", ""]
 
         for duty in duties:
 

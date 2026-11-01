@@ -1,12 +1,79 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from utils.file_discovery import state_file
 from scheduling.duty_history import DutyBaselineStore
 from typing import Any
+
+
+class ExamReserveStore:
+    """
+    Stand-by (reserve) teachers per exam session, kept beside the confirmed duties
+    (exam_duties_reserves.json).  They are NOT duties: they do not count towards a
+    teacher's total until called in to replace someone absent.
+    """
+
+    def __init__(self, path):
+        self.path = Path(path)
+
+    def _read(self) -> list[dict[str, Any]]:
+        try:
+            with self.path.open(encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+        except (OSError, json.JSONDecodeError):
+            return []
+
+    def _write(self, rows: list[dict[str, Any]]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(rows, f, indent=2, ensure_ascii=False)
+        tmp.replace(self.path)
+
+    def all(self) -> list[dict[str, Any]]:
+        return self._read()
+
+    def set_session(self, exam_date: str, start: str, end: str, teachers: list[str]) -> None:
+        """Replace the stand-by list of one session."""
+
+        rows = [
+            r for r in self._read()
+            if (r.get("exam_date"), r.get("start_time"), r.get("end_time")) != (exam_date, start, end)
+        ]
+
+        rows += [
+            {"exam_date": exam_date, "start_time": start, "end_time": end,
+             "teacher": t, "status": "standby"}
+            for t in teachers
+        ]
+
+        self._write(rows)
+
+    def standby(self, exam_date: str, start: str, end: str) -> list[str]:
+        return [
+            r["teacher"] for r in self._read()
+            if (r.get("exam_date"), r.get("start_time"), r.get("end_time")) == (exam_date, start, end)
+            and r.get("status") == "standby"
+        ]
+
+    def mark_used(self, exam_date: str, start: str, end: str, teacher: str, replaced: str) -> None:
+
+        rows = self._read()
+
+        for r in rows:
+            if (r.get("exam_date"), r.get("start_time"), r.get("end_time"), r.get("teacher")) == \
+                    (exam_date, start, end, teacher):
+                r["status"] = "used"
+                r["replaced"] = replaced
+
+        self._write(rows)
+
+    def clear(self) -> None:
+        self._write([])
 
 
 class ExamDutyStore:
@@ -47,6 +114,11 @@ class ExamDutyStore:
         # (scheduling/duty_history.py); lives beside the confirmed duties
         self.baseline = DutyBaselineStore(
             self.path.with_name(self.path.stem + "_baseline.json")
+        )
+
+        # stand-by teachers (not duties)
+        self.reserves = ExamReserveStore(
+            self.path.with_name(self.path.stem + "_reserves.json")
         )
 
     # ============================================================
@@ -223,6 +295,25 @@ class ExamDutyStore:
         Remove all exam-duty records.
         """
         self._write([])
+
+    def replace_teacher(self, duty_id: str, new_teacher: str, reason: str = "absent") -> bool:
+        """Give one saved duty to someone else (the original is noted on the record)."""
+
+        duties = self._read()
+        changed = False
+
+        for duty in duties:
+            if str(duty.get("duty_id", "")) == str(duty_id):
+                duty["replaced_teacher"] = duty.get("teacher")
+                duty["replaced_reason"] = reason
+                duty["teacher"] = new_teacher
+                duty["confirmed_at"] = datetime.now(timezone.utc).isoformat()
+                changed = True
+
+        if changed:
+            self._write(duties)
+
+        return changed
 
     # ============================================================
     # SEARCH

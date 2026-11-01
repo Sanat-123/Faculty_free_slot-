@@ -321,3 +321,132 @@ def room_classes(model, scope: ExamScope, day: str, start_min: int, end_min: int
             out[room].append(cls)
 
     return out
+
+
+# ----------------------------------------------------------------------
+# rooms that nobody uses in the window (extra exam halls)
+# ----------------------------------------------------------------------
+
+def _natural(value: str):
+    return [int(p) if p.isdigit() else p.lower() for p in re.split(r"(\d+)", value)]
+
+
+def classroom_kinds(model) -> Dict[str, str]:
+    """
+    {room: "classroom" | "lab"} - a room that hosts at least one THEORY class
+    anywhere in the timetable is a classroom, a room that only ever hosts labs
+    is a lab.  Read from the timetable, nothing is listed by hand.
+    """
+
+    kinds: Dict[str, str] = {}
+
+    for e in model.events:
+
+        room = str(e.get("room", "")).strip()
+
+        if not room:
+            continue
+
+        theory = str(e.get("type", "")).lower() == "theory"
+
+        if theory:
+            kinds[room] = "classroom"
+        else:
+            kinds.setdefault(room, "lab")
+
+    return kinds
+
+
+def vacant_rooms(
+    model,
+    day: str,
+    start_min: int,
+    end_min: int,
+    skip: Optional[Iterable[str]] = None,
+    ignore_classes: Optional[Iterable[str]] = None,
+) -> List[Tuple[str, str]]:
+    """
+    [(room, kind)] of rooms with NO class in [start_min, end_min] on `day`,
+    classrooms first, then labs; each group in natural order.
+
+    skip           - rooms to leave out (already chosen / booked for another exam)
+    ignore_classes - classes that do not run (a semester sitting its exam)
+    """
+
+    ignore = set(ignore_classes or ())
+    skipped = {str(r) for r in (skip or ())}
+
+    kinds = classroom_kinds(model)
+
+    busy = {
+        str(e.get("room", "")).strip()
+        for e in _overlapping(model, day, start_min, end_min)
+        if str(e.get("class_name", "")).strip() not in ignore
+    }
+
+    free = [(r, k) for r, k in kinds.items() if r not in busy and r not in skipped]
+
+    return sorted(free, key=lambda rk: (rk[1] != "classroom", _natural(rk[0])))
+
+
+def rooms_for_exam(
+    model,
+    scope: Optional[ExamScope],
+    day: str,
+    start_min: int,
+    end_min: int,
+    needed: Optional[int],
+    booked: Optional[Iterable[str]] = None,
+) -> Tuple[List[str], Dict[str, str], int]:
+    """
+    The exam halls for one window.
+
+    1. a semester exam: the rooms its suspended classes would have used;
+    2. then other rooms nobody uses at that time (classrooms before labs), until
+       `needed` rooms are found - `needed=None` keeps just the first group
+       (or, with no semester, every vacant classroom);
+    3. rooms already booked for another exam are never offered.
+
+    Returns (rooms, {room: note shown in the table}, how many are still missing).
+    """
+
+    booked_set = {str(b) for b in (booked or ())}
+    notes: Dict[str, str] = {}
+    rooms: List[str] = []
+
+    if scope is not None:
+
+        by_class = room_classes(model, scope, day, start_min, end_min)
+
+        for room in exam_rooms(model, scope, day, start_min, end_min):
+
+            if room in booked_set:
+                continue
+
+            rooms.append(room)
+            notes[room] = ", ".join(by_class.get(room, [])) or "—"
+
+    if needed is not None and len(rooms) >= needed:
+        rooms = rooms[:needed]
+        return rooms, {r: notes[r] for r in rooms}, 0
+
+    if needed is None and scope is not None:
+        return rooms, notes, 0
+
+    extra = vacant_rooms(
+        model, day, start_min, end_min,
+        skip=set(rooms) | booked_set,
+        ignore_classes=set(scope.classes) if scope else None,
+    )
+
+    for room, kind in extra:
+
+        if needed is not None and len(rooms) >= needed:
+            break
+
+        rooms.append(room)
+        notes[room] = "free " + kind + " (no class then)"
+
+    missing = max(0, (needed or 0) - len(rooms))
+
+    return rooms, notes, missing
