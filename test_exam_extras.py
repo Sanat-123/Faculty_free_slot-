@@ -117,6 +117,7 @@ blocks = split_sessions(r)
 check("two sessions", len(blocks) == 2, str(len(blocks)))
 
 assigned = []
+RES = []                      # stand-by teachers per session
 for (w0, w1), block in zip([(A0, A1), (B0, B1)], blocks):
     rows = table_rows(block)
     rooms_rows = [c for c in rows if len(c) >= 4]
@@ -133,12 +134,15 @@ for (w0, w1), block in zip([(A0, A1), (B0, B1)], blocks):
     people = [re.sub(r"\s*\(.*\)$", "", x) for c in rooms_rows for x in c[2:] if "not filled" not in x]
     assigned.append(set(people))
     check(f"[{hh(w0)}] fewer than 80 duties", all(sheet.get(p, 0) < 80 for p in people), "")
+    fill = [sum(1 for x in c[2:] if "not filled" not in x) for c in rooms_rows]
+    check(f"[{hh(w0)}] rooms are staffed one by one (0 or 2 invigilators, at most one half-staffed)",
+          all(f in (0, 2) for f in fill) or sum(1 for f in fill if f == 1) <= 1, str(fill))
+    check(f"[{hh(w0)}] staffed rooms come before empty ones", fill == sorted(fill, reverse=True), str(fill))
     sb = block.split("**Reserve / replacement teachers")[-1] if "Reserve / replacement" in block else ""
     reserves = [re.sub(r"\s*\(.*\)$", "", c[1]) for c in [[x.strip() for x in l.strip("|").split("|")] for l in sb.splitlines() if l.startswith("| ")] if len(c) == 4 and c[0].isdigit()]
     check(f"[{hh(w0)}] at most 2 reserves", len(reserves) <= 2, str(reserves))
     check(f"[{hh(w0)}] reserves are not also assigned", not (set(reserves) & set(people)), str(set(reserves) & set(people)))
-    assigned[-1] |= set()
-    globals().setdefault("RES", []).append(set(reserves))
+    RES.append(set(reserves))
 check("nobody in both sessions", not (assigned[0] & assigned[1]), str(assigned[0] & assigned[1]))
 check("reserves are not on duty in the other session", not (RES[0] & assigned[1]) and not (RES[1] & assigned[0]))
 check("at least one reserve exists", any(RES), str(RES))

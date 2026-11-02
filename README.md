@@ -272,4 +272,12 @@ Dr. Name is absent, please replace          (works before or after "confirm")
   (classrooms before labs); rooms already confirmed for another exam are never offered again; a shortage is reported.
 * **Reserves:** stand-by teachers per session, chosen by the same rules; they are not counted as duties until used.
 * **Absence:** the duty goes to the next stand-by teacher (or the next best free one) and the absent teacher is marked unavailable.
-* Wording lives in `config/duty_lexicon.json`. Checks: `python test_exam_extras.py`.v
+* Wording lives in `config/duty_lexicon.json`. Checks: `python test_exam_extras.py`.
+
+### How a request is read (no fixed sentences)
+
+A message is first cleaned (typos, odd clock notation), then each number is read by the ROLE it plays:
+"N students" next to *each class / every room / per room* is the room size, the other one is the total;
+"N … per room" is invigilators; "less than N" is the duty-count rule; and so on. The wording lists live in
+`config/duty_lexicon.json`. Checks: `python test_nlp_combinations.py 1000` (generated sentences, any seed via
+`NLP_SEED`) and `python test_nlp_heldout.py` (differently worded sentences not used for tuning).

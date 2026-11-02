@@ -213,6 +213,10 @@
   },
   "spell_vocabulary": [
     "absent",
+    "accommodate",
+    "accommodated",
+    "accommodates",
+    "accommodation",
     "afternoon",
     "allocate",
     "allocated",
@@ -390,14 +394,17 @@
   ],
   "students_patterns": [
     "(\\d[\\d,]{1,6})\\s*(?:students?|candidates?|examinees?|children|boys\\s+and\\s+girls|learners?|pupils?)\\b",
-    "(?:total|strength\\s+of|around|about|approximately|nearly|roughly)\\s+(\\d[\\d,]{1,6})\\s*(?:students?|candidates?)?\\b(?=[^.]{0,40}(?:exam|sit|appear|seat))"
+    "(?:total|strength\\s+of|around|about|approximately|nearly|roughly)\\s+(\\d[\\d,]{1,6})\\s*(?:students?|candidates?)?\\b(?=[^.]{0,40}(?:exam|sit|appear|seat))",
+    "(?:total\\s+)?(?:students?|candidates?|examinees?)\\s*(?:are|is|=|:|of|count\\s+is|strength\\s+is|appearing\\s+are)\\s*(\\d[\\d,]*)",
+    "(?:total|strength|number\\s+of\\s+students|student\\s+count|headcount)\\s*(?:of\\s+students\\s*)?(?:are|is|=|:|of)?\\s*(\\d[\\d,]*)\\b",
+    "(?:students?|candidates?|examinees?|strength)\\s*[:=-]?\\s*(\\d[\\d,]{1,6})\\b(?!\\s*(?:am|pm|:|-|–|to\\b|till\\b))"
   ],
   "capacity_patterns": [
-    "(?:only\\s+|just\\s+|maximum\\s+|max\\s+|at\\s+most\\s+|up\\s*to\\s+)?(\\d{1,3})\\s*(?:students?|candidates?|seats?|benches?|desks?)?\\s*(?:can\\s+(?:sit|be\\s+seated|fit|appear|be\\s+accommodated|be\\s+adjusted)|may\\s+sit|will\\s+sit|sit|fit)\\s*(?:in|per|at|on|inside)?\\s*(?:a|an|one|each|every|1)?\\s*(?:room|class|classroom|hall)?",
+    "(?:only\\s+|just\\s+|maximum\\s+|max\\s+|at\\s+most\\s+|up\\s*to\\s+)?(\\d{1,3})\\s*(?:students?|candidates?|seats?|benches?|desks?)?\\s*(?:can\\s+(?:sit|be\\s+seated|fit|appear|be\\s+accommodated|be\\s+adjusted)|may\\s+sit|will\\s+sit|sit|fit)(?!\\s*(?:only\\s+|just\\s+|around\\s+|about\\s+|maximum\\s+|max\\s+)?\\d)\\s*(?:in|per|at|on|inside)?\\s*(?:a|an|one|each|every|1)?\\s*(?:room|class|classroom|hall)?",
     "(\\d{1,3})\\s*(?:students?|candidates?|seats?)?\\s*(?:per|in\\s+(?:each|every|one|a|an|1)|for\\s+(?:each|every|one|a|an|1)|a|each|every)\\s*(?:room|class|classroom|hall)\\b",
     "(?:room|class|classroom|hall)s?\\s*(?:capacity|size|strength|seating)\\s*(?:is|of|=|:)?\\s*(\\d{1,3})",
     "capacity\\s*(?:of|is|=|:)?\\s*(\\d{1,3})",
-    "(?:holds?|accommodates?|seats?|fits?|takes?)\\s*(?:only\\s+|up\\s+to\\s+)?(\\d{1,3})\\b"
+    "(?:holds?|accomm?odat\\w*|seats?|fits?|takes?|sits?|allows?|can\\s+have|will\\s+have)\\s*(?:only\\s+|just\\s+|around\\s+|about\\s+|up\\s+to\\s+|maximum\\s+|max\\s+|approximately\\s+)?(\\d{1,3})\\b(?!\\s*(?:am|pm|:|-|–|to\\b|till\\b))"
   ],
   "reserve_patterns": [
     "(\\d{1,3})\\s*%\\s*(?:more|extra|reserve|spare|backup|back-up|standby|stand-by|replacement|substitute)s?",
@@ -526,5 +533,16 @@
     "display",
     "tell",
     "see"
+  ],
+  "student_mention_pattern": "(\\d[\\d,]*)\\s*(?:students?|candidates?|examinees?|pupils?|learners?|seats?)",
+  "capacity_context_before": [
+    "(?:each|every|any|one|a|an|single|per|the)\\s+(?:room|class|classroom|hall|section|bench|venue)s?\\s+(?:(?!and\\b|but\\b|also\\b|so\\b|then\\b|while\\b|whose\\b|that\\b|assign\\w*\\b|allot\\w*\\b)\\w+\\s+){0,4}$",
+    "(?:class|room|classroom|hall)\\s*(?:size|strength|capacity)\\s*(?:is|of|=|:)?\\s*(?:about|around|only|just)?\\s*$",
+    "(?:capacity|size|strength)\\s*(?:per|of\\s+(?:each|a|one|every))\\s*(?:room|class|classroom|hall)\\s*(?:is|of|=|:)?\\s*$"
+  ],
+  "capacity_context_after": [
+    "^\\s*(?:can\\s+|will\\s+|may\\s+|could\\s+|should\\s+)?(?:sit|be\\s+seated|be\\s+adjusted|fit|appear|seated|be\\s+accommodated)?\\s*(?:in|per|for|at|inside|to)\\s+(?:each|every|one|a|an|1|single)\\s+(?:room|class|classroom|hall|section|bench)",
+    "^\\s*(?:each|per|every)\\s+(?:room|class|classroom|hall|section)\\b",
+    "^\\s*(?:can|will|may|could)\\s+(?:sit|fit|be\\s+seated|be\\s+accommodated)\\b"
   ]
 }

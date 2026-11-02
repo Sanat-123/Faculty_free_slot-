@@ -93,8 +93,8 @@ _TIME = r"(\d{1,2})(?:[:.](\d{2}))?\s*(a\.?m\.?|p\.?m\.?)?"
 _RANGE_RE = re.compile(
     rf"(?P<lead>\bfrom\b|\bbetween\b|\bduring\b|\bat\b|\btime\b|\bslot\b)?"
     rf"\s*(?<![\w:.]){_TIME}\s*(?P<sep>to|till|until|through|and|-|–|—)\s*{_TIME}"
-    rf"(?!\s*(?:invigilat|faculty|teacher|rooms?\b|halls?\b|staff|members?|"
-    rf"people|persons?|per\b|each\b))",
+    rf"(?!\s*(?:invigilat|faculty|faculties|teacher|rooms?\b|halls?\b|staff|members?|"
+    rf"people|persons?))",
 )
 
 
@@ -121,6 +121,20 @@ def parse_time_range(text: str) -> Optional[Tuple[str, str]]:
     found = parse_time_ranges(text)
 
     return found[0] if found else None
+
+
+def mask_time_ranges(text: str) -> str:
+    """Blank out every time range, so its numbers are not read again as counts."""
+
+    low = text.lower()
+    out = list(text)
+
+    for m in _RANGE_RE.finditer(low):
+        if parse_time_ranges(m.group(0)):
+            for i in range(m.start(), m.end()):
+                out[i] = " "
+
+    return "".join(out)
 
 
 def parse_time_ranges(text: str) -> List[Tuple[str, str]]:
@@ -368,6 +382,10 @@ def parse_rooms(text: str) -> Tuple[List[str], Optional[int]]:
     return unique, count
 
 
+# "per class" / "each class" / "in a class" mean a room in an exam request
+_UNIT_WORD = r"(?:rooms?|halls?|venues?|classrooms?|class(?:es)?|centres?|centers?|labs?|sections?)"
+
+
 def parse_counts(text: str) -> Tuple[Optional[int], Optional[int]]:
     """(invigilators per room, total invigilators)."""
 
@@ -378,21 +396,36 @@ def parse_counts(text: str) -> Tuple[Optional[int], Optional[int]]:
     patterns = [
         rf"\b{_NUM}\s+{_PEOPLE}\s+(?:per|for\s+each|for\s+every|in\s+each|"
         rf"in\s+every|to\s+each|to\s+every|at\s+each|at\s+every|each|every)"
-        rf"(?:\s+{_ROOM_WORD})?",
-        rf"\b{_NUM}\s+(?:per|for\s+each|in\s+each|to\s+each)\s+{_ROOM_WORD}\b",
-        rf"\b(?:each|every)\s+{_ROOM_WORD}\s+(?:should\s+|must\s+|will\s+|to\s+)?"
-        rf"(?:have|get|gets|needs?|requires?|with|has)\s+{_NUM}\b",
-        rf"\b{_ROOM_WORD}\s+(?:each\s+)?(?:with|needs?|requires?|gets?)\s+{_NUM}\s+{_PEOPLE}",
+        rf"(?:\s+{_UNIT_WORD})?",
+        rf"\b{_NUM}\s+(?:per|for\s+each|in\s+each|to\s+each)\s+{_UNIT_WORD}\b",
+        rf"\b(?:each|every)\s+{_UNIT_WORD}\s+(?:should\s+|must\s+|will\s+|to\s+)?"
+        rf"(?:have|get|gets|needs?|requires?|with|has)\s+{_NUM}\b(?!\s*[-–—:]\s*\d)(?!\s*(?:am|pm|to|till|until)\b)",
+        rf"\b{_UNIT_WORD}\s+(?:each\s+)?(?:with|needs?|requires?|gets?)\s+{_NUM}\s+{_PEOPLE}",
         rf"\b{_NUM}\s+(?:each|apiece)\b",
         # "12 rooms x 2", "rooms × 2 faculty"
-        rf"\b{_ROOM_WORD}\s*[x×*]\s*{_NUM}\b",
+        rf"\b{_UNIT_WORD}\s*[x×*]\s*{_NUM}\b",
     ]
+
+    # "each room needs 3 invigilators", "every hall should have two teachers"
+    patterns.insert(
+        0,
+        rf"\b(?:each|every|per)\s+{_UNIT_WORD}\s+(?:\w+\s+){{0,2}}?(?:needs?|requires?|should\s+have|must\s+have|will\s+have|shall\s+have|has|gets?|to\s+have|with)\s+{_NUM}\b(?!\s*[-–—:]\s*\d)(?!\s*(?:am|pm|to|till|until)\b)",
+    )
+
+    # "2 faculties must be assigned in each class", "2 teachers to be kept for every room",
+    # "two invigilators should be there in each hall": the head-count, then a few words
+    # (no new clause), then "each / every / per <room>"
+    patterns.insert(
+        0,
+        rf"\b{_NUM}\s+{_PEOPLE}\s+(?:(?!and\b|but\b|so\b|also\b|then\b|while\b|whose\b|that\b|who\b)\w+\s+){{0,6}}?"
+        rf"(?:in|for|at|to|inside|per|of|with)?\s*(?:each|every)\s+{_UNIT_WORD}\b",
+    )
 
     # "two teachers in 1 room", "2 faculty in one room", "2 invigilators in a room"
     patterns.insert(
         0,
         rf"\b{_NUM}\s+{_PEOPLE}\s+(?:in|for|at|to|inside|per)\s+"
-        rf"(?:each\s+|every\s+|one\s+|1\s+|a\s+|an\s+|single\s+|one\s+single\s+){_ROOM_WORD}\b",
+        rf"(?:each\s+|every\s+|one\s+|1\s+|a\s+|an\s+|single\s+|one\s+single\s+){_UNIT_WORD}\b",
     )
 
     for pattern in patterns:
@@ -504,6 +537,7 @@ class ParsedRequest:
     reserves: Optional[int] = None     # "2 replacement teachers", "2 may be absent"
     reserve_pct: Optional[int] = None  # "10% extra"
     reserve_flag: bool = False         # "replacement must also be there" (no number)
+    per_room_assumed: bool = False     # a total too small for the rooms was read as "per room"
     scope: Any = None            # semester_exam.ExamScope: "5th sem has the exam"
     scope_problem: str = ""      # a semester was named but has no classes
     ask_unit: str = ""           # "per_room" when the bot asked "how many per room?"
@@ -559,7 +593,7 @@ def _find_numbered(patterns, text: str, accept=None):
 
             a = m.start(1)
 
-            if a > 0 and (text[a - 1].isdigit() or text[a - 1] in ",."):
+            if a > 0 and (text[a - 1].isdigit() or text[a - 1] in ",.:"):
                 continue
 
             if accept and not accept(m):
@@ -641,7 +675,7 @@ def parse_request(text: str, today: date) -> ParsedRequest:
 
             a_ = m.start(1)
 
-            if a_ > 0 and (original[a_ - 1].isdigit() or original[a_ - 1] in ",."):
+            if a_ > 0 and (original[a_ - 1].isdigit() or original[a_ - 1] in ",.:"):
                 continue
 
             hit = (_to_count(m.group(1)), (m.start(), m.end()))
@@ -651,13 +685,51 @@ def parse_request(text: str, today: date) -> ParsedRequest:
             elif has_students(low) and not re.search(rf"\b{_PEOPLE}\b", m.group(0).lower()):
                 bare.append(hit)           # "30 per room" - only when students were mentioned
 
-    # a clearly worded capacity wins; a bare "N per room" is read as capacity only when
-    # nothing clearer exists (the reply states the reading, so it can be corrected)
-    pick = min(explicit, key=lambda h: h[1][0]) if explicit else (max(bare, key=lambda h: h[0]) if bare else None)
+    # 1. a clearly worded capacity ("room capacity 30", "can seat 30") wins
+    pick = min(explicit, key=lambda h: h[1][0]) if explicit else None
 
     if pick:
         req.capacity = pick[0]
         mask(pick[1])
+
+    # 2. else read HOW each "N students" is used.  A number that sits right after /
+    #    before "each class / every room / per room" is the room size ("in each class
+    #    there will be 50 students"); the other one is the total.
+    if not pick:
+
+        for m in re.finditer(lex.get("student_mention_pattern", r"(\d+)\s*students?"), original, re.I):
+
+            before = original[:m.start()][-90:]
+            after = original[m.end():][:60]
+
+            if any(re.search(p_, before, re.I) for p_ in lex.get("capacity_context_before", [])) or \
+                    any(re.search(p_, after, re.I) for p_ in lex.get("capacity_context_after", [])):
+
+                req.capacity = _to_count(m.group(1))
+                mask((m.start(), m.end()))
+                pick = (req.capacity, None)
+                break
+
+    # 3. last resort: a bare "30 per room" - only when students were mentioned, and never
+    #    the second hour of a time range ("3 to 4 each room")
+    if not pick and bare:
+
+        usable = [
+            h for h in bare
+            if not re.search(r"\d\s*(?:to|till|until|-|–|—|and)\s*$", original[:h[1][0] + 0].rstrip()[-12:] + "", re.I)
+            and not re.search(r"(?:to|till|until|-|–|—)\s*$", original[:h[1][0]][-6:], re.I)
+        ]
+
+        # also drop a number that is the end of "A to B"
+        usable = [
+            h for h in usable
+            if not re.search(r"\d\s*(?:to|till|until|-|–|—)\s*" + str(h[0]) + r"\b", original[max(0, h[1][0] - 14): h[1][0] + len(str(h[0])) + 3], re.I)
+        ]
+
+        if usable:
+            pick = max(usable, key=lambda h: h[0])
+            req.capacity = pick[0]
+            mask(pick[1])
 
     found = _find_numbered(lex.get("students_patterns", []), original)
 
@@ -695,6 +767,7 @@ def parse_request(text: str, today: date) -> ParsedRequest:
 
     if req.times:
         req.start, req.end = req.times[0]
+        without_dates = mask_time_ranges(without_dates)
 
     # ---- dates that do not exist ("31 Nov") ----
     if not req.dates:
@@ -719,6 +792,16 @@ def parse_request(text: str, today: date) -> ParsedRequest:
         if not req.rooms and req.room_count in (None, 1):
             req.room_count = req.rooms_needed
 
+    # a head-count that cannot even put one person in every room ("2 faculties" for 20 rooms)
+    # can only have meant "per room"
+    if req.total and req.room_count and req.room_count > 1 and not req.per_room and req.total < req.room_count:
+        req.per_room, req.total = req.total, None
+        req.per_room_assumed = True
+
+    # "allot two teachers for every classroom" says the same number twice
+    if req.per_room and req.total == req.per_room:
+        req.total = None
+
     # "two teachers in 1 room": "1 room" is the unit (per room), not "only one room"
     if req.per_room and re.search(
         rf"\b{_NUM}\s+{_PEOPLE}\s+(?:in|for|at|to|inside|per)\s+"
@@ -732,7 +815,8 @@ def parse_request(text: str, today: date) -> ParsedRequest:
     # (but "2 teachers in each room" does talk about rooms: that stays per room)
     if (
         req.per_room is not None and req.total is None and not rooms and not room_count
-        and not re.search(rf"\b{_ROOM_WORD}\b", without_dates.lower())
+        and not req.room_count and not req.rooms_needed and not req.per_room_assumed
+        and not re.search(rf"\b{_UNIT_WORD}\b", without_dates.lower())
     ):
         req.total, req.per_room = req.per_room, None
 
@@ -3136,7 +3220,9 @@ class ExamDutyRequestHandler:
                 names, _, _ = _resolved(day, start, end)
 
                 if per_each:
-                    return [r for _ in range(per_each) for r in names]
+                    # room by room: a shortage then leaves whole rooms empty, not one
+                    # missing invigilator in every room
+                    return [r for r in names for _ in range(per_each)]
 
                 if not names:
                     return [""] * (total_seats or 0)
@@ -3351,6 +3437,13 @@ class ExamDutyRequestHandler:
             lines += [
                 f"**Rooms needed:** {req.students} students ÷ {req.capacity} per room = "
                 f"**{req.rooms_needed} rooms**.",
+                "",
+            ]
+
+        if req.per_room_assumed:
+            lines += [
+                f"*I read “{req.per_room}” as {req.per_room} invigilators in each room, "
+                f"because {req.per_room} in total could not cover {req.room_count} rooms.*",
                 "",
             ]
 
