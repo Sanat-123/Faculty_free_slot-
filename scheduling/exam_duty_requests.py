@@ -547,6 +547,10 @@ def is_exam_duty_text(text: str) -> bool:
 
     low = text.lower()
 
+    # "tomorrow is a non-working day, assign duties to all teachers with classrooms"
+    if semester_exam.is_college_wide(text) and re.search(r"\b(?:dut(?:y|ies)|invigilat\w*)\b", low):
+        return True
+
     return bool(
         re.search(r"\b(?:exam\w*|invigilat\w*)\b", low)
         and (
@@ -847,10 +851,21 @@ def parse_request(text: str, today: date) -> ParsedRequest:
         and not (req.total or req.per_room or req.rooms or req.room_count)
     )
 
-    if assign_first and not asks_for_list:
+    # an instruction verb together with real staffing details (invigilators per room, a
+    # head-count, rooms, students) is an assignment - a stray question phrase elsewhere in
+    # the sentence ("no classes are there") must not turn it into a lookup
+    staffing = bool(
+        req.per_room or req.total or req.rooms or req.room_count or req.students or req.reserves
+    )
+
+    if first_assign and staffing and not asks_for_list:
+        req.intent = "assign"
+    elif assign_first and not asks_for_list:
         req.intent = "assign"
     elif _ELIGIBLE.search(low):
         req.intent = "eligible"
+    elif first_assign and not first_ask:
+        req.intent = "assign"
     elif _TOTALS.search(low):
         req.intent = "totals"
     elif first_assign:
@@ -2023,11 +2038,18 @@ class ExamDutyRequestHandler:
         if scope is None:
             return []
 
-        lines = [
-            f"**Exam for {scope.label}** — its regular classes do not run in the "
-            f"exam window, so its teachers and classrooms are free then.",
-            "",
-        ]
+        if scope.everything:
+            lines = [
+                "**Exam / non-working day for the whole college** — no class runs in the "
+                "window, so every teacher and every classroom is free then.",
+                "",
+            ]
+        else:
+            lines = [
+                f"**Exam for {scope.label}** — its regular classes do not run in the "
+                f"exam window, so its teachers and classrooms are free then.",
+                "",
+            ]
 
         for cand in cands:
 
@@ -2042,7 +2064,7 @@ class ExamDutyRequestHandler:
                 f"- {cand.get('start_time', '')}–{cand.get('end_time', '')}: "
                 f"**{len(info['classes'])}** class(es) suspended"
                 + (f" ({', '.join(info['classes'][:8])}{'…' if len(info['classes']) > 8 else ''})"
-                   if info["classes"] else "")
+                   if info["classes"] and not info.get("everything") else "")
                 + f", **{len(info['freed'])}** teacher(s) freed"
                 + (f", **{len(rooms)} classroom(s) free** for the exam"
                    if rooms else "")
@@ -2549,6 +2571,16 @@ class ExamDutyRequestHandler:
 
         scope = semester_exam.resolve(spec, model)
 
+        if scope is None and (spec.years or spec.everything):
+
+            req.scope_problem = (
+                "I couldn't find any classes in the timetable for that "
+                + ("year" if spec.years else "college-wide request")
+                + ". Check that the class names in the uploaded timetable carry a "
+                  "semester number (for example 5CSA)."
+            )
+            return
+
         if scope is None:
 
             known = sorted({
@@ -2617,8 +2649,10 @@ class ExamDutyRequestHandler:
                 "label": scope.label,
                 "classes": sorted({str(e.get("class_name", "")).strip() for e in suspended}),
                 "freed": sorted(freed),
-                "rooms": semester_exam.exam_rooms(model, scope, weekday, sm, em),
+                "rooms": semester_exam.rooms_for_exam(model, scope, weekday, sm, em, None)[0],
                 "room_classes": semester_exam.room_classes(model, scope, weekday, sm, em),
+                "everything": scope.everything,
+                "all_teachers": len(model.faculty_set) if scope.everything else None,
                 "only_teachers": scope.only_teachers,
                 "teachers_of_scope": len(scope.teachers_of_scope),
             }
@@ -3486,7 +3520,12 @@ class ExamDutyRequestHandler:
 
                 lines += [
                     f"**{meta['rooms']} room(s) for the exam**"
-                    + (f": {freed} freed by the {req.scope.label} classes" if req.scope and freed else "")
+                    + (
+                        (f": {freed} normally used by classes that are suspended"
+                         if req.scope.everything else
+                         f": {freed} freed by the {req.scope.label} classes")
+                        if req.scope and freed else ""
+                    )
                     + (f"{' + ' if freed and req.scope else ': '}{other} other free classroom(s)/lab(s) with no class then"
                        if other else "")
                     + ".",

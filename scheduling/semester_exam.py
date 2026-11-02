@@ -95,10 +95,25 @@ class ScopeSpec:
     class_names: List[str] = field(default_factory=list)   # explicit classes ("5CSA")
     only_teachers: bool = False                              # "teachers of 5th sem only"
     mention: str = ""                                        # the words used
+    everything: bool = False                                 # "whole college", "non-working day"
+    years: List[Any] = field(default_factory=list)           # "final year", 2 (second year)
+
+
+def is_college_wide(text: str) -> bool:
+    """"the whole college has no classes / non-working day / holiday" - a college-wide event."""
+
+    low = str(text or "").lower()
+    lex = duty_history.lexicon()
+
+    return any(re.search(p, low, re.I) for p in lex.get("college_wide_strong", []))
 
 
 def find_scope(text: str, model_classes: Iterable[str]) -> Optional[ScopeSpec]:
-    """Read '5th sem', 'semester V', 'fifth semester', or class names like 5CSA / 3 CS-AI-B."""
+    """
+    Read '5th sem', 'semester V', 'fifth semester', 'final year', 'second year', class
+    names like 5CSA / 3 CS-AI-B, or a college-wide event ('whole college', 'non-working
+    day', 'no classes').
+    """
 
     lex = duty_history.lexicon()
     ordinals = {str(k).lower(): int(v) for k, v in lex.get("ordinal_words", {}).items()}
@@ -134,8 +149,47 @@ def find_scope(text: str, model_classes: Iterable[str]) -> Optional[ScopeSpec]:
             if key in by_key and by_key[key] not in spec.class_names:
                 spec.class_names.append(by_key[key])
 
+    # ---- "final year", "2nd year" ----
     if spec.semester is None and not spec.class_names:
+
+        for pattern in lex.get("year_patterns", []):
+
+            m = re.search(pattern, low, re.I)
+
+            if not m:
+                continue
+
+            word = m.group(1).lower()
+
+            if word in ("final", "last"):
+                spec.years.append("final")
+            else:
+                n = to_number(word, ordinals)
+                if n:
+                    spec.years.append(n)
+
+            if spec.years:
+                spec.mention = m.group(0)
+                break
+
+    # ---- a college-wide event ----
+    named = spec.semester is not None or spec.class_names or spec.years
+
+    strong = any(re.search(p, low, re.I) for p in lex.get("college_wide_strong", []))
+    weak = any(re.search(p, low, re.I) for p in lex.get("college_wide_weak", []))
+
+    if strong or (weak and not named):
+        spec.everything = True
+        spec.semester = None
+        spec.class_names = []
+        spec.years = []
+        spec.mention = ""
+
+    if spec.semester is None and not spec.class_names and not spec.years and not spec.everything:
         return None
+
+    if spec.everything:
+        return spec
 
     # ---- "teachers of / belonging to / teaching that semester" ----
     # the semester may be named more than once ("5th sem has exams ... teachers
@@ -175,6 +229,18 @@ class ExamScope:
     classes: List[str]
     teachers_of_scope: Set[str]            # everyone who teaches any of these classes
     only_teachers: bool = False
+    everything: bool = False               # the whole college: no class runs at all
+
+
+def semesters_per_year() -> int:
+    return int(duty_history.lexicon().get("semesters_per_year", 2) or 2)
+
+
+def year_of(semester: int) -> int:
+    """Academic year of a semester (semesters 1-2 -> year 1, 3-4 -> year 2 ...)."""
+
+    per = semesters_per_year()
+    return (int(semester) + per - 1) // per
 
 
 def resolve(spec: ScopeSpec, model) -> Optional[ExamScope]:
@@ -182,23 +248,68 @@ def resolve(spec: ScopeSpec, model) -> Optional[ExamScope]:
 
     all_classes = sorted({str(e.get("class_name", "")).strip() for e in model.events} - {""})
 
+    def teachers_of(classes):
+        wanted = set(classes)
+        return {
+            str(e.get("teacher", "")).strip()
+            for e in model.events
+            if str(e.get("class_name", "")).strip() in wanted and str(e.get("teacher", "")).strip()
+        }
+
+    # ---- the whole college: nothing runs ----
+    if spec.everything:
+
+        if not all_classes:
+            return None
+
+        return ExamScope(
+            label="the whole college",
+            semester=None,
+            classes=all_classes,
+            teachers_of_scope=teachers_of(all_classes),
+            only_teachers=False,
+            everything=True,
+        )
+
     chosen: List[str] = list(spec.class_names)
 
     if spec.semester is not None:
         chosen += [c for c in all_classes if class_semester(c) == spec.semester and c not in chosen]
 
+    label_years = ""
+
+    # ---- a whole year ("final year", "2nd year"): its semesters ----
+    if spec.years:
+
+        sems = {class_semester(c) for c in all_classes} - {None}
+        present_years = sorted({year_of(x) for x in sems})
+        wanted_years = set()
+
+        for y in spec.years:
+            if y == "final":
+                if present_years:
+                    wanted_years.add(present_years[-1])
+            else:
+                wanted_years.add(int(y))
+
+        picked = [c for c in all_classes if class_semester(c) is not None
+                  and year_of(class_semester(c)) in wanted_years and c not in chosen]
+
+        chosen += picked
+
+        used = sorted({class_semester(c) for c in picked})
+
+        label_years = (
+            ("final year" if "final" in spec.years else f"year {', '.join(map(str, sorted(wanted_years)))}")
+            + (f" (semester{'s' if len(used) > 1 else ''} {', '.join(map(str, used))})" if used else "")
+        )
+
     if not chosen:
         return None
 
-    wanted = set(chosen)
-
-    teachers = {
-        str(e.get("teacher", "")).strip()
-        for e in model.events
-        if str(e.get("class_name", "")).strip() in wanted and str(e.get("teacher", "")).strip()
-    }
-
-    if spec.semester is not None and not spec.class_names:
+    if label_years:
+        label = label_years
+    elif spec.semester is not None and not spec.class_names:
         label = f"semester {spec.semester}"
     else:
         label = ", ".join(spec.class_names[:3]) + ("…" if len(spec.class_names) > 3 else "")
@@ -207,7 +318,7 @@ def resolve(spec: ScopeSpec, model) -> Optional[ExamScope]:
         label=label,
         semester=spec.semester,
         classes=chosen,
-        teachers_of_scope=teachers,
+        teachers_of_scope=teachers_of(chosen),
         only_teachers=spec.only_teachers,
     )
 
@@ -430,7 +541,7 @@ def rooms_for_exam(
         rooms = rooms[:needed]
         return rooms, {r: notes[r] for r in rooms}, 0
 
-    if needed is None and scope is not None:
+    if needed is None and scope is not None and not getattr(scope, "everything", False):
         return rooms, notes, 0
 
     extra = vacant_rooms(
@@ -443,6 +554,10 @@ def rooms_for_exam(
 
         if needed is not None and len(rooms) >= needed:
             break
+
+        # the whole college with no room count given: every CLASSROOM (labs only when more rooms are needed)
+        if needed is None and kind != "classroom":
+            continue
 
         rooms.append(room)
         notes[room] = "free " + kind + " (no class then)"

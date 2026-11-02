@@ -281,3 +281,17 @@ A message is first cleaned (typos, odd clock notation), then each number is read
 "N … per room" is invigilators; "less than N" is the duty-count rule; and so on. The wording lists live in
 `config/duty_lexicon.json`. Checks: `python test_nlp_combinations.py 1000` (generated sentences, any seed via
 `NLP_SEED`) and `python test_nlp_heldout.py` (differently worded sentences not used for tuning).
+
+## 🏫 Non-working day / college-wide exam / a whole year
+
+```
+5 november is declared a non working day for the whole college, no classes, assign exam duties to the teachers
+with duty count less than 80 along with classrooms, timing 9 to 10:30 and 1 to 2:30, 2 teachers in each class
+final year exam on 5 nov 9 to 12, 2 invigilators per room
+```
+
+* **Whole college** (“non working day”, “holiday”, “no classes”, “entire college”…): every class is suspended in the
+  window, so every teacher and every classroom is free; all classrooms are offered (or as many as
+  students ÷ room size need).
+* **A year** (“final year”, “2nd year”): only that year's classes are suspended (semesters per year in `config/duty_lexicon.json`).
+* Checks: `python test_college_wide.py`.
