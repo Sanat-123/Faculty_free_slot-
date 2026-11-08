@@ -24,6 +24,7 @@ from scheduling.exam_duty_store import ExamDutyStore
 from scheduling.exam_duty_planner import ExamDutyCoordinator
 from scheduling.exam_unavailable_store import ExamUnavailableStore
 from scheduling.exam_duty_requests import ExamDutyRequestHandler
+from exam_management.integration import build_exam_management
 from engine.branch_resolver import BranchIndex
 from engine import date_resolver
 from query_engine import QueryEngine
@@ -388,6 +389,19 @@ class FacultyAIChatbot:
         )
 
         print("Exam Duty Requests ready.")
+
+        # College-wide, fairness-based examination duty management
+        # (exam_management/): SQLite + CP-SAT, exclusions, versions, reports.
+        # Anything it does not own returns None and falls through unchanged.
+        self.exam_management = build_exam_management(
+            model_getter=lambda: self.smart_engine.model,
+            branch_getter=self._branch_index,
+            real_faculty_getter=self.exam_duty_coordinator._real_faculty,
+            history_store_getter=lambda: self.exam_duty_store,
+            today_getter=date.today,
+        )
+
+        print("Exam Management ready.")
 
         self.nl_query = NaturalLanguageQuery(
             self.query_engine
@@ -2001,6 +2015,19 @@ class FacultyAIChatbot:
 
         # plain-English exam-duty requests (eligible list, room allocation,
         # exclusions, fairness) and the confirm/cancel that follows them
+        try:
+            managed = (
+                self.exam_management.handle(query)
+                if self.exam_management is not None else None
+            )
+        except Exception as error:
+            print(f"Exam management handler error: {error}")
+            managed = None
+
+        if managed is not None:
+            self._pending_exam_duty_plan = None
+            return managed
+
         try:
             duty_reply = self.exam_duty_requests.handle(query)
         except Exception as error:

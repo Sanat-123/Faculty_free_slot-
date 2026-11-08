@@ -372,6 +372,7 @@ def build_database(database: dict, db_path: str | None = None):
 
 # The data-driven query engine built from the ACTIVE (uploaded) database.
 _SMART_ENGINE = None
+_EXAM_HANDLER = None
 
 # Optional LLM front end (engine/llm_layer.py) wrapped around _SMART_ENGINE.
 # None unless ANTHROPIC_API_KEY is set; the rule-based engine is the fallback.
@@ -424,6 +425,28 @@ def activate(db_path: str) -> None:
             _LLM = LLMAssistant(_SMART_ENGINE)
     except Exception:
         _LLM = None
+
+    # Examination duty management (exam_management/) for the same timetable
+    global _EXAM_HANDLER
+    _EXAM_HANDLER = None
+    if _SMART_ENGINE is not None:
+        try:
+            from engine.branch_resolver import BranchIndex
+            from exam_management.integration import build_exam_management
+
+            _index = {}
+
+            def _branches():
+                if "i" not in _index:
+                    _index["i"] = BranchIndex(_SMART_ENGINE.model)
+                return _index["i"]
+
+            _EXAM_HANDLER = build_exam_management(
+                model_getter=lambda: _SMART_ENGINE.model,
+                branch_getter=_branches,
+            )
+        except Exception:
+            _EXAM_HANDLER = None
 
 
 def find_faculty_pdf(directory=None):
@@ -514,6 +537,27 @@ def answer_query(query: str, entity_extractor=None, history=None) -> dict:
     #    database in activate()).  If it understood the question the
     #    result is returned in the same dict shape as before.
     # --------------------------------------------------------------
+
+    if _EXAM_HANDLER is not None:
+
+        # examination duty management (allocation, exclusions, reports)
+        try:
+            exam_reply = _EXAM_HANDLER.handle(query)
+        except Exception:
+            exam_reply = None
+
+        if exam_reply is not None:
+            return {
+                "query": query,
+                "intent": "EXAM_DUTY",
+                "day": None,
+                "slot": None,
+                "entities": {},
+                "rows": [],
+                "text": exam_reply,
+                "detection": {"intent": "EXAM_DUTY", "day": None,
+                              "slot": None, "entities": {}},
+            }
 
     if _LLM is not None:
 
