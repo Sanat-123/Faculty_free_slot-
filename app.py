@@ -39,6 +39,8 @@ import hashlib
 import time
 from pathlib import Path
 
+from utils.example_questions import build_example_questions
+
 import streamlit as st
 
 
@@ -232,13 +234,7 @@ with st.sidebar:
 
 ### Example questions
 
-- Who is free on Monday slot 2?
-- Which faculty is free on Monday slot 3?
-- Is Dr. Mehul Mahrishi free on Monday slot 3?
-- What is Dr. Mehul Mahrishi teaching on Monday?
-- Who teaches OS III?
-- What is the timetable of 3CS-D on Monday?
-- Which room is free on Monday slot 4?
+@@EXAMPLES@@
 
 ### Once the full engine is ready
 
@@ -254,7 +250,14 @@ with st.sidebar:
 
 Any of these that produce a proposal will ask you to reply
 "confirm" before anything is actually saved.
-        """
+        """.replace(
+            "@@EXAMPLES@@",
+            "\n".join(
+                f"- {q}" for q in build_example_questions(
+                    st.session_state.get("records")
+                )
+            )
+        )
     )
 
 
@@ -535,7 +538,21 @@ def build_combined_dataset(uploaded_files):
 
     file_reports = []
 
+    # roster / duty-count files go to the exam-management importer (judged by content, roster first)
+    try:
+        from exam_management.integration import import_college_uploads
+        college_reports = import_college_uploads(uploaded_files)
+    except Exception:
+        college_reports = {}
+
     for uploaded_file in uploaded_files:
+
+        if uploaded_file.name in college_reports:
+            college = college_reports[uploaded_file.name]
+            if college.get("purpose") == "duty_counts":
+                import_duty_history(uploaded_file)      # keep the older exam-duty planner's store in step
+            file_reports.append(college)
+            continue
 
         duty_report = import_duty_history(uploaded_file)
 

@@ -33,6 +33,8 @@ from .groups import group_map, normalise_spec, seat_quota
 from .optimizer import assign_rooms, evaluate, greedy_construct, solve, targets_for
 from .providers import FacultyDirectory, HistoryProvider, NoTimetable, TimetableConflicts
 from .repository import Repository, now
+from .importer import Importer
+from .policy import PolicyService
 from .restrictions import RestrictionService, RestrictionSpec
 
 
@@ -94,6 +96,8 @@ class ExamService:
         self.history = history
         self.actor = actor
         self.restrictions = RestrictionService(self.repo, actor)
+        self.policy = PolicyService(self.repo, actor)
+        self.importer = Importer(self.repo, actor)
         self.eligibility = EligibilityEngine(self.repo, self.timetable, self.settings)
 
     def reload_settings(self) -> None:
@@ -205,6 +209,7 @@ class ExamService:
                                      "Tell me whether regular classes are suspended during this examination.")
         matrix = self.eligibility.evaluate(sid)
         comps = self.repo.history_components(exclude_session_id=sid)
+        rules = PolicyService(self.repo).priority_rules(sid)
         faculty: List[FacultyInfo] = []
         for f in matrix.faculty:
             if not f["active"]:
@@ -212,7 +217,7 @@ class ExamService:
             c = comps.get(f["id"], {})
             faculty.append(FacultyInfo(f["id"], f["name"], f["department"] or "",
                                        c.get("baseline", 0.0) + c.get("completed", 0.0),
-                                       c.get("committed", 0.0)))
+                                       c.get("committed", 0.0), PolicyService.tier_of(f, rules)[0]))
         eligible = {f.id: matrix.eligible_slots(f.id) for f in faculty}
         opts = session["options"]
         p = Problem(faculty=faculty, slots=matrix.slots, eligible=eligible,
@@ -536,6 +541,69 @@ class ExamService:
                             {"from": aid, "faculty": faculty_id, "date": on.isoformat(),
                              "changes": len(changes), "mode": mode}, self.actor)
             return Outcome(new_id, result.status, result, notes, changes, problem)
+        raise ConcurrentModification("data kept changing during the reallocation; please retry")
+
+    def reallocate_affected(self, aid: int, *, seed: Optional[int] = None, reason: str = "") -> Outcome:
+        """
+        Repair an allocation after exclusions / restrictions changed.
+
+          1. every duty that is no longer eligible is identified (person, date, room, why)
+          2. ONLY those seats are vacated; every other duty stays exactly where it is
+          3. vacated seats are refilled with the same fairness / priority / seeded-random rules
+          4. seats that cannot be filled are reported as unfilled (never faked)
+          5. the result is a NEW draft version (parent = the repaired one); an approved
+             allocation is never modified - it stays in force until the new draft is approved.
+        """
+
+        base = self.repo.allocation(aid)
+        if base is None:
+            raise ExamError(f"unknown allocation {aid}")
+        sid = base["session_id"]
+        base_duties = self.repo.duties(aid)
+        seed = seed if seed is not None else secrets.randbelow(2 ** 31 - 10000)
+        for _ in range(3):
+            fp = self._fingerprint(sid)
+            problem, matrix = self.build_problem(sid, seed=seed)
+            key = self._slot_key(matrix)
+            keep, hit = [], []
+            for d in base_duties:
+                si = key.get((d["exam_date"], d["shift_id"]))
+                (keep if si is not None and matrix.ok(d["faculty_id"], si) else hit).append(d)
+            if not hit:
+                return Outcome(None, "unchanged", None, ["No assignment is affected: every duty is still eligible."],
+                               problem=problem)
+            affected = []
+            for d in hit:
+                si = key.get((d["exam_date"], d["shift_id"]))
+                why = matrix.reasons(d["faculty_id"], si)[:1] if si is not None else []
+                affected.append({"faculty": d["faculty"], "department": d["department"], "date": d["exam_date"],
+                                 "shift": d["shift"], "room": d["room"], "why": why[0].text if why else "slot removed"})
+            problem.fixed = {(d["faculty_id"], key[(d["exam_date"], d["shift_id"])]) for d in keep}
+            targets = targets_for(problem, self.settings)
+            problem.seed = seed
+            solved = solve(problem, self.settings)             # unaffected duties are PINNED (problem.fixed)
+            if solved.assignments and all(solved.assignments.get(s) is not None for s in problem.fixed_slots()):
+                assign = solved.assignments
+            else:                                              # solver found nothing usable: fall back to greedy fill
+                assign = greedy_construct(problem, self.settings, targets, seed)
+            seats, _ = self._merge_seats(problem, matrix, base_duties, assign, key)
+            result = self._result_from(problem, assign, seats, targets, seed)
+            try:
+                new_id = self._persist(sid, result, problem, matrix, fp, parent=aid,
+                                       params={"reallocated": {"affected": len(hit), "reason": reason, "seed": seed}},
+                                       notes=f"reallocated {len(hit)} affected duties")
+            except ConcurrentModification:
+                continue
+            changes = self.diff(aid, new_id)
+            self.repo.audit("reallocate_affected", "allocation", new_id,
+                            {"from": aid, "affected": affected, "changes": len(changes), "reason": reason}, self.actor)
+            notes = [f"{len(hit)} duty(ies) were no longer allowed and were vacated; {len(keep)} unaffected duties were kept."]
+            if base["status"] == "approved":
+                notes.append("The approved allocation is unchanged and still in force; the new version is a DRAFT "
+                             "that needs your approval before it replaces it.")
+            out = Outcome(new_id, result.status, result, notes, changes, problem)
+            out.affected = affected  # type: ignore[attr-defined]
+            return out
         raise ConcurrentModification("data kept changing during the reallocation; please retry")
 
     @staticmethod

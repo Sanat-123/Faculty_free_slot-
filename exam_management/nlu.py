@@ -421,6 +421,8 @@ def parse_exam_request(text: str, today: date, year_hint: Optional[int] = None,
     if not pm:
         pm = re.search(r"(?:invigilators?|faculty|teachers?)\s+(?:per|in\s+each)\s+(?:room|hall)\s*(?:is|are|:|=|of)?\s*(\d{1,2}|" +
                        "|".join(NUMWORDS) + r")\b", low)
+    if not pm:                                   # "with two invigilators each", "2 invigilators per room"
+        pm = re.search(r"\b(\d{1,2}|" + "|".join(NUMWORDS) + r")\s+(?:invigilators?|supervisors?)\s*(?:each|apiece|per\s+(?:room|hall))\b", low)
     if pm:
         req.per_room = _n(pm.group(1))
 

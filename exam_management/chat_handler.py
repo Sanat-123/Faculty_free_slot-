@@ -18,6 +18,8 @@ from .nlu import ExamRequest, FacultyResolver
 from .reports import Reporter, fmt_date, md_table, num
 from .groups import describe, group_map, normalise_spec
 from .restrictions import RestrictionError, RestrictionSpec, describe_scope
+from .policy import PolicyError
+from .policy_chat import PolicyChat
 from .service import ExamError, ExamService, MissingInformation, SessionSpec
 
 _EXAM_WORDS = re.compile(r"\b(?:exam\w*|invigilat\w*|duty|duties)\b", re.I)
@@ -40,6 +42,9 @@ class ExamManagementHandler:
         self.pending_confirm: Optional[Dict[str, Any]] = None
         self.pending_exclusions: List[Tuple[nlu.Directive, List[int]]] = []
         self.pending_admin_policy: Optional[List[str]] = None
+        self.pending_dept: List[Dict[str, Any]] = []
+        self.last_exports: List[str] = []
+        self.policy_chat = PolicyChat(self)
         self._roster_synced = False
 
     # ------------------------------------------------------------------ helpers
@@ -101,7 +106,7 @@ class ExamManagementHandler:
             return self._route(text, low)
         except MissingInformation as e:
             return self._ask_missing(e.fields)
-        except (ExamError, RestrictionError) as e:
+        except (ExamError, RestrictionError, PolicyError) as e:
             return f"I could not do that: {e}"
 
     def _route(self, text: str, low: str) -> Optional[str]:
@@ -115,6 +120,8 @@ class ExamManagementHandler:
             if _NO.match(text):
                 self.pending_confirm = None
                 return "Okay - nothing was changed."
+            if self.pending_confirm.get("kind") in ("callback", "import"):
+                self.pending_confirm = None          # a different instruction disarms an import / publish / send request
 
         # --- approval / discard of the current draft
         if sess and re.match(r"^\W*(?:yes[\s,]*)?(?:please\s+)?(?:approve|finali[sz]e|confirm|go\s+ahead|save|accept)\b", low) \
@@ -130,6 +137,12 @@ class ExamManagementHandler:
         if sess and re.search(r"\b(?:mark|complete|close|finish)\b.{0,30}\bexam\w*\b.{0,20}\b(?:complete\w*|done|over|finished)\b", low):
             n = self.svc.complete_session(sess["id"])
             return f"Marked the examination as completed - its {n} approved duties now count as historical duties in future fairness calculations."
+
+        # --- a clear department / priority instruction is never mistaken for an answer to a pending question
+        if self.awaiting:
+            r = self.policy_chat.handle(text, low, self._resolver().mentions(text)[0], sess)
+            if r is not None:
+                return r
 
         # --- follow-up of an allocation request that lacked information
         if self.awaiting:
@@ -157,6 +170,11 @@ class ExamManagementHandler:
 
         # --- who belongs to which department / group (CS vs non-CS ...)
         r = self._departments(text, low, mentions, unmatched)
+        if r is not None:
+            return r
+
+        # --- department exclusion / priority tiers / file import (data-driven, see policy_chat)
+        r = self.policy_chat.handle(text, low, mentions, sess)
         if r is not None:
             return r
 
@@ -330,6 +348,15 @@ class ExamManagementHandler:
             for spec, err in res.errors:
                 notes.append(f"Could not apply an earlier exclusion for {self.repo.faculty(spec.faculty_id)['name']}: {err}")
         self.pending_exclusions = []
+        for op in self.pending_dept:
+            try:
+                self.svc.policy.exclude_department(op["department"], kind=op["kind"], session_id=sid,
+                                                   start=op["start"], end=op["end"], shift_label=op["shift"],
+                                                   reason=op["reason"])
+                notes.append(f"Applied your earlier exclusion of {op['department']}.")
+            except PolicyError as e:
+                notes.append(f"Could not apply an earlier department exclusion: {e}")
+        self.pending_dept = []
         if self.pending_admin_policy is not None:
             out = self.svc.restrictions.apply_admin_policy(sid, self.pending_admin_policy or None)
             notes.append(f"Administrative exclusion applied to {len(out['created'])} faculty member(s)."
@@ -613,6 +640,10 @@ class ExamManagementHandler:
         pc, self.pending_confirm = self.pending_confirm, None
         if pc["kind"] == "directives":
             return self._execute_plan(pc["plan"], pc["unmatched"], pc["sid"])
+        if pc["kind"] == "callback":
+            return pc["run"]()
+        if pc["kind"] == "import":
+            return self.policy_chat.run_import(pc["probe"])
         return "Nothing to confirm."
 
     def _execute_plan(self, plan, unmatched, sid) -> str:
@@ -729,7 +760,8 @@ class ExamManagementHandler:
         on = hits[0].first if hits else None
 
         if re.search(r"\bexclusion|\brestriction|\bwho\b.{0,25}\b(?:excluded|unavailable)\b", low) and not re.search(r"\bwhy\b", low):
-            return "**Exclusions & unavailability**\n" + self.rep.render_exclusions(sess["id"], include_inactive=bool(re.search(r"\b(?:history|all|restored)\b", low)))
+            return ("**Exclusions & unavailability**\n" + self.rep.render_exclusions(sess["id"], include_inactive=bool(re.search(r"\b(?:history|all|restored)\b", low)))
+                    + "\n\n" + self.policy_chat._show_excluded(sess))
         if re.search(r"\b(?:who\s+is|list|show)\b.{0,30}\beligible|eligibility|why\b.{0,20}\b(?:excluded|not\s+eligible)\b", low) and not names:
             return "**Eligibility**\n" + self.rep.render_eligibility(sess["id"], only_problem=not re.search(r"\ball\b|\bevery", low))
         if alloc is None:

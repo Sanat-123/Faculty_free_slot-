@@ -36,6 +36,7 @@ class OptimizerWeights:
     jitter: int = 6                    # max random cost per (person, slot) - tie breaker
     group_balance: int = 1500          # per seat away from a group's share of a slot
     department_mix: int = 4            # two invigilators of one department in a room
+    tier_penalty: int = 6000           # per duty, per priority tier below the first (lexicographic-ish: < unfilled_slot)
 
 
 @dataclass(frozen=True)
@@ -59,10 +60,23 @@ class ExamSettings:
     rest_days_preferred: int = 1           # exam days of rest wanted between duties
     max_shifts_per_day: Optional[int] = None   # hard cap per day (None = soft only)
     target_scale: int = 10                 # fixed-point scale of fractional targets
+    history_weight: float = 0.25           # share of a person's history gap (vs the average) that shifts their target
+    history_adjust_cap: float = 1.0        # most duties history may add / remove from a person's target
+    history_adjust_fraction: float = 0.5   # ...and never more than this fraction of the AVERAGE share per person
+                                           # (history_weight=1, cap=None-like 1e9 reproduces the old raw water-fill)
 
     # ---- calendar ------------------------------------------------------
     non_working_weekdays: Tuple[str, ...] = ("sunday",)  # skipped when a range is expanded
     default_year_window_days: int = 183    # dates further in the past roll to next year
+
+    # ---- output & wording (administrator-editable; nothing here is a college fact) ----
+    export_dir: str = "exports"            # where generated PDF / Excel reports are written (env EXAM_MGMT_EXPORT_DIR wins)
+    export_name_template: str = "exam_duty_session{session}_v{version}"   # {session} {version} {date}
+    notification_subject: str = "Examination duty assignment"
+    notification_greeting: str = "Dear {name},"
+    notification_intro: str = "You have been assigned examination invigilation duty:"
+    notification_closing: str = "Please contact the examination cell if you are unable to attend."
+    seat_role_labels: Tuple[str, ...] = ("First invigilator", "Second invigilator")   # seat 1, 2 ... then 'Invigilator N'
 
     # ---- policy ----------------------------------------------------------
     require_class_suspension_answer: bool = True   # ask, never assume
@@ -86,6 +100,8 @@ class ExamSettings:
             clean["weights"] = weights
         if "non_working_weekdays" in clean:
             clean["non_working_weekdays"] = tuple(str(d).lower() for d in clean["non_working_weekdays"])
+        if "seat_role_labels" in clean:
+            clean["seat_role_labels"] = tuple(str(x) for x in clean["seat_role_labels"])
         return replace(self, **clean)
 
 

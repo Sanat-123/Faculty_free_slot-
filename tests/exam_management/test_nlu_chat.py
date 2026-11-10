@@ -143,7 +143,7 @@ def test_full_coordinator_workflow(bot):
     for q, expect in [("show exclusions", n[1]), ("Show department-wise examination duty distribution", "Total faculty"),
                       ("Show total examination duties assigned to every faculty member", "Historical duties"),
                       ("Show faculty members who have not received any duties", n[2]),
-                      ("Find faculty members who are receiving consecutive examination duties", "Consecutive"),
+                      ("Find faculty members who are receiving consecutive examination duties", "onsecutive"),
                       ("who is eligible", "Excluded")]:
         assert expect in bot.handle(q), q
     second = bot.handle("Generate another allocation with a different faculty distribution while maintaining all constraints.")

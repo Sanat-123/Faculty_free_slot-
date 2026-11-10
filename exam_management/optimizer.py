@@ -50,20 +50,48 @@ class OptimizerError(RuntimeError):
 # quality (what the objective measures, minus randomness / variation terms)
 # ---------------------------------------------------------------------------
 
+def _tier_capacity(problem: Problem, members: Sequence[FacultyInfo]) -> float:
+    """How many seats this set of people can cover at most (per-person limits and per-slot seats)."""
+
+    ids = {f.id for f in members}
+    per_person = sum(min(len(problem.eligible.get(f.id, ())), problem.max_duties
+                         if problem.max_duties is not None else 10 ** 9) for f in members)
+    per_slot = sum(min(sl.required, sum(1 for i in ids if sl.index in problem.eligible.get(i, ())))
+                   for sl in problem.slots)
+    return float(min(per_person, per_slot))
+
+
 def targets_for(problem: Problem, settings: ExamSettings) -> Dict[int, int]:
-    """Fair per-person targets; with a group split they are computed inside each group."""
+    """Fair per-person targets; with a group split they are computed inside each group.
+    With priority tiers, demand is filled tier by tier: a lower tier only gets what the higher
+    tiers cannot cover."""
 
     scale = settings.target_scale
+    kw = dict(history_weight=settings.history_weight, history_cap=settings.history_adjust_cap,
+              history_cap_fraction=settings.history_adjust_fraction)
+    tiers = sorted({f.tier for f in problem.faculty})
+    if not problem.groups and len(tiers) > 1:
+        out: Dict[int, int] = {}
+        remaining = float(problem.total_required)
+        for t in tiers:
+            members = [f for f in problem.faculty if f.tier == t]
+            cap_t = _tier_capacity(problem, members)
+            share = min(remaining, cap_t)
+            out.update(compute_targets(members, {f.id: problem.eligible.get(f.id, set()) for f in members},
+                                       int(round(share)), problem.max_duties, settings.opportunity_blend, scale,
+                                       problem.min_duties if t == tiers[0] else None, demand_cap_by_slot=cap_t, **kw))
+            remaining -= share
+        return out
     if not problem.groups:
         return compute_targets(problem.faculty, problem.eligible, problem.total_required, problem.max_duties,
-                               settings.opportunity_blend, scale, problem.min_duties)
-    out: Dict[int, int] = {}
+                               settings.opportunity_blend, scale, problem.min_duties, **kw)
+    out = {}
     names = sorted(set(problem.groups.values()))
     for g in names:
         members = [f for f in problem.faculty if problem.groups.get(f.id) == g]
         demand = sum(q.get(g, 0) for q in problem.group_quota.values())
         out.update(compute_targets(members, {f.id: problem.eligible.get(f.id, set()) for f in members}, demand,
-                                   problem.max_duties, settings.opportunity_blend, scale, problem.min_duties))
+                                   problem.max_duties, settings.opportunity_blend, scale, problem.min_duties, **kw))
     for f in problem.faculty:                         # people outside every group: no target
         out.setdefault(f.id, 0)
     return out
@@ -129,8 +157,11 @@ def evaluate(problem: Problem, assign: Dict[int, Sequence[int]], targets: Dict[i
                 gbal += abs(gc.get(s, {}).get(g, 0) - q)
     conc = sum(max(0, counts[f.id] * scale - targets.get(f.id, 0) - scale) for f in problem.faculty
                if problem.eligible.get(f.id))
+    tier_of = {f.id: f.tier for f in problem.faculty}
+    tier_use = sum((tier_of.get(f, 1) - 1) * c for f, c in counts.items())
     parts = {
         "unfilled_seats": unfilled,
+        "tier_use": tier_use * w.tier_penalty,
         "deviation": dev * coef(w.target_deviation, scale),
         "min_shortfall": short * w.min_shortfall,
         "consecutive": cons * w.consecutive_day,
@@ -244,7 +275,8 @@ def greedy_construct(problem: Problem, settings: ExamSettings, targets: Dict[int
                         (days[fid].get(sl.day_pos - 1) or days[fid].get(sl.day_pos + 1)):
                     continue
                 t, k = targets.get(fid, 0), n[fid]
-                cost = c_dev * (((k + 1) * scale - t) ** 2 - (k * scale - t) ** 2)
+                cost = (f.tier - 1) * w.tier_penalty
+                cost += c_dev * (((k + 1) * scale - t) ** 2 - (k * scale - t) ** 2)
                 cost += c_conc * (max(0, (k + 1) * scale - t - scale) - max(0, k * scale - t - scale))
                 for d2, cnt in days[fid].items():
                     if cnt <= 0:
@@ -302,6 +334,7 @@ def local_search(problem: Problem, settings: ExamSettings, targets: Dict[int, in
     allowed = {f.id: {s for s in problem.eligible.get(f.id, ()) if (f.id, s) not in problem.forbidden}
                for f in problem.faculty}
     cap_f = {fid: len(v) for fid, v in allowed.items()}
+    tier_by = {f.id: f.tier for f in problem.faculty}
     assign = {s: list(v) for s, v in assign.items()}
     n: Dict[int, int] = defaultdict(int)
     days: Dict[int, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
@@ -315,6 +348,7 @@ def local_search(problem: Problem, settings: ExamSettings, targets: Dict[int, in
     def fcost(fid: int, k: int, dmap: Dict[int, int]) -> int:
         t = targets.get(fid, 0)
         cost = c_dev * (k * scale - t) ** 2 + c_conc * max(0, k * scale - t - scale)
+        cost += k * (tier_by.get(fid, 1) - 1) * w.tier_penalty
         if problem.min_duties:
             cost += w.min_shortfall * max(0, min(problem.min_duties, cap_f.get(fid, 0)) - k)
         ds = sorted(d for d, c in dmap.items() if c > 0)
@@ -557,6 +591,8 @@ def _solve_once(problem: Problem, settings: ExamSettings, targets: Dict[int, int
         sq = m.NewIntVar(0, (top + abs(tgt)) ** 2 + 1, f"sq_{f.id}")
         m.AddMultiplicationEquality(sq, [diff, diff])
         cost.append(coef(w.target_deviation, scale) * sq)
+        if f.tier > 1:
+            cost.append((f.tier - 1) * w.tier_penalty * n)
 
         over = m.NewIntVar(0, top + abs(tgt), f"over_{f.id}")
         m.Add(over >= diff - scale)

@@ -1,0 +1,115 @@
+{
+  "_comment": "Header wording understood by the exam-management file importer. Add synonyms here (any language) - no code change needed. Matching ignores case, punctuation and spacing.",
+  "fields": {
+    "serial": [
+      "s no",
+      "sno",
+      "sr no",
+      "serial",
+      "serial no",
+      "sl no",
+      "#"
+    ],
+    "name": [
+      "faculty name",
+      "name",
+      "name of faculty",
+      "teacher",
+      "teacher name",
+      "employee name",
+      "faculty"
+    ],
+    "department": [
+      "branch department",
+      "department",
+      "branch",
+      "dept",
+      "dept name",
+      "school",
+      "discipline"
+    ],
+    "employee_code": [
+      "employee code",
+      "emp code",
+      "employee id",
+      "emp id",
+      "staff code",
+      "faculty id",
+      "code",
+      "ecode"
+    ],
+    "designation": [
+      "designation",
+      "post",
+      "position",
+      "rank",
+      "role"
+    ],
+    "duty_count": [
+      "duty count",
+      "duties",
+      "no of duties",
+      "total duties",
+      "exam duties",
+      "invigilation count",
+      "number of duties",
+      "duty"
+    ],
+    "exam_date": [
+      "date",
+      "exam date",
+      "duty date"
+    ],
+    "shift": [
+      "shift",
+      "time slot",
+      "slot",
+      "session"
+    ],
+    "room": [
+      "room",
+      "room no",
+      "hall",
+      "venue"
+    ]
+  },
+  "timetable_markers": [
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "mon",
+    "tue",
+    "wed",
+    "thu",
+    "fri",
+    "sat",
+    "mo",
+    "tu",
+    "we",
+    "th",
+    "fr",
+    "sa"
+  ],
+  "titles": [
+    "dr",
+    "mr",
+    "mrs",
+    "ms",
+    "miss",
+    "prof",
+    "professor",
+    "er",
+    "shri",
+    "smt"
+  ],
+  "fuzzy_header_threshold": 88,
+  "supported_extensions": [
+    ".pdf",
+    ".xlsx",
+    ".xls",
+    ".csv"
+  ]
+}

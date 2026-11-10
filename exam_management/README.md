@@ -60,3 +60,19 @@ so only comparable candidates are reordered; a seed reproduces a result.
 pip install -r requirements.txt pytest
 python -m pytest tests/exam_management -q
 ```
+
+## College-wide roster, policy and reporting (added)
+
+| Module | Purpose |
+|---|---|
+| `importer.py` | Content-based import of PDF / XLSX / XLS / CSV (roster, duty counts). Column wording from `config/import_columns.json`; folder from `EXAM_MGMT_IMPORT_DIR`. Preview -> validate -> idempotent import, issues logged, rollback, alias linking. |
+| `policy.py` | Department exclusion (scoped by session / dates / shift, restored independently of person exclusions) and priority tiers (department / designation / person). Department names are resolved against the database. |
+| `policy_chat.py` | Chat understanding of exclusion vs priority, import, export, publish, notify. Cue words in `config/policy_lexicon.json`. |
+| `exports.py` | Overview and Reports A-E from database records, to Excel and PDF. |
+| `notifications.py` | Publication gate + notification outbox (dry-run default, de-duplicated, honest delivery status). |
+
+Fairness: history now shifts a person's target only by a bounded share (`history_weight`, `history_adjust_cap`,
+`history_adjust_fraction` in `ExamSettings`); `history_weight=1, history_adjust_cap=1e9, history_adjust_fraction=None`
+restores the old raw behaviour. Lower tiers are used only for seats higher tiers cannot fill (`tier_penalty`).
+Weekly off-days are the `non_working_weekdays` setting (empty = every calendar day is an exam day).
+Migration v3 is additive; the database file should still be copied before upgrading.

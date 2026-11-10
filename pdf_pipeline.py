@@ -463,16 +463,34 @@ def find_faculty_pdf(directory=None):
     if explicit and os.path.isfile(explicit):
         return explicit
 
+    # Score EVERY candidate by how much real timetable it yields and take the best:
+    # a roster / duty-count PDF can "parse" without error as a 1-2 teacher timetable,
+    # so "first one that does not raise" is not a valid test.
+    best, best_score = None, 0
+
     for path in list_timetable_pdfs(directory):
 
         try:
             with open(path, "rb") as fh:
-                parse_faculty_pdf(fh.read())
-            return str(path)
+                parsed = parse_faculty_pdf(fh.read())
         except Exception:
             continue
 
-    return None
+        score = _timetable_score(parsed)
+
+        if score > best_score:
+            best, best_score = str(path), score
+
+    return best
+
+
+def _timetable_score(parsed) -> int:
+    """Number of (teacher, day, slot) entries in a parsed faculty timetable."""
+
+    try:
+        return sum(len(slots) for days in parsed.values() for slots in days.values())
+    except Exception:
+        return 0
 
 
 def example_questions(limit: int = 6) -> list:

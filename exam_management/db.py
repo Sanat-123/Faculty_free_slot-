@@ -193,10 +193,126 @@ CREATE TABLE IF NOT EXISTS exm_dept_override (
 );
 """
 
+
+_DDL_V3 = """
+-- identity: employee code is the preferred key; names may repeat
+ALTER TABLE exm_faculty ADD COLUMN employee_code TEXT;
+ALTER TABLE exm_faculty ADD COLUMN designation TEXT NOT NULL DEFAULT '';
+ALTER TABLE exm_faculty ADD COLUMN record_status TEXT NOT NULL DEFAULT 'verified';
+ALTER TABLE exm_faculty ADD COLUMN roster_serial INTEGER;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_faculty_code ON exm_faculty(employee_code) WHERE employee_code IS NOT NULL;
+
+-- history: a newer cumulative import SUPERSEDES an older one (never added twice, never deleted)
+ALTER TABLE exm_history ADD COLUMN status TEXT NOT NULL DEFAULT 'active';
+ALTER TABLE exm_history ADD COLUMN verification TEXT NOT NULL DEFAULT 'unverified';
+ALTER TABLE exm_history ADD COLUMN import_id INTEGER;
+
+-- every imported file, whatever it was called or wherever it lived
+CREATE TABLE IF NOT EXISTS exm_import_file (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    sha256      TEXT NOT NULL,
+    filename    TEXT NOT NULL,
+    file_kind   TEXT NOT NULL,
+    purpose     TEXT NOT NULL,
+    row_count   INTEGER NOT NULL DEFAULT 0,
+    status      TEXT NOT NULL DEFAULT 'imported'
+                CHECK (status IN ('imported','superseded','rolled_back')),
+    summary     TEXT NOT NULL DEFAULT '{}',
+    imported_by TEXT NOT NULL DEFAULT '',
+    imported_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_import_sha ON exm_import_file(sha256, purpose, status);
+
+-- rows an import could not place (never silently discarded)
+CREATE TABLE IF NOT EXISTS exm_import_issue (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_id INTEGER NOT NULL REFERENCES exm_import_file(id),
+    row_ref   TEXT NOT NULL DEFAULT '',
+    severity  TEXT NOT NULL DEFAULT 'warning',
+    message   TEXT NOT NULL,
+    raw       TEXT NOT NULL DEFAULT ''
+);
+
+-- other spellings of a person (timetable names -> roster person)
+CREATE TABLE IF NOT EXISTS exm_faculty_alias (
+    alias_norm TEXT PRIMARY KEY,
+    faculty_id INTEGER NOT NULL REFERENCES exm_faculty(id),
+    source     TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
+-- department-level exclusion: same scopes as a person's restriction, restored independently
+CREATE TABLE IF NOT EXISTS exm_dept_restriction (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    department  TEXT NOT NULL,
+    kind        TEXT NOT NULL CHECK (kind IN ('permanent','session','date','date_range','shift')),
+    session_id  INTEGER REFERENCES exm_session(id),
+    start_date  TEXT,
+    end_date    TEXT,
+    shift_label TEXT,
+    reason      TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','restored','superseded')),
+    created_by  TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL,
+    restored_at TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_deptr ON exm_dept_restriction(department, status);
+
+-- allocation priority tier (1 = first choice; larger = used only when lower numbers cannot fill)
+CREATE TABLE IF NOT EXISTS exm_priority_rule (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope       TEXT NOT NULL CHECK (scope IN ('department','designation','faculty')),
+    pattern     TEXT NOT NULL,
+    tier        INTEGER NOT NULL CHECK (tier >= 1),
+    session_id  INTEGER REFERENCES exm_session(id),
+    label       TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','removed')),
+    created_by  TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL
+);
+
+-- publication is a record ON TOP of an approved allocation (the allocation status CHECK is left untouched)
+CREATE TABLE IF NOT EXISTS exm_publication (
+    allocation_id INTEGER PRIMARY KEY REFERENCES exm_allocation(id),
+    published_by  TEXT NOT NULL DEFAULT '',
+    published_at  TEXT NOT NULL,
+    note          TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS exm_contact (
+    faculty_id INTEGER NOT NULL REFERENCES exm_faculty(id),
+    channel    TEXT NOT NULL,
+    address    TEXT NOT NULL,
+    verified   INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (faculty_id, channel)
+);
+
+CREATE TABLE IF NOT EXISTS exm_notification (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    allocation_id INTEGER NOT NULL REFERENCES exm_allocation(id),
+    faculty_id    INTEGER NOT NULL REFERENCES exm_faculty(id),
+    channel       TEXT NOT NULL,
+    kind          TEXT NOT NULL DEFAULT 'assignment',
+    address       TEXT NOT NULL DEFAULT '',
+    subject       TEXT NOT NULL DEFAULT '',
+    body          TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'queued'
+                  CHECK (status IN ('queued','dry_run','sent','delivered','failed','skipped','in_app')),
+    detail        TEXT NOT NULL DEFAULT '',
+    provider_ref  TEXT NOT NULL DEFAULT '',
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    UNIQUE (allocation_id, faculty_id, channel, kind)
+);
+"""
+
 # (version, description, ddl) - append only; never edit an applied entry
 MIGRATIONS: List[Tuple[int, str, str]] = [
     (1, "initial exam-management schema", _DDL_V1),
     (2, "coordinator department overrides (CS / non-CS style groups)", _DDL_V2),
+    (3, "college-wide roster: employee code, designation, imports, department exclusion, priority tiers", _DDL_V3),
 ]
 
 

@@ -335,7 +335,7 @@ def test_repeated_requests_never_create_duplicate_duties(world):
 def test_migration_is_safe_to_repeat(tmp_path):
     from exam_management import db
     c = db.connect(tmp_path / "m.db")
-    assert db.migrate(c) == [1, 2] and db.migrate(c) == []
+    assert db.migrate(c) == [1, 2, 3] and db.migrate(c) == []
     c.execute("INSERT INTO exm_faculty(name,norm,updated_at) VALUES ('A','a','now')")
     assert db.migrate(c) == [] and c.execute("SELECT COUNT(*) FROM exm_faculty").fetchone()[0] == 1
 

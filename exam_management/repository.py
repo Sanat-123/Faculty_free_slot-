@@ -52,14 +52,29 @@ class Repository:
 
         added = updated = 0
         seen = set()
+        # Once an authoritative (imported) roster exists, a timetable spelling of someone already on it is the SAME
+        # person (alias), and a name found nowhere on it is parked as "needs verification" - never double-counted.
+        authoritative = self.conn.execute("SELECT 1 FROM exm_faculty WHERE employee_code IS NOT NULL LIMIT 1").fetchone() is not None
+        aliases: Dict[str, int] = {}
+        titles: List[str] = []
+        if authoritative:
+            from .importer import load_columns, strip_titles
+            titles = load_columns().get("titles", [])
+            aliases = {r["alias_norm"]: r["faculty_id"] for r in self.conn.execute("SELECT * FROM exm_faculty_alias")}
         with transaction(self.conn):
             for name, dept in records:
                 name = " ".join(str(name).split())
                 if not name:
                     continue
                 seen.add(name)
-                row = self.conn.execute("SELECT id, department, active FROM exm_faculty WHERE name=?",
+                row = self.conn.execute("SELECT id, department, active, record_status FROM exm_faculty WHERE name=?",
                                         (name,)).fetchone()
+                if row is not None and row["record_status"] in ("needs_verification", "merged"):
+                    continue                                # parked / merged by the administrator: the sync never revives it
+                if row is None and authoritative:
+                    fid = aliases.get(strip_titles(name, titles))
+                    if fid is not None:
+                        continue                            # already on the roster under another spelling
                 if row is not None:
                     ov = self.conn.execute("SELECT department FROM exm_dept_override WHERE faculty_id=?",
                                            (row["id"],)).fetchone()
@@ -67,8 +82,9 @@ class Repository:
                         dept = ov["department"]          # the coordinator's label wins
                 if row is None:
                     self.conn.execute(
-                        "INSERT INTO exm_faculty(name,norm,department,active,source,updated_at) "
-                        "VALUES (?,?,?,?,?,?)", (name, norm_name(name), dept or "", 1, source, now()))
+                        "INSERT INTO exm_faculty(name,norm,department,active,source,updated_at,record_status) "
+                        "VALUES (?,?,?,?,?,?,?)", (name, norm_name(name), dept or "", 0 if authoritative else 1, source,
+                                                   now(), "needs_verification" if authoritative else "verified"))
                     added += 1
                 elif (row["department"] or "") != (dept or "") or not row["active"]:
                     self.conn.execute(
@@ -89,6 +105,10 @@ class Repository:
 
     def faculty(self, fid: int) -> Optional[Dict[str, Any]]:
         return _d(self.conn.execute("SELECT * FROM exm_faculty WHERE id=?", (fid,)).fetchone())
+
+    def faculty_by_code(self, code: str) -> Optional[Dict[str, Any]]:
+        return _d(self.conn.execute("SELECT * FROM exm_faculty WHERE employee_code=?",
+                                    (str(code).strip(),)).fetchone())
 
     def faculty_by_name(self, name: str) -> Optional[Dict[str, Any]]:
         return _d(self.conn.execute("SELECT * FROM exm_faculty WHERE name=?", (name,)).fetchone())
@@ -133,18 +153,25 @@ class Repository:
 
         unknown: List[str] = []
         with transaction(self.conn):
-            self.conn.execute("DELETE FROM exm_history WHERE source=?", (source,))
+            self.conn.execute("DELETE FROM exm_history WHERE source=? AND status='active'", (source,))
+            deferred = 0
             for name, value in counts.items():
                 row = self.faculty_by_name(name)
                 if row is None:
                     unknown.append(name)
                     continue
+                if not source.startswith("import:") and self.conn.execute(
+                        "SELECT 1 FROM exm_history WHERE faculty_id=? AND status='active' AND source LIKE 'import:%'",
+                        (row["id"],)).fetchone():
+                    deferred += 1          # an imported (file-verified) total exists: never add this sheet on top of it
+                    continue
                 self.conn.execute(
                     "INSERT INTO exm_history(faculty_id,duties,source,recorded_at) VALUES (?,?,?,?)",
                     (row["id"], float(value), source, now()))
             self.audit("import_history", "history", None,
-                       {"source": source, "rows": len(counts) - len(unknown), "unknown": unknown})
-        return {"imported": len(counts) - len(unknown), "unknown": unknown}
+                       {"source": source, "rows": len(counts) - len(unknown) - deferred, "unknown": unknown,
+                        "deferred_to_imported_total": deferred})
+        return {"imported": len(counts) - len(unknown) - deferred, "unknown": unknown, "deferred": deferred}
 
     def history_components(self, exclude_session_id: Optional[int] = None
                            ) -> Dict[int, Dict[str, float]]:
@@ -159,7 +186,8 @@ class Repository:
         def slot(fid):
             return out.setdefault(fid, {"baseline": 0.0, "completed": 0.0, "committed": 0.0})
 
-        for r in self.conn.execute("SELECT faculty_id, SUM(duties) t FROM exm_history GROUP BY faculty_id"):
+        for r in self.conn.execute("SELECT faculty_id, SUM(duties) t FROM exm_history "
+                                   "WHERE status='active' GROUP BY faculty_id"):
             slot(r["faculty_id"])["baseline"] = r["t"] or 0.0
         q = ("SELECT d.faculty_id, d.status, COUNT(*) c FROM exm_duty d "
              "JOIN exm_allocation a ON a.id=d.allocation_id "

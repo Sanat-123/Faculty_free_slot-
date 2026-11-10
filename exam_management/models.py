@@ -14,6 +14,7 @@ class FacultyInfo:
     department: str
     history: float = 0.0        # historical duties (baseline + completed)
     committed: float = 0.0      # approved duties of OTHER sessions not yet completed
+    tier: int = 1               # allocation priority tier (1 = first choice)
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,9 @@ class Problem:
     group_quota: Dict[int, Dict[str, int]] = field(default_factory=dict)  # slot -> group -> seats
     # overlapping slot pairs (same date, overlapping clock time) - derived
     overlaps: List[Tuple[int, int]] = field(default_factory=list)
+
+    def fixed_slots(self) -> Set[int]:
+        return {sl for _, sl in self.fixed}
 
     @property
     def total_required(self) -> int:

@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from .config import ExamSettings
 from .models import SlotInfo
 from .providers import NoTimetable, TimetableConflicts
+from .policy import PolicyService
 from .repository import Repository
 from .restrictions import RestrictionService, applies, describe_scope
 
@@ -143,6 +144,10 @@ class EligibilityEngine:
         for r in self.restrictions.active(session_id=session_id):
             restr.setdefault(r["faculty_id"], []).append(r)
 
+        dept_rules: Dict[str, List[Dict[str, Any]]] = {}
+        for r in PolicyService(self.repo).department_restrictions(session_id):
+            dept_rules.setdefault(r["department"].lower(), []).append(r)
+
         dates = sorted({s.exam_date for s in slots})
         other = {}
         for row in self.repo.other_session_duties(session_id, dates):
@@ -173,6 +178,11 @@ class EligibilityEngine:
                     why.append(Verdict(False, "department", "Department not included in this allocation"))
                 if exclude and dl in exclude:
                     why.append(Verdict(False, "department", "Department excluded from this allocation"))
+                for r in dept_rules.get(dl, []):
+                    if applies(r, session, s.exam_date, s.shift_label):
+                        why.append(Verdict(False, "department",
+                                           f"Department excluded: {r['reason'] or 'no reason recorded'} "
+                                           f"[{describe_scope(r, session)}]"))
                 for r in restr.get(fid, []):
                     if applies(r, session, s.exam_date, s.shift_label):
                         code = ("permanent" if r["kind"] == "permanent" else

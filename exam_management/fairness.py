@@ -74,7 +74,10 @@ def _proportional(weight: Mapping[int, float], cap: Mapping[int, float], demand:
 
 def compute_targets(faculty: Sequence[FacultyInfo], eligible: Mapping[int, Set[int]],
                     demand: int, max_duties: Optional[int], blend: float,
-                    scale: int = 10, min_duties: Optional[int] = None) -> Dict[int, int]:
+                    scale: int = 10, min_duties: Optional[int] = None,
+                    history_weight: float = 1.0, history_cap: Optional[float] = None,
+                    history_cap_fraction: Optional[float] = None,
+                    demand_cap_by_slot: Optional[float] = None) -> Dict[int, int]:
     """
     Fixed-point targets (value * scale) of NEW duties per faculty id.
 
@@ -89,7 +92,23 @@ def compute_targets(faculty: Sequence[FacultyInfo], eligible: Mapping[int, Set[i
         n = len(eligible.get(f.id, ()))
         cap[f.id] = float(min(n, max_duties) if max_duties is not None else n)
         base[f.id] = f.history + f.committed
+    # History is ONE input, not the master: only a bounded, damped part of a person's gap to the
+    # average (of people who can actually serve) moves their target.  weight=1 / no cap = raw water-fill.
+    live = [i for i in base if cap[i] > 0]
+    if live and (history_weight < 1.0 or history_cap is not None):
+        mean_h = sum(base[i] for i in live) / len(live)
+        cap_adj = history_cap
+        if history_cap_fraction is not None:                # relative bound: scales with the average workload
+            rel = history_cap_fraction * (demand / len(live))
+            cap_adj = rel if cap_adj is None else min(cap_adj, rel)
+        for i in live:
+            adj = history_weight * (base[i] - mean_h)
+            if cap_adj is not None:
+                adj = max(-cap_adj, min(cap_adj, adj))
+            base[i] = mean_h + adj
     capacity = sum(cap.values())
+    if demand_cap_by_slot is not None:
+        capacity = min(capacity, demand_cap_by_slot)
     d = float(min(demand, capacity))
     floor = {i: 0.0 for i in base}
     if min_duties:
