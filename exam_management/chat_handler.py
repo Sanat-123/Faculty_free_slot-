@@ -22,6 +22,8 @@ from .policy import PolicyError
 from .policy_chat import PolicyChat
 from .service import ExamError, ExamService, MissingInformation, SessionSpec
 
+_WANT_VERBS = re.compile(r"\b(?:need|needs|want|wants|require\w*|plan\w*|organi[sz]\w*|set\s*up|create|make|put|book|fix|conduct\w*|manage|do|give)\b")
+_QUERY_LEAD = re.compile(r"^\W*(?:please\s+)?(?:can\s+you\s+|could\s+you\s+)?(?:show|list|display|view|tell|what|which|who|whom|whose|how|why|when|where|is|are|does|do|did|report|summari[sz]e|compare|explain|count|find|check)\b")
 _EXAM_WORDS = re.compile(r"\b(?:exam\w*|invigilat\w*|duty|duties)\b", re.I)
 _ALLOC_VERBS = re.compile(r"\b(?:allocat\w*|assign\w*|schedul\w*|prepar\w*|arrang\w*|distribut\w*|generat\w*|"
                           r"plan|roster|organi[sz]e)\b", re.I)
@@ -212,13 +214,40 @@ class ExamManagementHandler:
         return None
 
     # --------------------------------------------------------------- recognisers
-    def _is_allocation_request(self, text: str, low: str) -> bool:
-        if not (_ALLOC_VERBS.search(low) and _EXAM_WORDS.search(low)):
+    def _college_roster_loaded(self) -> bool:
+        """True once a faculty roster has been IMPORTED: from then on the college-wide engine is authoritative."""
+        try:
+            return self.repo.conn.execute(
+                "SELECT 1 FROM exm_faculty WHERE source LIKE 'import:%' AND active=1 LIMIT 1").fetchone() is not None
+        except Exception:
             return False
+
+    def _is_allocation_request(self, text: str, low: str) -> bool:
+        if not _EXAM_WORDS.search(low):
+            return False
+        if _QUERY_LEAD.match(low):                 # a question or a "show me ..." is never a request to allocate
+            return False
+        if not _ALLOC_VERBS.search(low):
+            # "I need exam duty on 20 and 21 Nov, 9 to 11, 12 halls": softer wording counts only when the message
+            # also carries real schedule details (at least three of: dates, times, rooms, invigilators per room)
+            if not _WANT_VERBS.search(low):
+                return False
+            r = nlu.parse_exam_request(text, self.today(), self._year(), self.settings.default_year_window_days)
+            details = sum(bool(x) for x in (r.explicit_dates or r.start, r.shifts, r.room_count or r.rooms, r.per_room))
+            if details < 3:
+                return False
+        if self._college_roster_loaded():
+            # The older planner only knows the timetable's teachers, so with a college roster every allocation
+            # request is handled here (college-wide) - unless it NAMES particular teachers (older named flow).
+            try:
+                named = [m for m in self._resolver().mentions(text)[0] if len(re.sub(r"[^A-Za-z]", "", m.text)) >= 3]
+                return not named                    # a stray one-letter token ("I need ...") is not a name
+            except Exception:
+                return True
         req = nlu.parse_exam_request(text, self.today(), self._year(), self.settings.default_year_window_days)
         multi_day = bool(req.n_days and req.n_days > 1) or bool(req.start and req.end and req.end > req.start) \
             or len(req.explicit_dates) > 1
-        # single-day requests stay with the existing exam-duty flow
+        # without a roster, single-day requests stay with the existing exam-duty flow
         return multi_day or bool(re.search(r"\b(?:examination|exam)\s+(?:period|session)\b|\bcollege[- ]wide\b", low))
 
     # ----------------------------------------------------------- new / continued

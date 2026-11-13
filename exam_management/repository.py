@@ -97,7 +97,28 @@ class Repository:
                     if r["name"] not in seen:
                         self.conn.execute("UPDATE exm_faculty SET active=0, updated_at=? WHERE id=?",
                                           (now(), r["id"]))
-        return {"added": added, "updated": updated}
+            parked = self.park_unlisted() if authoritative else []
+        return {"added": added, "updated": updated, "parked": len(parked)}
+
+    def park_unlisted(self) -> List[Dict[str, Any]]:
+        """
+        Once a faculty roster has been IMPORTED it is the authority: anyone active who is not on it
+        (a timetable-only name, an old record) is PARKED - made ineligible and flagged "needs verification".
+        Nothing is deleted, history is kept, and the administrator can accept a person (accept_unlisted)
+        or link a spelling variant to a roster person (confirm_alias).  Call inside a transaction.
+        """
+
+        if not self.conn.execute("SELECT 1 FROM exm_faculty WHERE source LIKE 'import:%' LIMIT 1").fetchone():
+            return []
+        rows = [dict(r) for r in self.conn.execute(
+            "SELECT id,name,department FROM exm_faculty WHERE active=1 AND source NOT LIKE 'import:%' "
+            "AND record_status NOT IN ('accepted','merged')")]
+        for r in rows:
+            self.conn.execute("UPDATE exm_faculty SET active=0, record_status='needs_verification', updated_at=? WHERE id=?",
+                              (now(), r["id"]))
+        if rows:
+            self.audit("parked_unlisted", "faculty", None, {"count": len(rows), "names": [r["name"] for r in rows][:60]})
+        return rows
 
     def faculty_all(self, active_only: bool = True) -> List[Dict[str, Any]]:
         q = "SELECT * FROM exm_faculty" + (" WHERE active=1" if active_only else "") + " ORDER BY name"

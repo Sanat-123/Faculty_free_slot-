@@ -9,6 +9,7 @@ headline.  Nothing is dropped silently.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -160,11 +161,38 @@ class EligibilityEngine:
         busy_cache: Dict[Tuple[int, str, str], Set[int]] = {}
         check_timetable = session["classes_suspended"] == 0
 
+        # A timetable spells a name its own way ("Dr. X"): resolve it by exact name first, then by the name
+        # without titles, then through an administrator-confirmed alias.  When a spelling fits more than one
+        # active person, ALL of them count as busy - never risk assigning someone who may be teaching.
+        from .importer import load_columns, strip_titles
+        titles = load_columns().get("titles", [])
+        plain = lambda n: strip_titles(re.sub(r"\s*\((?:EC|unverified)[^)]*\)", "", n), titles)
+        active_ids = {f["id"] for f in faculty if f["active"]}
+        by_key: Dict[str, Set[int]] = {}
+        for f in faculty:
+            if f["active"]:
+                by_key.setdefault(plain(f["name"]), set()).add(f["id"])
+        confirmed = {r["alias_norm"]: r["faculty_id"] for r in self.repo.conn.execute(
+            "SELECT alias_norm, faculty_id FROM exm_faculty_alias WHERE source LIKE 'confirmed%'")}
+
+        def ids_for(name: str) -> Set[int]:
+            exact = by_name.get(name)
+            if exact in active_ids:
+                return {exact}
+            key = plain(name)
+            found = set(by_key.get(key, ()))
+            if key in confirmed and confirmed[key] in active_ids:
+                found.add(confirmed[key])
+            return found
+
         def busy_ids(slot: SlotInfo) -> Set[int]:
             key = (slot.exam_date.weekday(), slot.start, slot.end)
             if key not in busy_cache:
                 names = self.timetable.busy(slot.exam_date, slot.start, slot.end)
-                busy_cache[key] = {by_name[n] for n in names if n in by_name}
+                out: Set[int] = set()
+                for n in names:
+                    out |= ids_for(n)
+                busy_cache[key] = out
             return busy_cache[key]
 
         for f in faculty:

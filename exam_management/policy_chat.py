@@ -134,6 +134,12 @@ class PolicyChat:
             return "scan"
         if has.get("import") and re.search(r"\.(?:" + "|".join(e.lstrip(".") for e in SUPPORTED) + r")\b", low):
             return "import"
+        if has.get("accept_unlisted"):
+            return "accept_unlisted"
+        if has.get("link_names") and (has.get("unverified") or re.search(r"\bsame\b|\blink\b|\bmerge\b", low)) and not has.get("exclude"):
+            return "link_names"
+        if has.get("unverified") and (has.get("show") or not has.get("exclude")):
+            return "unverified"
         if has.get("reject"):
             return "reject"
         if has.get("publish"):
@@ -179,6 +185,12 @@ class PolicyChat:
             return self._show_priority(sess)
         if intent == "export":
             return self._export(low, sess)
+        if intent == "unverified":
+            return self._unverified()
+        if intent == "link_names":
+            return self._link_names(text)
+        if intent == "accept_unlisted":
+            return self._accept_unlisted(text)
         if intent in ("publish", "reject", "notify"):
             return self._workflow(intent, text, low, sess)
         if intent == "overview":
@@ -372,6 +384,92 @@ class PolicyChat:
             ns.dispatch(aid, dry_run=False, confirmed=True))}
         return base + f"\nSend {dry['would_send']} real message(s) now? Reply **confirm** or **cancel**."
 
+    # ----------------------------------------------- names not on the imported roster
+    def _titles(self) -> List[str]:
+        from .importer import load_columns
+        return load_columns().get("titles", [])
+
+    def _clean_name(self, text: str) -> str:
+        from .importer import strip_titles
+        return strip_titles(re.sub(r"[\"'`.]", " ", text), self._titles())
+
+    def _best(self, phrase: str, pool: List[Dict[str, Any]]):
+        """(match, ambiguous_candidates): the single best name in `pool`, or the close rivals when unsure."""
+        from rapidfuzz import fuzz, process
+        from .importer import strip_titles
+        key = self._clean_name(phrase)
+        if not key:
+            return None, []
+        labels = {i: strip_titles(re.sub(r"\s*\((?:EC|unverified)[^)]*\)", "", p["name"]), self._titles()) for i, p in enumerate(pool)}
+        scored = sorted(((max(fuzz.token_sort_ratio(key, v), fuzz.token_set_ratio(key, v) - 8), i) for i, v in labels.items()), reverse=True)
+        scored = [(sc, i) for sc, i in scored if sc >= 80][:4]
+        if not scored:
+            return None, []
+        if len(scored) == 1 or scored[0][0] - scored[1][0] >= 6 or scored[0][0] >= 99:
+            return pool[scored[0][1]], []
+        return None, [pool[i] for _, i in scored]
+
+    def _unverified(self) -> str:
+        imp = self.h.svc.importer
+        parked = imp.unverified()
+        if not parked:
+            return "Nobody is waiting for verification: every active name is on the imported roster."
+        roster = [f for f in self.h.repo.faculty_all() if f.get("record_status") not in ("needs_verification", "merged")]
+        rows = []
+        for p in parked:
+            match, _ = self._best(p["name"], roster)
+            rows.append([p["name"], p["department"] or "—", match["name"] if match else "no close match on the roster"])
+        return ("**Names that are NOT on the imported roster** (set aside: they get no duties until you decide; nothing was deleted)\n"
+                + md_table(["Name from the timetable", "Department", "Closest roster name"], rows) +
+                "\n- Same person spelled differently? Say *link <timetable name> to <roster name>*.\n"
+                "- A real, eligible person who is missing from the roster? Say *accept <name>*.")
+
+    def _split_link(self, text: str):
+        for pat in (r"\b(?:link|merge|match|connect)\s+(.+?)\s+(?:to|with|and|into)\s+(.+)$",
+                    r"^(.+?)\s+(?:is|are)\s+(?:the\s+)?same(?:\s+person)?\s+as\s+(.+)$"):
+            m = re.search(pat, text.strip().rstrip(".?!"), re.I)
+            if m:
+                return m.group(1).strip(), m.group(2).strip()
+        return None
+
+    def _link_names(self, text: str) -> str:
+        parts = self._split_link(text)
+        if not parts:
+            return "Tell me both names, e.g. *link <timetable name> to <roster name>*."
+        left, right = parts
+        imp = self.h.svc.importer
+        parked = imp.unverified()
+        roster = [f for f in self.h.repo.faculty_all() if f.get("record_status") not in ("needs_verification", "merged")]
+        a, amb_a = self._best(left, parked)
+        b, amb_b = self._best(right, roster)
+        for who, amb in ((left, amb_a), (right, amb_b)):
+            if amb:
+                return f"'{who}' could be " + " or ".join(f"{c['name']}" for c in amb) + ". Which one? Nothing was changed."
+        if not a:
+            return f"'{left}' is not in the list of unverified names. Say *show unverified faculty* to see them."
+        if not b:
+            return f"I could not find '{right}' on the roster. Say *show unverified faculty* for the closest names."
+        self.h.pending_confirm = {"kind": "callback", "run": lambda: (
+            lambda r: f"Linked: '{a['name']}' is now treated as {b['name']}. Their timetable classes now count as teaching "
+                      f"clashes for {b['name']}." if r["status"] == "linked" else "Could not link them.")(
+            imp.confirm_alias(a["id"], b["id"]))}
+        return (f"Treat the timetable name **{a['name']}** as the roster person **{b['name']}** "
+                f"({b['department'] or 'no department listed'})? Reply **confirm** or **cancel**.")
+
+    def _accept_unlisted(self, text: str) -> str:
+        who = re.sub(r"^\W*(?:please\s+)?accept\s+", "", text.strip(), flags=re.I).rstrip(".?!")
+        who = re.sub(r"\s+(?:as\s+(?:eligible|a\s+faculty.*)|for\s+(?:exam|duty).*)$", "", who, flags=re.I)
+        imp = self.h.svc.importer
+        a, amb = self._best(who, imp.unverified())
+        if amb:
+            return f"'{who}' could be " + " or ".join(c["name"] for c in amb) + ". Which one? Nothing was changed."
+        if not a:
+            return None  # not one of the parked names: leave 'accept ...' to the other handlers
+        self.h.pending_confirm = {"kind": "callback", "run": lambda: (
+            imp.accept_unlisted(a["id"]) and f"{a['name']} is accepted as eligible for examination duty.")}
+        return (f"Accept **{a['name']}** as a real, eligible faculty member even though they are not on the imported roster? "
+                f"Reply **confirm** or **cancel**.")
+
     def _export(self, low: str, sess) -> str:
         alloc = self.h._latest_alloc() if sess else None
         if not alloc:
@@ -471,7 +569,9 @@ class PolicyChat:
         if "roster" in res:
             r = res["roster"]
             parts.append(f"Faculty: {r['added']} new, {r['updated']} updated, {r['unchanged']} unchanged; "
-                         f"{r['not_in_this_file']} existing record(s) are not in this file (kept, not deleted).")
+                         f"{r['not_in_this_file']} earlier roster record(s) are not in this file (kept, not deleted)."
+                         + (f" {r['parked_not_on_roster']} name(s) that are not on the roster were set aside (not deleted)."
+                            if r.get("parked_not_on_roster") else ""))
         if "history" in res:
             h = res["history"]
             parts.append(f"Historical duties: {h['applied']} applied ({h['total_duties']:g} in total), "

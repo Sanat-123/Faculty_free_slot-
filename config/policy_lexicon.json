@@ -21,7 +21,10 @@
     "publish": "\\bpublish\\w*",
     "notify": "\\b(?:send|dispatch|issue|trigger)\\b.{0,40}\\b(?:notifications?|e-?mails?|messages?|intimations?|alerts?)\\b|\\bnotify\\b",
     "reject": "\\breject\\w*",
-    "go_live": "\\bsend\\s+(?:them\\s+)?for\\s+real\\b|\\bgo\\s+live\\b|\\bconfirm\\w*\\s+(?:and\\s+)?send\\b"
+    "go_live": "\\bsend\\s+(?:them\\s+)?for\\s+real\\b|\\bgo\\s+live\\b|\\bconfirm\\w*\\s+(?:and\\s+)?send\\b",
+    "unverified": "\\b(?:unverified|unlisted|parked|set\\s+aside|needs?\\s+verification|awaiting\\s+verification|not\\s+(?:on|in)\\s+the\\s+(?:roster|list|pdf)|missing\\s+from\\s+the\\s+(?:roster|list))\\b",
+    "link_names": "\\b(?:link|merge|match|connect)\\b.+?\\b(?:to|with|and|into)\\b|\\b(?:is|are)\\s+(?:the\\s+)?same\\s+(?:person\\s+)?as\\b|\\bsame\\s+person\\b",
+    "accept_unlisted": "^\\W*(?:please\\s+)?accept\\b"
   },
   "department_words": [
     "department",

@@ -381,10 +381,16 @@ class Importer:
             for i in issues:
                 self.conn.execute("INSERT INTO exm_import_issue(import_id,row_ref,severity,message,raw) VALUES (?,?,?,?,?)",
                                   (iid, i.get("ref", ""), i.get("severity", "warning"), i["message"], i.get("raw", "")))
-            self.conn.execute("UPDATE exm_import_file SET summary=? WHERE id=?",
-                              (json.dumps(summary, default=str, ensure_ascii=False), iid))
+            nothing = purpose == "duty_counts" and summary["history"]["applied"] == 0
+            self.conn.execute("UPDATE exm_import_file SET summary=?, status=? WHERE id=?",
+                              (json.dumps(summary, default=str, ensure_ascii=False),
+                               "rolled_back" if nothing else "imported", iid))
             self.repo.audit("import_file", "import", iid, {"file": probe.filename, "purpose": purpose,
-                                                           "rows": probe.row_count}, actor=self.actor)
+                                                           "rows": probe.row_count, "applied_nothing": nothing}, actor=self.actor)
+        if nothing:                               # not recorded as imported, so uploading it again later is NOT a duplicate
+            return {"status": "nothing_applied", "import_id": iid, "issues": len(issues), **summary,
+                    "message": f"None of the {summary['history']['not_applied']} duty counts could be matched to a faculty "
+                               f"member - load the faculty roster first, then upload this file again."}
         return {"status": "imported", "import_id": iid, "issues": len(issues), **summary}
 
     # --------------------------------------------------------------- roster
@@ -450,24 +456,27 @@ class Importer:
                     self.conn.execute(
                         "UPDATE exm_faculty SET department=COALESCE(NULLIF(?, ''),department), "
                         "designation=COALESCE(NULLIF(?, ''),designation), employee_code=COALESCE(?,employee_code), "
-                        "active=1, record_status=?, roster_serial=?, updated_at=? WHERE id=?",
-                        (new_dept, desig, code, status, serial, now(), fid))
+                        "active=1, record_status=?, roster_serial=?, source=?, updated_at=? WHERE id=?",
+                        (new_dept, desig, code, status, serial, f"import:{iid}", now(), fid))
                     changed.append({"faculty_id": fid, "name": row["name"], "changes": diffs})
                     self.repo.audit("faculty_changed", "faculty", fid, {"import": iid, "changes": diffs}, actor=self.actor)
                 else:
-                    self.conn.execute("UPDATE exm_faculty SET roster_serial=? WHERE id=?", (serial, fid))
+                    self.conn.execute("UPDATE exm_faculty SET roster_serial=?, source=? WHERE id=?", (serial, f"import:{iid}", fid))
                     unchanged += 1
             seen_ids.add(fid)
             alias = strip_titles(name, titles)
             if alias:
                 self.conn.execute("INSERT OR IGNORE INTO exm_faculty_alias(alias_norm,faculty_id,source,created_at) "
                                   "VALUES (?,?,?,?)", (alias, fid, f"import:{iid}", now()))
-        # people already in the database but absent from this file: REPORTED, never deleted or deactivated
+        # people already in the database but absent from this file: REPORTED, never deleted.  Roster-imported people
+        # missing from a NEWER file stay as they are; people who were never on any imported roster are PARKED.
         missing = [dict(x) for x in self.conn.execute(
-            "SELECT id,name,department,employee_code FROM exm_faculty WHERE active=1")
+            "SELECT id,name,department,employee_code FROM exm_faculty WHERE active=1 AND source LIKE 'import:%'")
             if x["id"] not in seen_ids]
+        parked = self.repo.park_unlisted()
         return {"added": len(added), "updated": len(changed), "unchanged": unchanged,
                 "linked_existing_records": linked, "not_in_this_file": len(missing),
+                "parked_not_on_roster": len(parked), "parked_sample": [r["name"] for r in parked[:10]],
                 "not_in_this_file_sample": missing[:10], "changes": changed[:50]}
 
     # --------------------------------------------------------- duty counts
@@ -612,7 +621,7 @@ class Importer:
     def accept_unlisted(self, faculty_id: int) -> Dict[str, Any]:
         """The administrator confirms an unlisted person is real and eligible."""
         with transaction(self.conn):
-            self.conn.execute("UPDATE exm_faculty SET active=1, record_status='verified' WHERE id=? AND record_status='needs_verification'",
+            self.conn.execute("UPDATE exm_faculty SET active=1, record_status='accepted' WHERE id=? AND record_status='needs_verification'",
                               (faculty_id,))
             self.repo.audit("unlisted_accepted", "faculty", faculty_id, {}, actor=self.actor)
         return {"status": "accepted"}

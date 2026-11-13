@@ -625,6 +625,41 @@ def build_combined_dataset(uploaded_files):
 
     if not all_records:
 
+        # Roster / duty-count files are not timetables.  When such a file WAS imported
+        # successfully, start with an EMPTY timetable so the exam-duty chatbot (which works
+        # from the faculty database) still runs; timetable questions simply find nothing.
+        college_imported = any(
+            report.get("success") and report.get("purpose")
+            for report in file_reports
+        )
+
+        if college_imported:
+
+            matcher = CanonicalEventMatcher([])
+
+            matcher.match()
+
+            engine = QueryEngine(matcher)
+
+            nlp = NaturalLanguageQuery(engine)
+
+            return {
+                "success": True,
+                "records": [],
+                "matcher": matcher,
+                "engine": engine,
+                "nlp": nlp,
+                "warnings": [
+                    "No timetable was uploaded, so timetable questions "
+                    "(who is free, who teaches what) have nothing to "
+                    "search yet. Exam-duty allocation works from the "
+                    "imported faculty roster; with no timetable, nobody "
+                    "is treated as busy teaching. Upload a timetable "
+                    "to include teaching conflicts."
+                ],
+                "file_reports": file_reports,
+            }
+
         return {
             "success": False,
             "message": (

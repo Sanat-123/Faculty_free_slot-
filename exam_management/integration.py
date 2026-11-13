@@ -25,7 +25,7 @@ def build_exam_management(model_getter: Callable, branch_getter: Callable,
         except Exception:
             buffer = 0
         settings = ExamSettings()
-        path = db_path or state_file(ExamSettings().db_filename)
+        path = db_path or os.environ.get("EXAM_MGMT_DB_PATH") or state_file(ExamSettings().db_filename)
         svc = ExamService(
             path,
             directory=ProjectDirectory(model_getter, branch_getter, real_faculty_getter),
@@ -93,7 +93,10 @@ def import_college_uploads(uploaded_files, db_path: Any = None) -> dict:
             if "roster" in res:
                 r = res["roster"]
                 parts.append(f"{r['added']} faculty added, {r['updated']} updated, {r['unchanged']} unchanged "
-                             f"({r['not_in_this_file']} existing records not in this file were kept)")
+                             f"({r['not_in_this_file']} earlier roster records not in this file were kept)")
+                if r.get("parked_not_on_roster"):
+                    parts.append(f"{r['parked_not_on_roster']} other name(s) (e.g. from a timetable) are NOT on this roster and were "
+                                 f"set aside, not deleted, until you accept them")
             if "history" in res:
                 h = res["history"]
                 parts.append(f"duty counts applied to {h['applied']} faculty ({h['total_duties']:g} duties)"

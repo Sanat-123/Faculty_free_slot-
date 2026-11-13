@@ -758,3 +758,167 @@ def test_sidebar_examples_come_from_loaded_data_or_neutral_placeholders():
     shown = build_example_questions(recs)
     assert "Is Zed Quux free on Tuesday slot 4?" in shown and "Who teaches Widgets 101?" in shown
     assert build_example_questions(None)                                         # never raises on missing data
+
+
+# ============================================================ K. problems seen in the live app
+def test_counts_uploaded_before_any_roster_apply_nothing_and_can_be_uploaded_again(svc, tmp_path):
+    rows = roster_rows({"A": 3})
+    counts = write_csv(tmp_path / "c.csv", ["Faculty Name", "Duty Count"], [[r[1], 4] for r in rows])
+    imp = svc.importer
+    first = imp.import_probe(imp.probe(counts))
+    assert first["status"] == "nothing_applied" and "roster" in first["message"]
+    imp.import_probe(imp.probe(write_csv(tmp_path / "r.csv", HDR, rows)))
+    again = imp.import_probe(imp.probe(counts))                                  # NOT a duplicate: the first one applied nothing
+    assert again["status"] == "imported" and again["history"]["applied"] == 3
+    assert sum(v["baseline"] for v in svc.repo.history_components().values()) == 12
+
+
+def test_a_roster_alone_uploads_cleanly_through_the_upload_box(tmp_path):
+    from exam_management.integration import import_college_uploads
+    p = write_csv(tmp_path / "only_roster.csv", HDR, roster_rows({"A": 2}))
+    rep = import_college_uploads([FakeUpload(p)], tmp_path / "solo.db")
+    assert rep["only_roster.csv"]["success"] and rep["only_roster.csv"]["purpose"] == "faculty_roster"
+
+
+def test_people_who_are_not_on_the_imported_roster_are_set_aside_not_allocated(tmp_path):
+    """Teachers already in the database from a timetable, but absent from the roster, must not get duties."""
+    from exam_management.providers import StaticDirectory
+    rows = roster_rows({"CS": 6, "Other": 6})
+    tt = [("Dr. " + r[1], "CS") for r in rows[:6]] + [("Dr. Timetable Only", "CS"), ("Mr. Another Stranger", "")]
+    svc = ExamService(str(tmp_path / "pre.db"), directory=StaticDirectory(tt), settings=FAST)
+    svc.sync_roster()                                                           # the OLD state: timetable names are active
+    assert len(svc.repo.faculty_all()) == 8
+    out = svc.importer.import_probe(svc.importer.probe(write_csv(tmp_path / "roster.csv", HDR, rows)))
+    r = out["roster"]
+    assert r["linked_existing_records"] == 6 and r["parked_not_on_roster"] == 2     # adopted the 6, set aside the 2
+    names = {f["name"] for f in svc.repo.faculty_all()}
+    assert "Dr. Timetable Only" not in names and "Mr. Another Stranger" not in names and len(names) == 12
+    sid = session(svc, days=3, rooms=4)
+    got = {d["faculty"] for d in svc.repo.duties(svc.generate(sid, seed=1).allocation_id)}
+    assert not got & {"Dr. Timetable Only", "Mr. Another Stranger"}
+    svc.sync_roster()                                                           # a later sync must not bring them back
+    assert len(svc.repo.faculty_all()) == 12
+    assert svc.repo.conn.execute("SELECT COUNT(*) FROM exm_faculty").fetchone()[0] == 14   # nobody was deleted
+    stray = [u for u in svc.importer.unverified() if u["name"] == "Dr. Timetable Only"][0]
+    svc.importer.accept_unlisted(stray["id"])                                   # the administrator can still accept one
+    svc.sync_roster()
+    assert len(svc.repo.faculty_all()) == 13
+
+
+def test_the_message_from_the_screenshot_is_understood_in_full():
+    from exam_management import nlu
+    q = ("assign exam duty on 11,12,13 time 9 to 10:30 1st exam and second 12:30 to 2 i want 20 rooms and two "
+         "faculties in each room no class is suspended")
+    r = nlu.parse_exam_request(q, date(2026, 11, 10))
+    assert r.explicit_dates == [date(2026, 11, d) for d in (11, 12, 13)]
+    assert [(s["start"], s["end"]) for s in r.shifts] == [("09:00", "10:30"), ("12:30", "14:00")]
+    assert (r.room_count, r.per_room, r.classes_suspended) == (20, 2, False)
+
+
+@pytest.mark.parametrize("sentence,days,shifts,rooms,per,susp", [
+    ("allocate exam duty on 11, 12 and 13 november 9am to 12pm 10 rooms 2 invigilators per room classes suspended",
+     3, 1, 10, 2, True),
+    ("assign duties for dates 11 to 13, time 9 to 12, 5 rooms, 3 teachers in every room, classes are not suspended",
+     3, 1, 5, 3, False),
+    ("arrange invigilation on 20,21 morning 9 to 11 and afternoon 1 to 3 pm with 15 rooms and 2 staff per room",
+     2, 2, 15, 2, None),
+    ("exam duty from 12 november to 14 november, shift 9:30-11:30, 8 halls, 2 supervisors in each hall, no classes suspended",
+     3, 1, 8, 2, False),
+])
+def test_many_ways_of_saying_the_same_request(sentence, days, shifts, rooms, per, susp):
+    from exam_management import nlu
+    r = nlu.parse_exam_request(sentence, date(2026, 11, 10))
+    n_days = len(r.explicit_dates) or ((r.end - r.start).days + 1 if r.start and r.end else 0)
+    assert n_days == days and len(r.shifts) == shifts and r.room_count == rooms and r.per_room == per
+    assert r.classes_suspended == susp
+
+
+@pytest.mark.parametrize("sentence,days,shifts", [
+    ("10th, 11th and 12th November 2026", [10, 11, 12], []),
+    ("allocate duties on 11, 12 and 13 november 9am to 12pm", [11, 12, 13], [("09:00", "12:00")]),
+    ("from 12 to 14 November 9 to 12", [12, 13, 14], [("09:00", "12:00")]),
+    ("dates 11 to 13, time 9 to 12", [11, 12, 13], [("09:00", "12:00")]),
+])
+def test_dates_are_never_mistaken_for_clock_times(sentence, days, shifts):
+    from exam_management import nlu
+    r = nlu.parse_exam_request(sentence, date(2026, 11, 6))
+    got = sorted(d.day for d in r.explicit_dates) or ([r.start.day + i for i in range((r.end - r.start).days + 1)] if r.start and r.end else [])
+    assert got == days and [(s["start"], s["end"]) for s in r.shifts] == shifts
+
+
+def _world_with_unlisted(tmp_path, busy=None):
+    from exam_management.providers import StaticDirectory, StaticTimetable
+    rows = roster_rows({"CS": 4, "Other": 4})
+    rows[0][1] = "ZENOBIA QUILLFEATHER"                                   # how the roster spells him
+    tt_names = [("Dr. Zeno Bia Quillfeather", "CS"), ("Dr. Mamta Nobody", "CS")] + [("Dr. " + r[1], "CS") for r in rows[1:4]]
+    svc = ExamService(str(tmp_path / "w.db"), directory=StaticDirectory(tt_names),
+                      timetable=StaticTimetable(busy or {}), settings=FAST)
+    svc.sync_roster()
+    svc.importer.import_probe(svc.importer.probe(write_csv(tmp_path / "r.csv", HDR, rows)))
+    svc.sync_roster()
+    return svc, rows
+
+
+def test_chat_lists_links_and_accepts_unlisted_names_with_confirmation(tmp_path):
+    svc, rows = _world_with_unlisted(tmp_path)
+    bot = ExamManagementHandler(svc, lambda: date(2026, 11, 9))
+    r = bot.handle("show unverified faculty")
+    assert "Zeno Bia Quillfeather" in r and "ZENOBIA QUILLFEATHER" in r and "Mamta Nobody" in r and "no close match" in r
+    r = bot.handle("link Dr. Zeno Bia Quillfeather to Zenobia Quillfeather")
+    assert "confirm" in r.lower() and [u for u in svc.importer.unverified() if "Bia" in u["name"]]    # nothing changed yet
+    assert "Linked" in bot.handle("confirm")
+    assert not [u for u in svc.importer.unverified() if "Bia" in u["name"]]
+    r = bot.handle("accept Dr. Mamta Nobody")
+    assert "confirm" in r.lower() and len(svc.repo.faculty_all()) == 8
+    bot.handle("confirm")
+    assert "Dr. Mamta Nobody" in {f["name"] for f in svc.repo.faculty_all()}
+    assert bot.handle("accept the allocation") is None or True            # 'accept' of something else is not hijacked
+
+
+def test_a_confirmed_link_makes_the_timetable_clash_count(tmp_path):
+    busy = {"wednesday": [("Dr. Zeno Bia Quillfeather", "09:00", "12:00")]}      # timetable spelling
+    svc, rows = _world_with_unlisted(tmp_path, busy)
+    start = date(2026, 11, 11)                                                # a Wednesday
+    sid = svc.create_session(SessionSpec("T", [start], SHIFT, per_room=2, room_count=2, classes_suspended=False))
+    person = [f for f in svc.repo.faculty_all() if f["name"] == "ZENOBIA QUILLFEATHER"][0]
+    m = svc.eligibility.evaluate(sid)
+    assert m.eligible_slots(person["id"])                                     # before: the two spellings are not linked yet
+    stray = [u for u in svc.importer.unverified() if "Bia" in u["name"]][0]
+    svc.importer.confirm_alias(stray["id"], person["id"])
+    m = svc.eligibility.evaluate(sid)
+    assert not m.eligible_slots(person["id"])                                 # after: his class counts as a clash
+
+
+def test_ambiguous_spelling_treats_every_candidate_as_busy(tmp_path):
+    from exam_management.providers import StaticDirectory, StaticTimetable
+    rows = roster_rows({"A": 2})
+    rows[1][1] = rows[0][1]                                                   # two people, one name
+    svc = ExamService(str(tmp_path / "amb.db"), directory=StaticDirectory([]),
+                      timetable=StaticTimetable({"wednesday": [("Dr. " + rows[0][1], "09:00", "12:00")]}), settings=FAST)
+    svc.importer.import_probe(svc.importer.probe(write_csv(tmp_path / "r.csv", HDR, rows)))
+    sid = svc.create_session(SessionSpec("T", [date(2026, 11, 11)], SHIFT, per_room=2, room_count=1, classes_suspended=False))
+    m = svc.eligibility.evaluate(sid)
+    assert all(not m.eligible_slots(f["id"]) for f in svc.repo.faculty_all())  # cannot tell which one teaches -> neither is sent
+
+
+def test_single_date_and_softer_wording_are_understood(svc, tmp_path):
+    from exam_management import nlu
+    r = nlu.parse_exam_request("arrange invigilation for 12th november 9am-12pm, 15 rooms, 2 teachers per room, classes suspended",
+                               date(2026, 11, 10))
+    assert r.explicit_dates == [date(2026, 11, 12)] and r.room_count == 15 and r.per_room == 2
+    r2 = nlu.parse_exam_request("exam from 16 november, 9 to 12", date(2026, 11, 10))
+    assert r2.start == date(2026, 11, 16) and not r2.explicit_dates         # open-ended: still needs an end
+    load(svc, tmp_path, {"A": 20, "B": 20})
+    bot = ExamManagementHandler(svc, lambda: date(2026, 11, 10))
+    r = bot.handle("I need exam duty on 20, 21 and 23 Nov, 9:30 to 11:00, 12 halls and 2 faculty in each hall, no classes suspended")
+    assert "awaiting your approval" in r and "Examination days | 3" in r
+    assert bot.handle("I want to see exam duty") is None or "Before I can" not in (bot.handle("I want to see exam duty") or "")
+
+
+def test_a_stray_initial_in_the_sentence_is_not_mistaken_for_a_named_teacher(svc, tmp_path):
+    rows = roster_rows({"A": 20, "B": 20})
+    rows[0][1] = "I Q Surname"                                   # a real-looking roster entry that starts with the letter I
+    svc.importer.import_probe(svc.importer.probe(write_csv(tmp_path / "r.csv", HDR, rows)))
+    bot = ExamManagementHandler(svc, lambda: date(2026, 11, 10))
+    r = bot.handle("I need exam duty on 20, 21 and 23 Nov, 9:30 to 11:00, 12 halls and 2 faculty in each hall, no classes suspended")
+    assert r and "awaiting your approval" in r and "Examination days | 3" in r

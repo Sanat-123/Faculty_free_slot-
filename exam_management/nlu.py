@@ -91,6 +91,16 @@ class DateParser:
             if d1 and d2 and d1 <= d2:
                 out.append(DateHit(m.start(), m.end(), d1, d2, True))
                 taken.append((m.start(), m.end()))
+        # 1b) "10th, 11th and 12th November 2026": several days sharing ONE month written after the last
+        for m in re.finditer(rf"\b((?:\d{{1,2}}){_ORD}(?:\s*(?:,|and|&)\s*(?:\d{{1,2}}){_ORD})+)\s+(?:of\s+)?({_MON})\b\.?(?:,?\s*(\d{{4}}))?", low):
+            if not free(m.start(), m.end()):
+                continue
+            y = int(m.group(3)) if m.group(3) else None
+            days = [self._make(int(n), MONTHS[m.group(2)], y) for n in re.findall(r"\d{1,2}", m.group(1))]
+            if all(days):
+                for d in days:
+                    singles.append((m.start(), m.end(), d))
+                taken.append((m.start(), m.end()))
         # 2) ISO, "12 November 2026", "November 12", dd/mm/yyyy
         pats = [
             (rf"\b(\d{{4}})-(\d{{2}})-(\d{{2}})\b", lambda g: (int(g[2]), int(g[1]), int(g[0]))),
@@ -131,6 +141,58 @@ class DateParser:
             out.append(DateHit(a, b, d1, d1, False, open_end))
             i += 1
         return sorted(out, key=lambda h: h.start)
+
+
+_DAYNUM = r"\d{1,2}(?:st|nd|rd|th)?"
+_BARE_LIST = re.compile(
+    rf"\b(?:on|dates?|dated|from|for|during|between|the)\s+((?:{_DAYNUM})(?:\s*(?:,|and|&|{_SEP})\s*(?:{_DAYNUM}))+)"
+    rf"(?![\d:.]|\s*(?:am|pm|a\.m|p\.m|rooms?|halls?|invigilators?|faculty|faculties|teachers?|staff|days?|dut(?:y|ies)|shifts?|members?|hours?|{_MON})\b)")
+
+
+def bare_day_hits(parser: "DateParser", text: str, blocked: Sequence[Tuple[int, int]] = ()) -> List[DateHit]:
+    """
+    Days written WITHOUT a month - "on 11,12,13", "dates 11 to 13" - placed in the current month
+    (next month when the day has already passed).  Numbers that belong to a clock range are ignored.
+    """
+
+    low = text.lower()
+    out: List[DateHit] = []
+    for m in _BARE_LIST.finditer(low):
+        a, b = m.start(1), m.end(1)
+        explicit = low[max(0, a - 12):a].strip().split()[-1:] in (["date"], ["dates"], ["dated"])
+        if not explicit and any(not (b <= s0 or a >= e0) for s0, e0 in blocked):
+            continue                                  # "9 to 12" is a clock range unless the word "dates" says otherwise
+        body = m.group(1)
+        nums = [int(x) for x in re.findall(r"\d{1,2}", body)]
+        if not nums or any(not 1 <= n <= 31 for n in nums):
+            continue
+        is_range = bool(re.search(rf"\d\s*(?:{_SEP})\s*\d", body)) and len(nums) == 2 and not re.search(r",|\band\b|&", body)
+        month, year, prev, days = parser.today.month, parser.year_hint or parser.today.year, 0, []
+        for n in nums:
+            d = None
+            for _ in range(2):                       # a day that does not exist in the month rolls to the next one
+                try:
+                    d = date(year, month, n)
+                    break
+                except ValueError:
+                    month, year = (1, year + 1) if month == 12 else (month + 1, year)
+            if d is None:
+                break
+            if not days and (parser.today - d).days > 0 and parser.year_hint is None:
+                month, year = (1, year + 1) if month == 12 else (month + 1, year)       # already past -> next month
+                d = date(year, month, n)
+            elif days and n < prev:
+                month, year = (1, year + 1) if month == 12 else (month + 1, year)
+                d = date(year, month, n)
+            prev = n
+            days.append(d)
+        if len(days) != len(nums):
+            continue
+        if is_range and days[0] <= days[1]:
+            out.append(DateHit(a, b, days[0], days[1], True))
+        else:
+            out += [DateHit(a, b, d, d, False) for d in days]
+    return out
 
 
 # ===========================================================================
@@ -276,6 +338,8 @@ def parse_times(text: str) -> List[Tuple[int, int, int, int]]:
                 s += 12 * 60
             if 1 <= h2 <= 7:
                 e += 12 * 60
+        if e <= s and not mer2 and 1 <= h2 <= 12 and e + 12 * 60 > s:
+            e += 12 * 60                         # "12:30 to 2" -> 12:30-14:00
         if e <= s:
             continue
         out.append((s, e, m.start(), m.end()))
@@ -374,6 +438,10 @@ def parse_exam_request(text: str, today: date, year_hint: Optional[int] = None,
     req = ExamRequest()
     dp = DateParser(today, year_hint, window_days)
     hits = dp.find(text)
+    bare_spans: List[Tuple[int, int]] = []
+    if not hits:                                      # "on 11,12,13" (no month): this month, or the next one
+        hits = bare_day_hits(dp, text, [(a, b) for _, _, a, b in parse_times(text)])
+        bare_spans = [(h.start, h.end) for h in hits]
 
     # skipped / holiday dates: "except 15 November", "excluding 15 Nov (holiday)"
     skip_spans = []
@@ -394,7 +462,10 @@ def parse_exam_request(text: str, today: date, year_hint: Optional[int] = None,
         if starting:
             req.start = starting[0].first
         elif len(singles) == 1:
-            req.start = singles[0]
+            if main[0].open_ended:                      # "from 16 November": needs an end date or a number of days
+                req.start = singles[0]
+            else:                                       # "on 12th November": a one-day examination
+                req.explicit_dates = [singles[0]]
         elif len(singles) > 1:
             req.explicit_dates = sorted(set(singles))
     dm = re.search(r"\b(\d{1,2}|" + "|".join(NUMWORDS) + r")[\s-]*days?\b", low)
@@ -403,8 +474,11 @@ def parse_exam_request(text: str, today: date, year_hint: Optional[int] = None,
     if re.search(r"including\s+(?:all\s+)?(?:sundays|weekends|holidays)|include\s+sundays|all\s+7\s+days", low):
         req.include_weekdays = True
 
-    # shifts (clock ranges)
-    req.shifts = parse_shifts(text)
+    # shifts (clock ranges) - the days of a month-less date list are not clock times
+    shift_text = text
+    for a, b in bare_spans + [(h.start, h.end) for h in hits]:      # text read as a DATE is never a clock time
+        shift_text = shift_text[:a] + " " * (b - a) + shift_text[b:]
+    req.shifts = parse_shifts(shift_text)
 
     # rooms
     rm = re.search(r"\b(\d{1,3}|" + "|".join(NUMWORDS) + r")\s+(?:[a-z]+\s+)?(?:rooms?|halls?|venues?|classrooms?)\b", low)
@@ -416,13 +490,16 @@ def parse_exam_request(text: str, today: date, year_hint: Optional[int] = None,
         req.room_count = None
 
     # invigilators per room
-    pm = re.search(r"\b(\d{1,2}|" + "|".join(NUMWORDS) + r")\s+(?:invigilators?|faculty|teachers?|staff|supervisors?|members?)\s+"
-                   r"(?:per|in\s+each|for\s+each|every|in\s+every|a|each)\s+(?:room|hall)", low)
+    _who = r"(?:invigilators?|invigilation\s+staff|faculty|faculties|teachers?|staff|supervisors?|members?|persons?|people|examiners?)"
+    pm = re.search(r"\b(\d{1,2}|" + "|".join(NUMWORDS) + r")\s+" + _who + r"\s+"
+                   r"(?:per|in\s+each|for\s+each|every|in\s+every|a|each|in\s+one|in\s+a)\s+(?:room|hall)", low)
+    if not pm:                                   # "2 in each room", "two per room"
+        pm = re.search(r"\b(\d{1,2}|" + "|".join(NUMWORDS) + r")\s+(?:in|per|for)\s+(?:each|every|one)\s+(?:room|hall)\b", low)
     if not pm:
-        pm = re.search(r"(?:invigilators?|faculty|teachers?)\s+(?:per|in\s+each)\s+(?:room|hall)\s*(?:is|are|:|=|of)?\s*(\d{1,2}|" +
+        pm = re.search(r"(?:invigilators?|faculty|faculties|teachers?)\s+(?:per|in\s+each)\s+(?:room|hall)\s*(?:is|are|:|=|of)?\s*(\d{1,2}|" +
                        "|".join(NUMWORDS) + r")\b", low)
     if not pm:                                   # "with two invigilators each", "2 invigilators per room"
-        pm = re.search(r"\b(\d{1,2}|" + "|".join(NUMWORDS) + r")\s+(?:invigilators?|supervisors?)\s*(?:each|apiece|per\s+(?:room|hall))\b", low)
+        pm = re.search(r"\b(\d{1,2}|" + "|".join(NUMWORDS) + r")\s+(?:invigilators?|supervisors?|faculty|faculties|teachers?)\s*(?:each|apiece|per\s+(?:room|hall))\b", low)
     if pm:
         req.per_room = _n(pm.group(1))
 
@@ -449,11 +526,15 @@ def parse_exam_request(text: str, today: date, year_hint: Optional[int] = None,
         req.max_duties = _n(mx.group(1))
 
     # classes suspended?
-    if re.search(r"(?:classes|lectures|teaching)\s+(?:are\s+|is\s+|will\s+(?:be\s+)?|remain\s+|stay\s+|have\s+been\s+)?"
+    _cls = r"(?:regular\s+)?(?:class(?:es)?|lectures?|teaching)"
+    if re.search(rf"(?:no|none\s+of\s+the|not\s+any)\s+{_cls}\s+(?:is\s+|are\s+|will\s+be\s+|has\s+been\s+|have\s+been\s+|gets?\s+)?"
+                 r"(?:being\s+)?(?:suspended|cancel\w+|off|stopped|closed)", low) or \
+            re.search(rf"{_cls}\s+(?:is\s+|are\s+|will\s+be\s+)?(?:not|never)\s+(?:being\s+)?(?:suspended|cancel\w+|stopped|closed)", low) or \
+            re.search(r"(?:classes|lectures|teaching)\s+(?:are\s+|is\s+|will\s+(?:be\s+)?|remain\s+|stay\s+|have\s+been\s+)?"
                  r"(?:not\s+suspended|continu\w+|running|going\s+on|as\s+usual|held|normal)", low) or \
             re.search(r"(?:no|without)\s+(?:class\s+)?suspension", low) or re.search(r"not\s+suspended", low):
         req.classes_suspended = False
-    elif re.search(r"(?:classes|lectures|teaching)\s+(?:are\s+|is\s+|will\s+(?:be\s+)?|remain\s+|stay\s+|have\s+been\s+)?"
+    elif re.search(r"(?:class(?:es)?|lectures?|teaching)\s+(?:are\s+|is\s+|will\s+(?:be\s+)?|remain\s+|stay\s+|have\s+been\s+)?"
                    r"(?:suspended|cancel\w+|off|stopped|closed|not\s+held)|"
                    r"(?:suspend\w*|cancel\w*|stop\w*)\s+(?:all\s+|the\s+)?(?:regular\s+)?(?:classes|lectures)|"
                    r"no\s+(?:regular\s+)?(?:classes|lectures)|regular\s+classes\s+(?:are\s+)?(?:off|suspended)", low):
