@@ -222,6 +222,19 @@ class ExamManagementHandler:
         except Exception:
             return False
 
+    def _parse_req(self, text: str, year: Any = "default") -> ExamRequest:
+        """parse_exam_request + the department scope ("only CS faculties") read against the roster's departments."""
+        yr = self._year() if year == "default" else year
+        req = nlu.parse_exam_request(text, self.today(), yr, self.settings.default_year_window_days,
+                                     self.settings.shift_label_template)
+        try:
+            inc, exc, _ = self.policy_chat.scope_departments(text)
+        except Exception:
+            inc, exc = [], []
+        req.dept_include = list(dict.fromkeys(req.dept_include + inc))
+        req.dept_exclude = list(dict.fromkeys(req.dept_exclude + exc))
+        return req
+
     def _is_allocation_request(self, text: str, low: str) -> bool:
         if not _EXAM_WORDS.search(low):
             return False
@@ -252,13 +265,13 @@ class ExamManagementHandler:
 
     # ----------------------------------------------------------- new / continued
     def _new_request(self, text: str, low: str) -> str:
-        req = nlu.parse_exam_request(text, self.today(), self._year(), self.settings.default_year_window_days)
+        req = self._parse_req(text)
         self.draft = req
         return self._advance(text)
 
     def _continue_request(self, text: str, low: str) -> Optional[str]:
         assert self.draft is not None
-        new = nlu.parse_exam_request(text, self.today(), None, self.settings.default_year_window_days)
+        new = self._parse_req(text, None)
         before = self.draft.__dict__.copy()
         self.draft.merge(new)
         # a bare answer to a single outstanding question
@@ -346,7 +359,9 @@ class ExamManagementHandler:
         outcome = self.svc.generate(sid, seed=int(seed.group(1)) if seed else None)
         sess = self.repo.session(sid)
         if sess["options"].get("rooms_generated"):
-            notes.append("You gave a room count, so rooms are labelled Room 1..N. Name them (e.g. 'rooms A101, A102 ...') in a new request if you want real names.")
+            tpl = self.settings.room_label_template
+            notes.append(f"You gave a room count, so rooms are labelled {tpl.format(n=1)}..{tpl.format(n='N')}. "
+                         f"Give real room names in a new request if you want them (list the room names in your request).")
         return self._present(outcome, notes + applied, first=True)
 
     def _known_lines(self, req: ExamRequest) -> str:
@@ -402,28 +417,34 @@ class ExamManagementHandler:
         parts = []
         if outcome.status == "infeasible":
             parts.append("**No valid allocation exists under the current constraints.**")
-        parts.append(self.rep.render_summary(aid))
+        parts.append(self.rep.render_headline(aid))
+        parts.append("**At a glance**\n" + self.rep._summary_table(aid))
         a = self.repo.allocation(aid)
         f = (a["quality"] or {}).get("fairness") or {}
         if f:
-            parts.append(f"Fairness: new duties per eligible faculty avg {f['avg_new']} (min {f['min_new']}, max {f['max_new']}); "
-                         f"{f['zero_duty_eligible']} eligible with no duty; {f['consecutive_pairs']} consecutive-day pair(s); "
-                         f"combined-workload spread (std) {f['workload_std']}.")
+            parts.append(f"⚖️ **Fairness** - new duties per eligible faculty: avg {f['avg_new']} (min {f['min_new']}, max {f['max_new']}) · "
+                         f"{f['zero_duty_eligible']} eligible with no duty · {f['consecutive_pairs']} consecutive-day pair(s) · "
+                         f"combined-workload spread (std) {f['workload_std']}")
+        try:
+            note = self.rep.history_note(aid)
+        except Exception:
+            note = ""
+        if note:
+            parts.append(note)
         if self.repo.unfilled(aid):
             parts.append("**Unfilled seats**\n" + self.rep.render_unfilled(aid) + "\n\n" + self._suggestions(aid))
-        else:
-            first_day = self.repo.duties(aid)
-            if first_day:
-                d0 = date.fromisoformat(first_day[0]["exam_date"])
-                parts.append(f"**Preview - {fmt_date(d0)}**\n" + self.rep.render_day_wise(aid, d0, limit_rows=10))
+        if self.repo.duties(aid):
+            parts.append("---\n## 🗓️ Day-wise duty chart\n" + self.rep.render_schedule(aid, max_rows=self.settings.chat_schedule_max_rows))
         below = (a["quality"] or {}).get("below_minimum")
         if below:
             parts.append(f"Minimum-duty shortfall for {len(below)} faculty (eligibility/maximum limits prevent more without artificial duties).")
         parts += [n for n in notes if n]
         if a["status"] == "draft":
-            parts.append("This is a **draft awaiting approval**. You can say: *approve*, *generate another allocation*, "
-                         "*exclude Dr. X on 12 November*, *remove Dr. X from 13 November*, *show full report*, "
-                         "*show department-wise distribution*, or *why did X receive more duties than Y*.")
+            first_day = date.fromisoformat(self.repo.session(a["session_id"])["start_date"])     # examples use YOUR dates
+            day = f"{first_day.day} {first_day:%B}"
+            parts.append("---\nThis is a **draft awaiting approval**. You can say: *approve*, *generate another allocation*, "
+                         f"*generate the PDF*, *exclude <a faculty name> on {day}*, *show duties on {day}*, "
+                         "*show department-wise distribution*, or *why did <name> receive more duties than <name>*.")
         return "\n\n".join(parts)
 
     def _suggestions(self, aid: int) -> str:
@@ -748,7 +769,7 @@ class ExamManagementHandler:
         sess = self._session()
         if self._is_question(low):
             return None
-        req = nlu.parse_exam_request(text, self.today(), self._year())
+        req = nlu.parse_exam_request(text, self.today(), self._year(), shift_label=self.settings.shift_label_template)
         changes: Dict[str, Any] = {}
         if req.max_duties is not None and re.search(r"\bmax", low):
             changes["max_duties"] = req.max_duties
@@ -841,7 +862,7 @@ class ExamManagementHandler:
                                             [[fmt_date(d["exam_date"]), d["shift"], d["room"], d["seat"]] for d in rows])
         if re.search(r"\b(?:show|display|view|preview|list)\b.{0,30}\b(?:allocation|roster|duties|schedule|rooms?)\b", low) or \
                 (on and re.search(r"\ballocation|\bduties|\bschedule", low)):
-            body = self.rep.render_day_wise(aid, on) if on else self.rep.render_summary(aid) + "\n\n" + self.rep.render_day_wise(aid, limit_rows=12)
+            body = self.rep.render_schedule(aid, on) if on else self.rep.render_headline(aid) + "\n\n" + self.rep.render_schedule(aid, max_rows=self.settings.chat_schedule_max_rows)
             return body
         if re.search(r"\bsummary|\bstatus\b", low) and re.search(r"\b(?:exam\w*|allocation)\b", low):
             return self.rep.render_summary(aid)
