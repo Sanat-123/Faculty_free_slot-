@@ -24,17 +24,26 @@
     "go_live": "\\bsend\\s+(?:them\\s+)?for\\s+real\\b|\\bgo\\s+live\\b|\\bconfirm\\w*\\s+(?:and\\s+)?send\\b",
     "unverified": "\\b(?:unverified|unlisted|parked|set\\s+aside|needs?\\s+verification|awaiting\\s+verification|not\\s+(?:on|in)\\s+the\\s+(?:roster|list|pdf)|missing\\s+from\\s+the\\s+(?:roster|list))\\b",
     "link_names": "\\b(?:link|merge|match|connect)\\b.+?\\b(?:to|with|and|into)\\b|\\b(?:is|are)\\s+(?:the\\s+)?same\\s+(?:person\\s+)?as\\b|\\bsame\\s+person\\b",
-    "accept_unlisted": "^\\W*(?:please\\s+)?accept\\b"
+    "accept_unlisted": "^\\W*(?:please\\s+)?accept\\b",
+    "scope_only_before": "\\b(?:only|just|solely|exclusively|merely|limited\\s+to|restricted?\\s+to|restrict\\s+(?:it\\s+)?to|from\\s+only|choose\\s+only|pick\\s+only|nobody\\s+but|no\\s+one\\s+but)\\b",
+    "scope_only_after": "^\\W*(?:(?:faculty|faculties|teachers?|staff|members?|department|dept|branch)\\W+){0,2}(?:only|alone|exclusively)\\b",
+    "scope_not_before": "\\b(?:except|excluding|exclude|without|not\\s+from|other\\s+than|apart\\s+from|besides|but\\s+not|leave\\s+out|skip|avoid|no)\\b"
   },
   "department_words": [
-    "department",
-    "dept",
-    "faculty",
-    "teachers",
-    "teacher",
-    "staff",
     "branch",
-    "members"
+    "branches",
+    "department",
+    "departments",
+    "dept",
+    "depts",
+    "faculties",
+    "faculty",
+    "lecturers",
+    "members",
+    "professors",
+    "staff",
+    "teacher",
+    "teachers"
   ],
   "not_department_words": [],
   "stop_words": [

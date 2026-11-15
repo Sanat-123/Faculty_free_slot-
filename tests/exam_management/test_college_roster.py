@@ -922,3 +922,113 @@ def test_a_stray_initial_in_the_sentence_is_not_mistaken_for_a_named_teacher(svc
     bot = ExamManagementHandler(svc, lambda: date(2026, 11, 10))
     r = bot.handle("I need exam duty on 20, 21 and 23 Nov, 9:30 to 11:00, 12 halls and 2 faculty in each hall, no classes suspended")
     assert r and "awaiting your approval" in r and "Examination days | 3" in r
+
+
+# ============================================================ L. "only CS faculties", times, and the clean layout
+DEPTS3 = {"COMPUTER SCIENCE AND ENGG.": 14, "INFORMATION TECHNOLOGY": 14, "DEPT. OF MANAGEMENT STUDIES": 6}
+
+
+@pytest.fixture
+def bot3(svc, tmp_path):
+    load(svc, tmp_path, DEPTS3)
+    return ExamManagementHandler(svc, lambda: date(2026, 11, 10))
+
+
+@pytest.mark.parametrize("sentence,include,exclude", [
+    ("i want two faculties in each room and i only want cs faculties", ["COMPUTER SCIENCE AND ENGG."], []),
+    ("only CS and IT", ["COMPUTER SCIENCE AND ENGG.", "INFORMATION TECHNOLOGY"], []),
+    ("cs faculty only please", ["COMPUTER SCIENCE AND ENGG."], []),
+    ("just the computer science department", ["COMPUTER SCIENCE AND ENGG."], []),
+    ("use all branches except management", [], ["DEPT. OF MANAGEMENT STUDIES"]),
+    ("i want it only for cs faculties", ["COMPUTER SCIENCE AND ENGG."], []),          # lowercase 'it' is a pronoun
+    ("allocate duties to everyone", [], []),
+])
+def test_department_scope_is_read_from_ordinary_wording(bot3, sentence, include, exclude):
+    inc, exc, amb = bot3.policy_chat.scope_departments(sentence)
+    assert (inc, exc) == (include, exclude) and not amb
+
+
+def test_only_cs_request_uses_only_that_department_across_two_messages(bot3):
+    r1 = bot3.handle("assign exam duty on 14,15,16 on two slots 9 to 10:30 and 1 to 2:30 i want two faculties in each room "
+                     "and 3 rooms are required i only want cs faculties")
+    assert "regular classes are suspended" in r1.lower()                          # asks only for what is missing
+    r2 = bot3.handle("no regular classes are suspended")
+    sid = bot3.svc.repo.conn.execute("SELECT id FROM exm_session").fetchone()[0]
+    duties = bot3.svc.repo.duties(bot3.repo.conn.execute("SELECT id FROM exm_allocation").fetchone()[0])
+    assert {d["department"] for d in duties} == {"COMPUTER SCIENCE AND ENGG."} and len(duties) == 3 * 3 * 2 * 2
+    assert {(d["start_time"], d["end_time"]) for d in duties} == {("09:00", "10:30"), ("13:00", "14:30")}   # 1 to 2:30 = afternoon
+    assert bot3.svc.repo.session(sid)["classes_suspended"] == 0
+    assert "Computer Science and Engg. only" in r2
+
+
+def test_schedule_is_one_heading_per_date_and_one_table_per_time_slot(bot3):
+    bot3.handle("allocate exam duty on 14,15 on two slots 9 to 10:30 and 1 to 2:30, 3 rooms, 2 invigilators per room, "
+                "classes are suspended")
+    r = bot3.handle("show duties on 14 november") + "\n" + bot3.handle("show duties on 15 november")
+    assert r.count("### 📅") == 2
+    assert r.count("**🕘 Shift 1") == 2 and r.count("**🕐 Shift 2") == 2                 # clock icon follows the start hour
+    assert "09:00 – 10:30" in r and "13:00 – 14:30" in r
+    first = bot3.handle("generate another allocation")
+    assert first.count("| Room |") == 4 and "more rows" not in first                   # 2 dates x 2 slots, nothing truncated
+    assert "Department" in first                                                      # several departments -> column shown
+
+
+def test_department_column_is_dropped_when_everyone_is_from_one_department(bot3):
+    r = bot3.handle("allocate exam duty on 14 and 15, 9 to 12, 3 rooms, 2 invigilators per room, classes suspended, only cs faculties")
+    assert "| Room | Invigilator 1 | Invigilator 2 |" in r and "Department" not in r.split("Day-wise duty chart")[1]
+
+
+def test_names_are_shown_in_normal_capitalisation():
+    from exam_management.reports import pretty
+    assert pretty("DHARMENDRA HARIYANI") == "Dharmendra Hariyani"
+    assert pretty("DEPT. OF MANAGEMENT STUDIES") == "Dept. of Management Studies"
+    assert pretty("COMPUTER SCIENCE AND ENGG.") == "Computer Science and Engg."
+    assert pretty("Mr. Nikhil Sharma") == "Mr. Nikhil Sharma" and pretty("CS") == "CS" and pretty(None) == "—"
+
+
+def test_allocation_works_and_says_so_when_no_duty_counts_exist(bot3):
+    r = bot3.handle("allocate exam duty on 14 and 15, 9 to 12, 3 rooms, 2 invigilators per room, classes suspended")
+    assert "Complete - every seat filled" in r and "No earlier duty counts are loaded" in r
+    assert bot3.svc.repo.conn.execute("SELECT COUNT(*) FROM exm_history").fetchone()[0] == 0     # nothing was invented
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("9 to 10:30 and 1 to 2:30", [("09:00", "10:30"), ("13:00", "14:30")]),
+    ("9:30 to 11:00", [("09:30", "11:00")]),
+    ("12:30 to 2", [("12:30", "14:00")]),
+    ("10 to 1", [("10:00", "13:00")]),
+    ("9am to 12pm", [("09:00", "12:00")]),
+])
+def test_clock_times_without_am_pm_are_read_as_office_hours(text, expected):
+    from exam_management import nlu
+    assert [(nlu.hhmm(a), nlu.hhmm(b)) for a, b, _, _ in nlu.parse_times(text)] == expected
+
+
+@pytest.mark.skipif(not (_REAL.get("faculty_roster")), reason="no real data folder to audit against")
+def test_no_department_abbreviation_from_the_real_data_is_a_quoted_literal_in_the_code():
+    """'CS', 'ECE' ... are derived from the roster's department names at run time, never typed into the code."""
+    import re
+    from exam_management.policy import DepartmentResolver
+    c = db.connect(":memory:")
+    db.migrate(c)
+    imp = Importer(Repository(c))
+    depts = {r["department"] for r in imp.probe(REAL_ROSTER).records() if r["department"]}
+    short = {k.upper() for k in DepartmentResolver(sorted(depts)).alias_map if 2 <= len(k) <= 4 and k.isalpha()}
+    scanned = [p for p in (ROOT / "exam_management").glob("*.py")] + list((ROOT / "config").glob("*.json")) + [ROOT / "app.py"]
+    hits = []
+    for p in scanned:
+        text = p.read_text(encoding="utf-8", errors="ignore")
+        hits += [(p.name, a) for a in short if re.search(rf"""["']{a}["']""", text)]       # upper-case quoted token only
+    assert hits == [], f"department abbreviations written into the code: {hits[:6]}"
+
+
+def test_default_room_and_shift_names_are_settings_not_literals(svc, tmp_path):
+    from exam_management import nlu
+    svc.repo.set_setting("room_label_template", "Hall {n}")
+    svc.repo.set_setting("shift_label_template", "Slot {n}")
+    svc.reload_settings()
+    load(svc, tmp_path, {"A": 12, "B": 12})
+    bot = ExamManagementHandler(svc, lambda: date(2026, 11, 10))
+    r = bot.handle("allocate exam duty on 14 and 15 from 9 to 10:30 and 1 to 2:30, 3 rooms, 2 invigilators per room, classes suspended")
+    assert "Slot 1" in r and "Slot 2" in r and "Hall 1" in r and "Shift 1" not in r and "Room 1" not in r
+    assert nlu.parse_shifts("9 to 10", "Block {n}")[0]["label"] == "Block 1"

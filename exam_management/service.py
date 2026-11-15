@@ -159,7 +159,7 @@ class ExamService:
         labels = [s["label"].lower() for s in spec.shifts]
         if len(set(labels)) != len(labels):
             raise ExamError("two shifts have the same name")
-        rooms = list(spec.rooms) if spec.rooms else [f"Room {i + 1}" for i in range(spec.room_count or 0)]
+        rooms = list(spec.rooms) if spec.rooms else [self.settings.room_label_template.format(n=i + 1) for i in range(spec.room_count or 0)]
         options = dict(spec.options)
         if not spec.rooms:
             options["rooms_generated"] = True

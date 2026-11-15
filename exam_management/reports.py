@@ -5,6 +5,7 @@ Reports and explanations.  Everything is computed from stored records
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from datetime import date
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -29,6 +30,36 @@ def fmt_date(d: Any) -> str:
     if isinstance(d, str):
         d = date.fromisoformat(d)
     return d.strftime("%d %b %Y")
+
+
+_SMALL_WORDS = {"and", "of", "the", "for", "in", "at", "to"}
+_CLOCKS = "🕛🕐🕑🕒🕓🕔🕕🕖🕗🕘🕙🕚"
+
+
+def pretty(text: Any) -> str:
+    """Display form of a name / department: the roster often shouts in CAPITALS."""
+    t = " ".join(str(text or "").split())
+    if not t or t == "—":
+        return "—"
+    if len(t) <= 3 or not (t.isupper() or t.islower()):
+        return t
+    words = []
+    for i, w in enumerate(t.title().split(" ")):
+        words.append(w.lower() if i and w.lower() in _SMALL_WORDS else w)
+    return " ".join(words)
+
+
+def clock_emoji(hhmm: str) -> str:
+    try:
+        return _CLOCKS[int(str(hhmm)[:2]) % 12]
+    except Exception:
+        return "🕘"
+
+
+def weekday_date(d: Any) -> str:
+    if isinstance(d, str):
+        d = date.fromisoformat(d)
+    return f"{d:%A}, {d.day} {d:%B %Y}"
 
 
 def num(x: float) -> str:
@@ -92,33 +123,80 @@ class Reporter:
                 "partially_restricted": sum(1 for r in rows if 0 < r["eligible_slots"] < len(slots)),
                 "assigned_faculty": sum(1 for r in rows if r["new"] > 0)}
 
-    def render_summary(self, aid: int) -> str:
+    def _summary_table(self, aid: int) -> str:
         s = self.summary(aid)
-        se, a = s["session"], s["allocation"]
+        se = s["session"]
+        return md_table(["Item", "Value"], [
+            ["Examination period", f"{fmt_date(se['start_date'])} to {fmt_date(se['end_date'])}"],
+            ["Examination days", s["days"]],
+            ["Shifts per day", s["shifts"]],
+            ["Rooms", s["rooms"]],
+            ["Invigilators per room", s["per_room"]],
+            ["Total duty seats", s["total_slots"]],
+            ["Seats filled / unfilled", f"{s['filled']} / {s['unfilled']}"],
+            ["Eligible faculty", s["eligible_faculty"]],
+            ["Fully excluded faculty", s["excluded_faculty"]],
+            ["Partly restricted faculty", s["partially_restricted"]],
+            ["Faculty assigned", s["assigned_faculty"]],
+            *([["Duty split between groups", describe(normalise_spec(se["options"]["group_split"]))]]
+              if (se["options"] or {}).get("group_split") else []),
+            ["Regular classes suspended", {1: "yes", 0: "no"}.get(se["classes_suspended"], "not stated")],
+        ])
+
+    def _state_feas(self, aid: int):
+        s = self.summary(aid)
+        a = s["allocation"]
         state = {"draft": "awaiting your approval", "approved": "APPROVED", "superseded": "superseded",
                  "cancelled": "cancelled", "completed": "completed"}[a["status"]]
         feas = {"complete": "complete - every seat filled",
                 "partial": f"PARTIAL - {s['unfilled']} seat(s) could not be filled",
                 "infeasible": "NOT FEASIBLE under the current constraints"}[a["feasibility"]]
-        lines = [
-            f"**{se['name']}** - allocation version {a['version']} ({state}); {feas}",
-            md_table(["Item", "Value"], [
-                ["Examination period", f"{fmt_date(se['start_date'])} to {fmt_date(se['end_date'])}"],
-                ["Examination days", s["days"]],
-                ["Shifts per day", s["shifts"]],
-                ["Rooms", s["rooms"]],
-                ["Invigilators per room", s["per_room"]],
-                ["Total duty seats", s["total_slots"]],
-                ["Seats filled / unfilled", f"{s['filled']} / {s['unfilled']}"],
-                ["Eligible faculty", s["eligible_faculty"]],
-                ["Fully excluded faculty", s["excluded_faculty"]],
-                ["Partly restricted faculty", s["partially_restricted"]],
-                ["Faculty assigned", s["assigned_faculty"]],
-                *([["Duty split between groups", describe(normalise_spec(se["options"]["group_split"]))]]
-                  if (se["options"] or {}).get("group_split") else []),
-                ["Regular classes suspended", {1: "yes", 0: "no"}.get(se["classes_suspended"], "not stated")],
-            ])]
-        return "\n\n".join(lines)
+        return s, state, feas
+
+    def render_summary(self, aid: int) -> str:
+        s, state, feas = self._state_feas(aid)
+        se, a = s["session"], s["allocation"]
+        return "\n\n".join([f"**{se['name']}** - allocation version {a['version']} ({state}); {feas}",
+                             self._summary_table(aid)])
+
+    def render_headline(self, aid: int) -> str:
+        """Title + one line of context, written for a person to scan."""
+        s, state, feas = self._state_feas(aid)
+        se, a = s["session"], s["allocation"]
+        icon = {"complete": "✅", "partial": "⚠️", "infeasible": "❌"}[a["feasibility"]]
+        d0, d1 = date.fromisoformat(se["start_date"]), date.fromisoformat(se["end_date"])
+        span = f"{d0.day} {d0:%b}" if d0 == d1 else (f"{d0.day} – {d1.day} {d1:%b %Y}" if d0.month == d1.month
+                                                      else f"{d0.day} {d0:%b} – {d1.day} {d1:%b %Y}")
+        if d0 == d1:
+            span += f" {d0.year}"
+        shifts = {(d["start_time"], d["end_time"]) for d in self.repo.duties(aid)}
+        cls = {1: "suspended", 0: "running as usual"}.get(se["classes_suspended"], "not stated")
+        dep = ((se["options"] or {}).get("departments") or {})
+        pool = []
+        if dep.get("include"):
+            pool.append(" + ".join(pretty(x) for x in dep["include"]) + " only")
+        if dep.get("exclude"):
+            pool.append("excluding " + ", ".join(pretty(x) for x in dep["exclude"]))
+        bits = [f"📆 **{span}** ({s['days']} day{'s' if s['days'] != 1 else ''})",
+                f"🕘 **{s['shifts']} shift{'s' if s['shifts'] != 1 else ''} a day**",
+                f"🚪 **{s['rooms']} rooms**", f"👥 **{s['per_room']} invigilators per room**"]
+        line2 = [f"🏫 Regular classes: **{cls}**", "🎓 Faculty pool: **" + ("; ".join(pool) if pool else "all eligible faculty") + "**"]
+        return (f"## {icon} Duty allocation - version {a['version']} ({state})\n"
+                f"{'  ·  '.join(bits)}\n\n{'  ·  '.join(line2)}\n\n{icon} **{feas[0].upper() + feas[1:]}**")
+
+    def history_note(self, aid: int) -> str:
+        """Say plainly when earlier duty counts are missing (they are then treated as zero, never invented)."""
+        a, session, matrix, comps, duties = self._ctx(aid)
+        pool = [f for f in matrix.faculty if f["active"] and matrix.eligible_slots(f["id"])]
+        have = {r[0] for r in self.repo.conn.execute("SELECT DISTINCT faculty_id FROM exm_history WHERE status='active'")}
+        missing = [f for f in pool if f["id"] not in have]
+        if not pool or not missing:
+            return ""
+        if len(missing) == len(pool):
+            return ("ℹ️ **No earlier duty counts are loaded**, so everyone starts from zero previous duties and the "
+                    "duties are shared evenly. Upload the duty-count sheet any time to balance against past duties.")
+        return (f"ℹ️ {len(missing)} of {len(pool)} faculty have no earlier duty count on file; they are treated as having "
+                f"none (nothing is invented).")
 
     # ------------------------------------------------------ B. day-wise
     def day_wise(self, aid: int, on: Optional[date] = None) -> List[Dict[str, Any]]:
@@ -142,24 +220,54 @@ class Reporter:
         return out
 
     def render_day_wise(self, aid: int, on: Optional[date] = None, limit_rows: Optional[int] = None) -> str:
-        rows = self.day_wise(aid, on)
-        if not rows:
+        return self.render_schedule(aid, on, limit_rows)
+
+    def render_schedule(self, aid: int, on: Optional[date] = None, max_rows: Optional[int] = None) -> str:
+        """One heading per DATE and one table per TIME SLOT (room x invigilators), nothing truncated unless asked."""
+
+        a, session, matrix, comps, duties = self._ctx(aid)
+        per = session["invigilators_per_room"]
+        days: Dict[str, Dict[Tuple[str, str, str], Dict[str, Dict[int, Dict[str, Any]]]]] = {}
+        for d in duties:
+            if on and d["exam_date"] != on.isoformat():
+                continue
+            slot = days.setdefault(d["exam_date"], {}).setdefault((d["start_time"], d["end_time"], d["shift"]), {})
+            slot.setdefault(d["room"], {})[d["seat"]] = d
+        if not days:
             return "_No duties on that date._"
-        per = len(rows[0]["invigilators"])
-        shown = rows if limit_rows is None else rows[:limit_rows]
-        head = ["Date", "Shift", "Room"]
+        show_dept = len({d["department"] for d in duties if d["department"]}) > 1
+        head = ["Room"]
         for i in range(per):
-            head += [f"Invigilator {i + 1}", "Department"]
-        body = []
-        for r in shown:
-            line = [fmt_date(r["date"]), r["shift"], r["room"]]
-            for n, d in r["invigilators"]:
-                line += [n, d]
-            body.append(line)
-        txt = md_table(head, body)
-        if limit_rows is not None and len(rows) > limit_rows:
-            txt += f"\n\n_{len(rows) - limit_rows} more rows - ask for the full report or one date._"
-        return txt
+            head += [f"Invigilator {i + 1}"] + (["Department"] if show_dept else [])
+        out: List[str] = []
+        used = 0
+        total_rows = sum(len(rooms) for sl in days.values() for rooms in sl.values())
+        cut = False
+        for day in sorted(days):
+            out.append(f"### 📅 {weekday_date(day)}")
+            for (st, en, label) in sorted(days[day]):
+                rooms = days[day][(st, en, label)]
+                if max_rows is not None and used + len(rooms) > max_rows and used:
+                    cut = True
+                    break
+                n_inv = sum(len(v) for v in rooms.values())
+                out.append(f"**{clock_emoji(st)} {label} · {st} – {en}** &nbsp;·&nbsp; {len(rooms)} rooms &nbsp;·&nbsp; {n_inv} invigilators")
+                body = []
+                for room in sorted(rooms, key=lambda r: [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", r)]):
+                    row = [f"**{room}**"]
+                    for i in range(1, per + 1):
+                        seat = rooms[room].get(i)
+                        row += [pretty(seat["faculty"]) if seat else "⚠️ unfilled"] + \
+                               ([pretty(seat["department"]) if seat else ""] if show_dept else [])
+                    body.append(row)
+                out.append(md_table(head, body))
+                used += len(rooms)
+            if cut:
+                break
+        if cut:
+            out.append(f"_Showing {used} of {total_rows} room rows. Say **show duties on <date>** for another day, "
+                       f"or **generate the PDF** for everything._")
+        return "\n\n".join(out)
 
     # --------------------------------------------------- C. workload
     def render_workload(self, aid: int, only_assigned: bool = False) -> str:

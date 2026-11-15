@@ -133,7 +133,7 @@ def test_missing_information_is_asked_not_invented(bot):
 
 def test_full_coordinator_workflow(bot):
     first = bot.handle(ALLOC)
-    assert "awaiting your approval" in first and "complete" in first
+    assert "awaiting your approval" in first and "complete" in first.lower()
     sid = bot._session()["id"]
     n = bot.w.names
     r = bot.handle(f"{n[0]} is unavailable on 12 November. {n[1]} is unavailable from 11 November to 12 November, "

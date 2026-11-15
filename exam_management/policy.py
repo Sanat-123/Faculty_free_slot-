@@ -122,8 +122,8 @@ class PolicyService:
 
     # ---- departments -------------------------------------------------------
     def resolver(self) -> DepartmentResolver:
-        depts = [r[0] for r in self.conn.execute(
-            "SELECT DISTINCT department FROM exm_faculty WHERE department<>''")]
+        depts = [r[0] for r in self.conn.execute(      # only people who can actually serve define a department
+            "SELECT DISTINCT department FROM exm_faculty WHERE department<>'' AND active=1")]
         row = self.conn.execute("SELECT value FROM exm_settings WHERE key='department_aliases'").fetchone()
         aliases = json.loads(row["value"]) if row else {}
         return DepartmentResolver(depts, aliases)

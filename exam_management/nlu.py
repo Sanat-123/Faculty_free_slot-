@@ -158,12 +158,19 @@ def bare_day_hits(parser: "DateParser", text: str, blocked: Sequence[Tuple[int, 
     low = text.lower()
     out: List[DateHit] = []
     for m in _BARE_LIST.finditer(low):
-        a, b = m.start(1), m.end(1)
-        explicit = low[max(0, a - 12):a].strip().split()[-1:] in (["date"], ["dates"], ["dated"])
-        if not explicit and any(not (b <= s0 or a >= e0) for s0, e0 in blocked):
-            continue                                  # "9 to 12" is a clock range unless the word "dates" says otherwise
-        body = m.group(1)
-        nums = [int(x) for x in re.findall(r"\d{1,2}", body)]
+        a0 = m.start(1)
+        explicit = low[max(0, a0 - 12):a0].strip().split()[-1:] in (["date"], ["dates"], ["dated"])
+        kept = []                                     # the list ends at the first number that starts a clock range:
+        for it in re.finditer(r"\d{1,2}", m.group(1)):   # "14 and 15, 9 to 12" -> days 14 and 15; "9 to 12" is a time
+            i0, i1 = a0 + it.start(), a0 + it.end()
+            if not explicit and any(not (i1 <= s0 or i0 >= e0) for s0, e0 in blocked):
+                break
+            kept.append((i0, i1, int(it.group(0))))
+        if len(kept) < 2:
+            continue
+        a, b = kept[0][0], kept[-1][1]
+        body = low[a:b]
+        nums = [n for _, _, n in kept]
         if not nums or any(not 1 <= n <= 31 for n in nums):
             continue
         is_range = bool(re.search(rf"\d\s*(?:{_SEP})\s*\d", body)) and len(nums) == 2 and not re.search(r",|\band\b|&", body)
@@ -332,8 +339,8 @@ def parse_times(text: str) -> List[Tuple[int, int, int, int]]:
         if a is None or b is None:
             continue
         s, e = a[0], b[0]
-        if not mer1 and not mer2 and not (m.group(2) or m.group(5)):
-            # bare hours: assume office hours (1-6 -> pm)
+        if not mer1 and not mer2:
+            # no am/pm anywhere ("1 to 2:30", "12:30 to 2"): an examination is in office hours, so 1-6 means pm
             if 1 <= h1 <= 6:
                 s += 12 * 60
             if 1 <= h2 <= 7:
@@ -357,8 +364,8 @@ _LABEL_STOP = {"from", "at", "the", "and", "is", "are", "shift", "shifts", "sess
                "held", "scheduled", "conducted", "has", "second", "first"} | set(NUMWORDS)
 
 
-def parse_shifts(text: str) -> List[Dict[str, str]]:
-    """Shifts the coordinator described, labelled by the word they used (or Shift N)."""
+def parse_shifts(text: str, label_template: str = "Shift {n}") -> List[Dict[str, str]]:
+    """Shifts the coordinator described, labelled by the word they used (or `label_template`, e.g. "Shift {n}")."""
 
     times = parse_times(text)
     out: List[Dict[str, str]] = []
@@ -374,7 +381,7 @@ def parse_shifts(text: str) -> List[Dict[str, str]]:
             m2 = re.match(r"\s*\(\s*([A-Za-z]+)\s*\)", after)
             if m2 and m2.group(1).lower() not in _LABEL_STOP:
                 label = m2.group(1)
-        out.append({"label": (label or f"Shift {k + 1}").capitalize(), "start": hhmm(s), "end": hhmm(e)})
+        out.append({"label": (label or label_template.format(n=k + 1)).capitalize(), "start": hhmm(s), "end": hhmm(e)})
         prev_end = b
     # unique labels
     seen: Dict[str, int] = {}
@@ -433,7 +440,7 @@ def _n(tok: str) -> Optional[int]:
 
 
 def parse_exam_request(text: str, today: date, year_hint: Optional[int] = None,
-                       window_days: int = 183) -> ExamRequest:
+                       window_days: int = 183, shift_label: str = "Shift {n}") -> ExamRequest:
     low = text.lower()
     req = ExamRequest()
     dp = DateParser(today, year_hint, window_days)
@@ -478,7 +485,7 @@ def parse_exam_request(text: str, today: date, year_hint: Optional[int] = None,
     shift_text = text
     for a, b in bare_spans + [(h.start, h.end) for h in hits]:      # text read as a DATE is never a clock time
         shift_text = shift_text[:a] + " " * (b - a) + shift_text[b:]
-    req.shifts = parse_shifts(shift_text)
+    req.shifts = parse_shifts(shift_text, shift_label)
 
     # rooms
     rm = re.search(r"\b(\d{1,3}|" + "|".join(NUMWORDS) + r")\s+(?:[a-z]+\s+)?(?:rooms?|halls?|venues?|classrooms?)\b", low)

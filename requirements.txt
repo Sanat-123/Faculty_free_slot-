@@ -1,19 +1,22 @@
 # Faculty Free Slot Identification - requirements
-#
+
 # Core PDF parsing + NLP engine
 pdfplumber>=0.10
 rapidfuzz>=3.0
 
-# PDF Chatbot UI (pdf_chatbot_app.py)
+# Web UI
 streamlit>=1.40
 pandas>=2.0
+
+# Exam duty engine (CP-SAT solver) and file formats
+ortools>=9.9
+openpyxl>=3.1
+xlrd>=2.0
+reportlab>=4.0
 
 # Optional - only needed by chatbot/nlp_engine.py (spaCy based)
 # spacy>=3.7
 # python -m spacy download en_core_web_sm
 
-# optional: natural-language chat mode (set ANTHROPIC_API_KEY)
+# Optional: natural-language chat mode (set ANTHROPIC_API_KEY)
 anthropic>=0.40
-
-# only for test_universal_parser.py
-reportlab>=4.0ortools>=9.9

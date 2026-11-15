@@ -1,10 +1,10 @@
 """
-Group split of examination duties (e.g. CS / non-CS, or any two or more groups).
+Group split of examination duties (any two or more groups of departments).
 
 A split is DATA, stored on the session (options["group_split"]):
 
-    {"groups": {"CS": ["CS"], "Non-CS": ["*"]},      # group -> department labels; "*" = everyone else
-     "shares": {"CS": 0.5, "Non-CS": 0.5}}           # share of the seats of every slot
+    {"groups": {"<group A>": ["<department label>"], "<group B>": ["*"]},   # group -> department labels; "*" = everyone else
+     "shares": {"<group A>": 0.5, "<group B>": 0.5}}                         # share of the seats of every slot
 
 Nothing here knows any department name: labels come from the coordinator and the roster.
 Each slot's seats are divided by share (largest-remainder rounding); the optimiser then

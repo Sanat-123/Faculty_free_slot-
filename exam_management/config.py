@@ -69,6 +69,9 @@ class ExamSettings:
     non_working_weekdays: Tuple[str, ...] = ("sunday",)  # skipped when a range is expanded
     default_year_window_days: int = 183    # dates further in the past roll to next year
 
+    room_label_template: str = "Room {n}"     # name given to a generated room (when the coordinator gives only a count)
+    shift_label_template: str = "Shift {n}"   # name given to a shift the coordinator described only by its times
+    chat_schedule_max_rows: int = 160      # room-rows shown in one chat reply before pointing to 'show duties on <date>'
     # ---- output & wording (administrator-editable; nothing here is a college fact) ----
     export_dir: str = "exports"            # where generated PDF / Excel reports are written (env EXAM_MGMT_EXPORT_DIR wins)
     export_name_template: str = "exam_duty_session{session}_v{version}"   # {session} {version} {date}

@@ -95,6 +95,40 @@ class PolicyChat:
                 uniq.append(f)
         return uniq, ambiguous
 
+    def scope_departments(self, text: str) -> Tuple[List[str], List[str], List[Tuple[str, List[str]]]]:
+        """
+        Who may be used for an allocation, read from ordinary wording:
+          "I only want cs faculties" / "just CS and IT" / "CS faculty only"   -> include
+          "except <department>" / "without the <department> department"       -> exclude
+        Departments are the DATABASE's own labels.  Returns (include, exclude, ambiguous phrases).
+        """
+
+        found, amb = self.find_departments(text)
+        only_b, only_a, not_b = (self._cue.get(k) for k in ("scope_only_before", "scope_only_after", "scope_not_before"))
+        include: List[str] = []
+        exclude: List[str] = []
+        prev: Optional[Found] = None
+        prev_role: Optional[str] = None
+        for f in sorted(found, key=lambda x: x.start):
+            role: Optional[str] = None
+            if prev is not None and prev_role and re.fullmatch(r"\s*(?:,|and|&|or|\+)?\s*(?:the\s+)?", text[prev.end:f.start], re.I):
+                role = prev_role                                         # "only CS and IT": the cue covers the whole list
+            else:
+                pre = re.split(r"[.;?!]", text[max(0, f.start - 45):f.start])[-1].lower()
+                post = text[f.end:f.end + 28].lower()
+                if not_b and not_b.search(pre[-32:]):
+                    role = "exclude"
+                elif only_b and only_b.search(pre):
+                    role = "include"
+                elif only_a and only_a.match(post):
+                    role = "include"
+            if role == "include":
+                include.append(f.label)
+            elif role == "exclude":
+                exclude.append(f.label)
+            prev, prev_role = f, role
+        return list(dict.fromkeys(include)), list(dict.fromkeys(exclude)), amb
+
     def _scope(self, text: str, low: str, sess: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         """kind/dates/shift/reason from the sentence."""
 
