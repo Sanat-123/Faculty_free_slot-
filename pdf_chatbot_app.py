@@ -172,6 +172,7 @@ def ask(question: str) -> None:
             "intent": answer.get("intent"),
             "rows": answer.get("rows", []),
             "detection": answer.get("detection", {}),
+            "dashboard": answer.get("dashboard"),
         }
     )
 
@@ -357,7 +358,13 @@ for message in st.session_state.messages:
 
     with st.chat_message(message["role"]):
 
-        st.markdown(message["content"])
+        if message.get("dashboard"):
+            # examination duty result: cards, date -> shift -> room roster, statistics, validation, downloads
+            import pdf_pipeline as _pp
+            from exam_management.streamlit_view import render as _render_exam
+            _render_exam(message["dashboard"], _pp._EXAM_HANDLER, key=f"exam{id(message)}")
+        else:
+            st.markdown(message["content"])
 
         if message["role"] == "assistant":
 

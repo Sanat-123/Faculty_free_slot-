@@ -82,7 +82,13 @@ class ExamSettings:
     seat_role_labels: Tuple[str, ...] = ("First invigilator", "Second invigilator")   # seat 1, 2 ... then 'Invigilator N'
 
     # ---- policy ----------------------------------------------------------
-    require_class_suspension_answer: bool = True   # ask, never assume
+    require_class_suspension_answer: bool = True   # ask when it cannot be worked out from the message or the timetable
+    default_classes_suspended: Optional[bool] = None   # administrator default; None = ask when nothing else decides
+    duty_rule_default_basis: str = "previous"      # "who have a duty count < N" judges the count BEFORE this allocation
+    named_shifts: Dict[str, Tuple[str, str]] = field(default_factory=dict)   # {"morning": ("09:30","12:30")} - none by default
+    unverified_faculty_policy: str = "exclude"     # no timetable on record: "exclude" (never assume free) or "allow"
+    own_all_allocation_requests: bool = False      # True: this engine handles EVERY allocation request (no imported roster needed)
+    use_llm_extraction: bool = True                # used only when ANTHROPIC_API_KEY is set
     large_operation_threshold: int = 5     # bulk ops above this need confirmation
     actor: str = "coordinator"
     # words that mark a role/duty as administrative (lexicon, not a list of people or roles)

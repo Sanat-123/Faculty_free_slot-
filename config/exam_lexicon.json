@@ -1,0 +1,114 @@
+{
+  "_comment": "LANGUAGE only - words and phrases coordinators use. Nothing here is a department, person, room, date or number from any college. Edit to add synonyms or another language; no code change is needed. Every entry is a regular expression fragment (case-insensitive).",
+
+  "number_words": {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+    "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16,
+    "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+    "single": 1, "double": 2, "pair": 2, "couple": 2
+  },
+
+  "comparison_operators": {
+    "lte": ["(?:nobody|no\\s*one|none)\\s+(?:should|must|shall|can|may)\\s+(?:exceed|cross|go\\s+(?:above|beyond|over))", "(?:should|must|shall|will|do|does)?\\s*not\\s+exceed(?:ing)?", "at\\s+(?:the\\s+)?most", "no\\s+more\\s+than", "not\\s+more\\s+than", "up\\s*to", "not\\s+exceeding", "maximum\\s+(?:of\\s+)?", "max\\.?\\s+(?:of\\s+)?", "<=", "\u2264"],
+    "gte": ["at\\s+least", "not\\s+less\\s+than", "no\\s+(?:fewer|less)\\s+than", "minimum\\s+(?:of\\s+)?", "min\\.?\\s+(?:of\\s+)?", ">=", "\u2265"],
+    "lt": ["less\\s+than", "fewer\\s+than", "lower\\s+than", "lesser\\s+than", "smaller\\s+than", "under", "below", "<"],
+    "gt": ["more\\s+than", "greater\\s+than", "higher\\s+than", "over", "above", "exceeding", "beyond", ">"],
+    "eq": ["exactly", "equal\\s+to", "equals?", "precisely", "=="]
+  },
+  "postfix_operators": {
+    "lte": ["or\\s+(?:less|fewer|below|lower|under)"],
+    "gte": ["or\\s+(?:more|above|higher|over)"]
+  },
+  "cap_language_operators": ["lte", "gte"],
+  "cap_language_cues": ["each", "per\\s+(?:faculty|person|teacher|member|invigilator)", "every\\s+(?:faculty|teacher|member)", "in\\s+(?:this|the)\\s+(?:exam|examination|session)", "during\\s+(?:this|the)\\s+(?:exam|examination)"],
+
+  "duty_nouns": ["duty\\s+count", "duty\\s+counts", "duty\\s+total", "duty\\s+score", "(?:invigilation|examination|exam)\\s+dut(?:y|ies)", "(?:invigilation|examination|exam)\\s+count", "dut(?:y|ies)"],
+  "holder_cues": ["who\\s+(?:have|has|had|did|do|done|performed|completed|carried)", "(?:having|with|having\\s+done|performed|completed|done|has|have|had)", "whose", "those\\s+(?:with|having)", "already"],
+  "projected_cues": ["in\\s+total", "total\\s+(?:of\\s+)?dut", "after\\s+(?:this|the)\\s+(?:allocation|exam|assignment)", "including\\s+(?:this|the)", "(?:should|must|shall|will)\\s+not\\s+(?:exceed|cross|go\\s+(?:above|beyond|over))", "not\\s+to\\s+exceed", "cap(?:ped)?\\s+at", "nobody\\s+should\\s+(?:exceed|cross)"],
+  "period_phrases": {
+    "current semester": ["this\\s+semester", "current\\s+semester", "present\\s+semester"],
+    "academic year": ["this\\s+(?:academic\\s+)?year", "current\\s+(?:academic\\s+)?year", "academic\\s+year", "this\\s+session"],
+    "current exam cycle": ["this\\s+(?:exam(?:ination)?\\s+)?cycle", "current\\s+(?:exam(?:ination)?\\s+)?cycle", "this\\s+exam(?:ination)?\\s+period"],
+    "all recorded duties": ["so\\s+far", "till\\s+(?:now|date)", "to\\s+date", "overall", "all[- ]time", "in\\s+total", "lifetime"]
+  },
+
+  "preference_words": ["prefer\\w*", "preference", "priorit(?:y|i[sz]e)\\w*", "ideally", "if\\s+possible", "as\\s+far\\s+as\\s+possible", "try\\s+to", "better\\s+if", "favou?r\\w*", "would\\s+like", "optionally"],
+  "requirement_words": ["only", "must", "strictly", "required", "compulsory", "have\\s+to", "need\\s+to", "should\\s+(?:be|have)", "who\\s+(?:have|has|having)", "select", "assign", "choose", "use", "allocate"],
+
+  "lowest_first": [
+    "(?:lowest|fewest|least|smallest|minimum)\\s+(?:number\\s+of\\s+)?(?:(?:previous|past|earlier|prior|exam(?:ination)?|invigilation)\\s+)?(?:dut(?:y|ies)|duty\\s+count|workload)",
+    "(?:fewer|less|lesser)\\s+(?:exam(?:ination)?\\s+|invigilation\\s+)?dut(?:y|ies)\\s+(?:so\\s+far|till\\s+now|earlier|previously|before|this\\s+\\w+)",
+    "(?:performed|done|completed|carried\\s+out|handled|had)\\s+(?:fewer|less|lesser|the\\s+least)\\s+(?:exam(?:ination)?\\s+)?dut(?:y|ies)",
+    "(?:fewer|less|lesser)\\s+(?:exam(?:ination)?\\s+)?(?:duty\\s+)?(?:count|workload)",
+    "(?:equal|even|balanced|fair|uniform)\\s+(?:distribution|share|workload|allocation|spread)",
+    "distribute\\w*\\s+(?:duties\\s+)?(?:equally|evenly|fairly)"
+  ],
+
+  "all_departments": [
+    "all\\s+(?:the\\s+)?(?:departments?|depts?|branches|streams|schools)",
+    "every\\s+(?:department|dept|branch|stream)",
+    "any\\s+(?:department|dept|branch|stream)",
+    "across\\s+(?:all\\s+|the\\s+)?(?:departments?|branches|streams)",
+    "(?:irrespective|regardless)\\s+of\\s+(?:the\\s+)?(?:department|dept|branch)",
+    "(?:whole|entire)\\s+(?:college|institute|university|campus)",
+    "(?:from|of)\\s+(?:the\\s+)?(?:whole|entire)\\s+(?:college|institute)"
+  ],
+
+  "faculty_nouns": ["faculty", "faculties", "teachers?", "staff", "professors?", "invigilators?", "members?", "lecturers?", "examiners?", "supervisors?", "teaching\\s+staff"],
+  "student_nouns": ["exams?", "examinations?", "students?", "batch(?:es)?", "semesters?", "sems?", "papers?", "classes", "class", "mid[- ]?terms?", "tests?", "years?", "course"],
+  "faculty_role_before": ["(?:faculty|faculties|teachers?|staff|professors?|invigilators?|members?)\\s+(?:of|from|in|belonging\\s+to|under)(?:\\s+the)?", "(?:take|use|select|choose|pick|assign|allocate|need|want|require)(?:\\s+the)?", "only"],
+  "student_role_before": ["(?:exams?|examinations?|tests?|papers?|students?|batch(?:es)?)\\s+(?:of|for|from|in|by)(?:\\s+the)?", "for(?:\\s+the)?"],
+
+  "exam_types": {
+    "mid-term": ["mid[- ]?terms?", "mid[- ]?sem(?:ester)?s?", "mst", "sessionals?", "internals?", "class\\s+tests?", "unit\\s+tests?"],
+    "end-semester": ["end[- ]?sem(?:ester)?s?", "final\\s+(?:semester\\s+)?exam(?:ination)?s?", "university\\s+exam(?:ination)?s?"],
+    "practical": ["practicals?", "lab\\s+exam(?:ination)?s?", "laboratory\\s+exam(?:ination)?s?"],
+    "viva": ["viva(?:[- ]voce)?", "oral\\s+exam(?:ination)?s?"],
+    "supplementary": ["supplementary", "back[- ]?log", "re[- ]?exam(?:ination)?s?", "make[- ]?up\\s+exam(?:ination)?s?", "reappear"],
+    "entrance": ["entrance\\s+(?:exam(?:ination)?|test)s?"],
+    "pre-board / preparatory": ["pre[- ]?board", "preparatory"]
+  },
+
+  "teaching_conflict_cues": [
+    "(?:avoid|exclude|skip|not\\s+(?:take|use|assign)|don'?t\\s+(?:take|use|assign)|except|without)\\s+(?:the\\s+)?(?:any\\s+)?(?:faculty|faculties|teachers?|staff|members?)?\\s*(?:who\\s+(?:are|is)\\s+|that\\s+(?:are|is)\\s+|having\\s+|with\\s+)?(?:teaching|busy|lectures?|classes|class\\s+load)",
+    "(?:faculty|faculties|teachers?|staff|members?)\\s+(?:who\\s+(?:are|is)\\s+|that\\s+(?:are|is)\\s+)?(?:free|available)\\s+(?:from|of|in)\\s+(?:teaching|their\\s+(?:classes|lectures)|the\\s+timetable)",
+    "(?:no|without)\\s+(?:teaching|lectures?|classes)\\s+(?:clash|conflict|overlap)",
+    "(?:not|isn'?t|aren'?t)\\s+teaching",
+    "(?:who\\s+(?:are|is)\\s+)?teaching\\s+during\\s+(?:the\\s+)?(?:exam|examination)",
+    "teaching\\s+(?:clash|conflict)",
+    "(?:free|available)\\s+in\\s+(?:the\\s+)?(?:timetable|time\\s+table)"
+  ],
+  "unverified_allow_cues": ["(?:include|allow|use|consider)\\s+(?:the\\s+)?(?:faculty|faculties|teachers?)?\\s*(?:whose|with|having)?\\s*(?:timetable|time\\s+table)\\s+(?:is\\s+)?(?:missing|unavailable|not\\s+available|unknown)", "(?:even\\s+)?(?:if|when)\\s+(?:their\\s+)?(?:timetable|time\\s+table)\\s+(?:is\\s+)?(?:missing|unavailable|not\\s+available)"],
+
+  "same_day_cap": [
+    "(?:nobody|no\\s*one|none|no\\s+(?:faculty|teacher|member|staff|invigilator)s?)\\s+(?:should|must|shall|can|may|will|is\\s+to)?\\s*(?:be\\s+)?(?:have|get|receive|be\\s+given|be\\s+assigned|do|take|perform|handle|given|assigned)?\\s*(?:more\\s+than\\s+one|two|multiple|2|several|repeat\\w*|any\\s+(?:second|other))\\s+(?:exam(?:ination)?\\s+)?(?:dut(?:y|ies)|shifts?|sessions?)?\\s*(?:on|in|per|during|within)?\\s*(?:the\\s+)?(?:same|one|a|single|each)\\s+day",
+    "(?:only\\s+)?one\\s+(?:exam(?:ination)?\\s+)?(?:dut(?:y|ies)|shift|session)\\s+(?:per|a|each|in\\s+a|on\\s+a)\\s+day",
+    "(?:not|never)\\s+(?:more\\s+than\\s+)?(?:once|twice)\\s+(?:a|per|in\\s+a)\\s+day",
+    "(?:no|avoid)\\s+(?:double|two|multiple|repeat)\\s+(?:dut(?:y|ies)|shifts?)\\s+(?:on|in|per)\\s+(?:the\\s+)?(?:same\\s+)?day",
+    "same\\s+day\\s+(?:duty\\s+)?(?:repeat|twice|double)"
+  ],
+  "no_simultaneous": [
+    "(?:nobody|no\\s*one|none|no\\s+(?:faculty|teacher|member|staff)s?|a\\s+(?:faculty|teacher)\\s+(?:should|must)\\s+not)\\s+(?:should|must|shall|can|may|will|is\\s+to)?\\s*(?:not\\s+)?(?:be\\s+)?(?:assigned|placed|allotted|allocated|given|put|posted|in|on\\s+duty)\\s*(?:to|in|at)?\\s*(?:multiple|more\\s+than\\s+one|two|different|several|overlapping|two\\s+different)\\s+(?:rooms?|halls?|places?|venues?|duties)",
+    "(?:no|avoid)\\s+(?:overlap\\w*|clash\\w*|double[- ]?book\\w*|simultaneous)\\s+(?:duty|duties|assignments?|allocations?)?",
+    "(?:at\\s+the\\s+same\\s+time|simultaneously|at\\s+once)"
+  ],
+  "no_consecutive": ["(?:no|never|prohibit\\w*|forbid\\w*|strictly\\s+no|avoid|don'?t\\s+(?:give|assign)|do\\s+not\\s+(?:give|assign|allow)|must\\s+not\\s+(?:have|get|receive|be\\s+given)|not\\s+allow(?:ed)?)\\s+(?:any\\s+)?(?:\\w+\\s+)?(?:back[- ]to[- ]back|consecutive|continuous)\\s*(?:days?|dut(?:y|ies)|shifts?)?"],
+
+  "constraint_cues": ["should", "must", "nobody", "no\\s*one", "avoid", "don'?t", "do\\s+not", "never", "only", "except", "without", "ensure", "make\\s+sure", "prefer\\w*", "ideally", "not\\s+allowed", "cannot", "can'?t", "at\\s+least", "at\\s+most", "no\\s+more\\s+than", "limit\\w*", "restrict\\w*", "exclude", "include"],
+
+  "shift_name_words": ["morning", "forenoon", "fore-noon", "afternoon", "evening", "noon", "first\\s+(?:shift|session|half|slot)", "second\\s+(?:shift|session|half|slot)", "third\\s+(?:shift|session|slot)", "shift\\s*[-#]?\\s*(?:\\d+|[ivx]+)", "session\\s*[-#]?\\s*(?:\\d+|[ivx]+)"],
+  "shift_count_words": "(\\d{1,2}|one|two|three|four|five|six)[\\s-]*(?:shifts?|sessions?|slots?|sittings?)\\s*(?:per\\s+day|a\\s+day|daily|each\\s+day|every\\s+day)?",
+
+  "per_room_nouns": ["invigilators?", "invigilation\\s+staff", "faculty", "faculties", "teachers?", "staff", "supervisors?", "members?", "persons?", "people", "examiners?", "professors?", "lecturers?", "personnel"],
+  "per_room_verbs": ["must\\s+have", "should\\s+have", "needs?", "need\\s+to\\s+have", "requires?", "will\\s+have", "to\\s+have", "has", "have", "gets?", "with", "having", "containing", "staffed\\s+by", "manned\\s+by", "supervised\\s+by", "invigilated\\s+by", "assigned", "allotted", "allocated", "posted", "put", "keep", "place", "want", "wants", "required", "needed"],
+  "room_each_words": ["each", "every", "per", "all\\s+(?:the\\s+)?", "for\\s+each", "in\\s+each", "in\\s+every", "for\\s+every", "any\\s+(?:given\\s+)?"],
+  "room_nouns": ["rooms?", "halls?", "venues?", "classrooms?", "centres?", "centers?"],
+
+  "clarification_labels": {
+    "dates": "the examination date(s)",
+    "shifts": "the start and end time of each shift",
+    "rooms": "the number of examination rooms (or their names)",
+    "per_room": "how many invigilators each room needs",
+    "suspension": "whether regular classes are suspended during the examination (or keep running)"
+  }
+}

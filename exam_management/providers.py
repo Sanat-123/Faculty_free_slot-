@@ -102,20 +102,68 @@ class ProjectDirectory:
 
 
 class ProjectTimetable:
-    """Teaching conflicts straight from the project's timetable model (with its buffer)."""
+    """
+    Teaching conflicts straight from the project's timetable model (with its buffer).
+
+    Optional abilities used by the eligibility engine when present:
+      busy_outside(on, start, end, suspended)  who still teaches when only the `suspended` classes stop
+      known_names()                            who the timetable has any data for (everyone else is UNVERIFIED, not free)
+    """
 
     def __init__(self, model_getter: Callable, buffer_minutes: int = 0):
         self.model_getter = model_getter
         self.buffer = buffer_minutes
 
     def busy(self, on: date, start: str, end: str) -> Set[str]:
+        return self.busy_outside(on, start, end, ())
+
+    def busy_outside(self, on: date, start: str, end: str, suspended: Iterable[str]) -> Set[str]:
         model = self.model_getter()
         day = on.strftime("%A")
         s, e = _minutes(start) - self.buffer, _minutes(end) + self.buffer
+        stopped = {str(c).strip() for c in suspended}
         busy: Set[str] = set()
         for slot in model.slots_overlapping(s, e):
-            busy |= set(model.busy_faculty(day, slot))
+            if not stopped:
+                busy |= set(model.busy_faculty(day, slot))
+                continue
+            for ev in model.cell_events.get((day.lower(), slot), []):
+                if ev.get("teacher") in model.faculty_set and str(ev.get("class_name", "")).strip() not in stopped:
+                    busy.add(ev["teacher"])
         return busy
+
+    def known_names(self) -> Set[str]:
+        return set(getattr(self.model_getter(), "faculty_set", None) or [])
+
+
+class ProjectClasses:
+    """Class catalog of the loaded timetable: semester from the class name, department from the learned branch code."""
+
+    def __init__(self, model_getter: Callable, branch_getter: Optional[Callable] = None,
+                 dept_resolver: Optional[Callable[[str], Optional[str]]] = None):
+        self.model_getter = model_getter
+        self.branch_getter = branch_getter
+        self.dept_resolver = dept_resolver
+
+    def classes(self) -> List[str]:
+        model = self.model_getter()
+        return sorted({str(e.get("class_name", "")).strip() for e in model.events} - {""})
+
+    def semester_of(self, class_name: str) -> Optional[int]:
+        try:
+            from scheduling.semester_exam import class_semester
+            return class_semester(class_name)
+        except Exception:
+            return None
+
+    def department_of(self, class_name: str) -> Optional[str]:
+        if not (self.branch_getter and self.dept_resolver):
+            return None
+        try:
+            info = getattr(self.branch_getter(), "class_info", {}).get(class_name)
+        except Exception:
+            info = None
+        return self.dept_resolver(info[0]) if info else None
 
 
 class ProjectHistory:

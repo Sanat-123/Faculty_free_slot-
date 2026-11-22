@@ -1340,7 +1340,14 @@ if st.session_state.nlp:
             message["role"]
         ):
 
-            if message["role"] == "assistant":
+            if message["role"] == "assistant" and message.get("dashboard"):
+
+                from exam_management.streamlit_view import render as _render_exam
+                _bot = st.session_state.get("chatbot")
+                _render_exam(message["dashboard"], getattr(_bot, "exam_management", None),
+                             key=f"exam{message['dashboard']['allocation_id']}_{message['dashboard']['version']}")
+
+            elif message["role"] == "assistant":
 
                 _render_assistant_message(
                     message["content"]
@@ -1432,9 +1439,22 @@ if st.session_state.nlp:
                     )
 
 
-            _render_assistant_message(
-                answer
-            )
+            _dashboard = None
+            try:
+                _bot = st.session_state.get("chatbot")
+                if _bot is not None and getattr(_bot, "exam_management", None) is not None:
+                    _dashboard = _bot.exam_management.consume_dashboard()
+            except Exception:
+                _dashboard = None
+
+            if _dashboard:
+                from exam_management.streamlit_view import render as _render_exam
+                _render_exam(_dashboard, _bot.exam_management,
+                             key=f"exam{_dashboard['allocation_id']}_{_dashboard['version']}")
+            else:
+                _render_assistant_message(
+                    answer
+                )
 
 
         # ----------------------------------------------------
@@ -1444,7 +1464,8 @@ if st.session_state.nlp:
         st.session_state.messages.append(
             {
                 "role": "assistant",
-                "content": answer
+                "content": answer,
+                "dashboard": _dashboard,
             }
         )
 

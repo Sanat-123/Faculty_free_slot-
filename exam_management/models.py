@@ -45,6 +45,7 @@ class Problem:
     max_duties: Optional[int] = None
     prohibit_consecutive: bool = False
     max_per_day: Optional[int] = None
+    person_max: Dict[int, int] = field(default_factory=dict)       # faculty id -> own duty cap (e.g. 'total must stay under N')
     fixed: Set[Tuple[int, int]] = field(default_factory=set)       # (fid, slot) must stay
     forbidden: Set[Tuple[int, int]] = field(default_factory=set)   # (fid, slot) never
     keep_preferred: Set[Tuple[int, int]] = field(default_factory=set)  # soft keep
@@ -55,6 +56,14 @@ class Problem:
     group_quota: Dict[int, Dict[str, int]] = field(default_factory=dict)  # slot -> group -> seats
     # overlapping slot pairs (same date, overlapping clock time) - derived
     overlaps: List[Tuple[int, int]] = field(default_factory=list)
+
+    def cap(self, fid: int) -> Optional[int]:
+        """The most new duties this person may take: the global maximum and their own cap, whichever is smaller."""
+
+        mine = self.person_max.get(fid)
+        if mine is None:
+            return self.max_duties
+        return mine if self.max_duties is None else min(mine, self.max_duties)
 
     def fixed_slots(self) -> Set[int]:
         return {sl for _, sl in self.fixed}

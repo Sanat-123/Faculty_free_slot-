@@ -54,8 +54,8 @@ def _tier_capacity(problem: Problem, members: Sequence[FacultyInfo]) -> float:
     """How many seats this set of people can cover at most (per-person limits and per-slot seats)."""
 
     ids = {f.id for f in members}
-    per_person = sum(min(len(problem.eligible.get(f.id, ())), problem.max_duties
-                         if problem.max_duties is not None else 10 ** 9) for f in members)
+    per_person = sum(min(len(problem.eligible.get(f.id, ())), problem.cap(f.id)
+                         if problem.cap(f.id) is not None else 10 ** 9) for f in members)
     per_slot = sum(min(sl.required, sum(1 for i in ids if sl.index in problem.eligible.get(i, ())))
                    for sl in problem.slots)
     return float(min(per_person, per_slot))
@@ -68,7 +68,7 @@ def targets_for(problem: Problem, settings: ExamSettings) -> Dict[int, int]:
 
     scale = settings.target_scale
     kw = dict(history_weight=settings.history_weight, history_cap=settings.history_adjust_cap,
-              history_cap_fraction=settings.history_adjust_fraction)
+              history_cap_fraction=settings.history_adjust_fraction, person_max=problem.person_max)
     tiers = sorted({f.tier for f in problem.faculty})
     if not problem.groups and len(tiers) > 1:
         out: Dict[int, int] = {}
@@ -265,7 +265,7 @@ def greedy_construct(problem: Problem, settings: ExamSettings, targets: Dict[int
                 fid = f.id
                 if sl.index not in allowed[fid] or fid in here:
                     continue
-                if problem.max_duties is not None and n[fid] >= problem.max_duties:
+                if problem.cap(fid) is not None and n[fid] >= problem.cap(fid):
                     continue
                 if any(o in mine[fid] for o in overlap_of[sl.index]):
                     continue
@@ -409,7 +409,7 @@ def local_search(problem: Problem, settings: ExamSettings, targets: Dict[int, in
                 b = f.id
                 if b in here or s not in allowed[b]:
                     continue
-                if problem.max_duties is not None and n[b] >= problem.max_duties:
+                if problem.cap(b) is not None and n[b] >= problem.cap(b):
                     continue
                 if any(o in mine[b] for o in overlap_of[s]):
                     continue
@@ -575,8 +575,8 @@ def _solve_once(problem: Problem, settings: ExamSettings, targets: Dict[int, int
         if not mine:
             continue
         n = sum(x[(f.id, s)] for s in mine)
-        if problem.max_duties is not None:
-            m.Add(n <= problem.max_duties)
+        if problem.cap(f.id) is not None:
+            m.Add(n <= problem.cap(f.id))
         if day_cap:
             for d in days:
                 row = [x[(f.id, s)] for s in slots_of_day[d] if (f.id, s) in x]
@@ -697,7 +697,7 @@ def _unfilled_records(problem: Problem, assign: Dict[int, List[int]],
                 and (f.id, sl.index) not in problem.forbidden]
         here = set(assign.get(sl.index, []))
         spare = [f for f in elig if f not in here]
-        at_max = [f for f in spare if problem.max_duties is not None and counts[f] >= problem.max_duties]
+        at_max = [f for f in spare if problem.cap(f) is not None and counts[f] >= problem.cap(f)]
         clash = [f for f in spare if f not in at_max and
                  any(f in assign.get(o, ()) for o in overlap_of[sl.index])]
         rest = [f for f in spare if f not in at_max and f not in clash]

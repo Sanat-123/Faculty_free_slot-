@@ -444,7 +444,7 @@ class Reporter:
             if only_problem and status == "Eligible" and "Not available" not in why:
                 continue
             rows.append([f["name"], f["department"] or "—", status, why])
-        rows.sort(key=lambda r: ({"Excluded": 0, "Unavailable": 1, "Ineligible": 2, "Eligible": 3}[r[2]], r[0]))
+        rows.sort(key=lambda r: ({"Excluded": 0, "Unavailable": 1, "Ineligible": 2, "Unverified": 3, "Eligible": 4}.get(r[2], 5), r[0]))
         return md_table(["Faculty", "Department", "Status", "Explanation"], rows)
 
     # --------------------------------------------------------- full report

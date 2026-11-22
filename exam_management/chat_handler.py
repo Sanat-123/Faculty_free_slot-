@@ -13,7 +13,9 @@ import re
 from datetime import date
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import dashboard as dash
 from . import nlu
+from . import understanding as und
 from .nlu import ExamRequest, FacultyResolver
 from .reports import Reporter, fmt_date, md_table, num
 from .groups import describe, group_map, normalise_spec
@@ -33,7 +35,12 @@ _NO = re.compile(r"^\W*(?:no|cancel|never\s*mind|stop|abort)\W*$", re.I)
 
 class ExamManagementHandler:
 
-    def __init__(self, service: ExamService, today_getter: Callable[[], date] = date.today):
+    def __init__(self, service: ExamService, today_getter: Callable[[], date] = date.today,
+                 catalog: Any = None, llm: Any = None):
+        self.catalog = catalog
+        self.llm = llm
+        self.last_dashboard: Optional[Dict[str, Any]] = None
+        self._understanding: Optional[und.RequestUnderstanding] = None
         self.svc = service
         self.repo = service.repo
         self.today = today_getter
@@ -48,6 +55,8 @@ class ExamManagementHandler:
         self.last_exports: List[str] = []
         self.policy_chat = PolicyChat(self)
         self._roster_synced = False
+        self._carry_from: Optional[int] = None
+        self.last_request: Optional[ExamRequest] = None
 
     # ------------------------------------------------------------------ helpers
     @property
@@ -175,6 +184,15 @@ class ExamManagementHandler:
         if r is not None:
             return r
 
+        # --- a NEW allocation request that carries its own dates is never mistaken for an exclusion instruction
+        if self._is_allocation_request(text, low) and self._has_own_dates(text):
+            return self._new_request(text, low)
+
+        # --- a change to the CURRENT examination ("make it two shifts", "prefer faculty with fewer than 8 duties")
+        r = self._modify_request(text, low)
+        if r is not None:
+            return r
+
         # --- department exclusion / priority tiers / file import (data-driven, see policy_chat)
         r = self.policy_chat.handle(text, low, mentions, sess)
         if r is not None:
@@ -222,11 +240,44 @@ class ExamManagementHandler:
         except Exception:
             return False
 
+    def understanding(self) -> und.RequestUnderstanding:
+        if self._understanding is None:
+            def finder(text: str):
+                found, amb = self.policy_chat.find_departments(text)
+                return [und.DeptMention(f.label, f.start, f.end) for f in found
+                        if not und.is_common_word(text[f.start:f.end])], amb
+
+            self._understanding = und.RequestUnderstanding(self.today, self.settings, finder, self.catalog, self.llm)
+        self._understanding.settings = self.settings
+        return self._understanding
+
+    def export(self, kind: str, aid: Optional[int] = None) -> Tuple[bytes, str, str]:
+        """Official Excel / PDF of the allocation, built from the same data the dashboard shows."""
+
+        import tempfile
+        from pathlib import Path
+        from . import official_export as oe
+        aid = aid or (self._latest_alloc() or {}).get("id")
+        if not aid:
+            raise ValueError("There is no allocation to export yet.")
+        payload = dash.build(self.svc, aid, self.last_request)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ("roster." + ("xlsx" if kind == "xlsx" else "pdf"))
+            (oe.to_excel if kind == "xlsx" else oe.to_pdf)(payload, path)
+            mime = ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if kind == "xlsx" else "application/pdf")
+            return path.read_bytes(), f"exam_duty_roster_v{payload['version']}.{'xlsx' if kind == 'xlsx' else 'pdf'}", mime
+
+    def consume_dashboard(self) -> Optional[Dict[str, Any]]:
+        """The structured result of the last reply (once); the chat UI renders it as cards, tables and tabs."""
+
+        d, self.last_dashboard = self.last_dashboard, None
+        return d
+
     def _parse_req(self, text: str, year: Any = "default") -> ExamRequest:
-        """parse_exam_request + the department scope ("only CS faculties") read against the roster's departments."""
+        """One reader for every message: the rule reader, semesters, department roles, optional language model."""
+
         yr = self._year() if year == "default" else year
-        req = nlu.parse_exam_request(text, self.today(), yr, self.settings.default_year_window_days,
-                                     self.settings.shift_label_template)
+        req = self.understanding().read(text, yr)
         try:
             inc, exc, _ = self.policy_chat.scope_departments(text)
         except Exception:
@@ -235,29 +286,38 @@ class ExamManagementHandler:
         req.dept_exclude = list(dict.fromkeys(req.dept_exclude + exc))
         return req
 
+    def _has_own_dates(self, text: str) -> bool:
+        r = nlu.parse_exam_request(text, self.today(), self._year(), self.settings.default_year_window_days)
+        return bool(r.explicit_dates or r.start)
+
+    _SELECT_LEAD = re.compile(r"^\W*(?:please\s+)?(?:find|select|list|get|pick|choose|identify)\b")
+    _AVAILABLE_FACULTY = re.compile(r"\b(?:available|eligible|free|suitable)\s+(?:\w+\s+){0,2}(?:faculty|faculties|teachers?|staff|invigilators?|members?)\b")
+
+    def _owns_allocations(self) -> bool:
+        return self._college_roster_loaded() or bool(getattr(self.settings, "own_all_allocation_requests", False))
+
     def _is_allocation_request(self, text: str, low: str) -> bool:
         if not _EXAM_WORDS.search(low):
             return False
-        if _QUERY_LEAD.match(low):                 # a question or a "show me ..." is never a request to allocate
-            return False
-        if not _ALLOC_VERBS.search(low):
+        req = nlu.parse_exam_request(text, self.today(), self._year(), self.settings.default_year_window_days)
+        details = sum(bool(x) for x in (req.explicit_dates or req.start, req.shifts, req.room_count or req.rooms, req.per_room))
+        if _QUERY_LEAD.match(low):
+            # "show ..." / "why ..." is a question; "find the available faculty for second-year exams" asks for a roster
+            if not (self._owns_allocations() and self._SELECT_LEAD.match(low) and self._AVAILABLE_FACULTY.search(low)):
+                return False
+        if not _ALLOC_VERBS.search(low) and not (self._SELECT_LEAD.match(low) and self._AVAILABLE_FACULTY.search(low)):
             # "I need exam duty on 20 and 21 Nov, 9 to 11, 12 halls": softer wording counts only when the message
             # also carries real schedule details (at least three of: dates, times, rooms, invigilators per room)
-            if not _WANT_VERBS.search(low):
+            if details < 3 or not (_WANT_VERBS.search(low) or self._owns_allocations()):
                 return False
-            r = nlu.parse_exam_request(text, self.today(), self._year(), self.settings.default_year_window_days)
-            details = sum(bool(x) for x in (r.explicit_dates or r.start, r.shifts, r.room_count or r.rooms, r.per_room))
-            if details < 3:
-                return False
-        if self._college_roster_loaded():
-            # The older planner only knows the timetable's teachers, so with a college roster every allocation
-            # request is handled here (college-wide) - unless it NAMES particular teachers (older named flow).
+        if self._owns_allocations():
+            # The older planner only knows the timetable's teachers, so every allocation request is handled here
+            # - unless it NAMES particular teachers without describing a whole examination (older named flow).
             try:
                 named = [m for m in self._resolver().mentions(text)[0] if len(re.sub(r"[^A-Za-z]", "", m.text)) >= 3]
-                return not named                    # a stray one-letter token ("I need ...") is not a name
+                return not named or details >= 3
             except Exception:
                 return True
-        req = nlu.parse_exam_request(text, self.today(), self._year(), self.settings.default_year_window_days)
         multi_day = bool(req.n_days and req.n_days > 1) or bool(req.start and req.end and req.end > req.start) \
             or len(req.explicit_dates) > 1
         # without a roster, single-day requests stay with the existing exam-duty flow
@@ -265,15 +325,46 @@ class ExamManagementHandler:
 
     # ----------------------------------------------------------- new / continued
     def _new_request(self, text: str, low: str) -> str:
+        """A NEW examination: nothing from an earlier request is carried over."""
+
         req = self._parse_req(text)
         self.draft = req
+        self._carry_from = None
+        self._queue_named_exclusions(text)
         return self._advance(text)
+
+    def _queue_named_exclusions(self, text: str) -> List[str]:
+        """People named for exclusion inside the allocation request itself ("... but not Dr. X"); returns their names."""
+
+        resolver = self._resolver()
+        mentions, _ = resolver.mentions(text)
+        if not mentions:
+            return []
+        labels, times = self._shift_info()
+        queued: List[str] = []
+        for d in nlu.parse_directives(text, resolver, mentions, labels, times, self.today(), self._year(),
+                                      self.settings.admin_keywords, self.settings.leave_keywords,
+                                      self.settings.default_year_window_days):
+            ids = [m.resolved for m in d.mentions]
+            if not d.needs and all(i is not None for i in ids):
+                self.pending_exclusions.append((d, ids))
+                queued += [self.repo.faculty(i)["name"] for i in ids]
+        return queued
 
     def _continue_request(self, text: str, low: str) -> Optional[str]:
         assert self.draft is not None
         new = self._parse_req(text, None)
-        before = self.draft.__dict__.copy()
+        before = repr(self.draft.to_json())
+        # an answer to a contradiction replaces the statement it contradicted
+        if new.classes_suspended is True:
+            self.draft.avoid_teaching = None
+        if new.avoid_teaching:
+            self.draft.classes_suspended = None
+        self._resolve_ambiguity(low)
+        if new.explicit_dates and (self.draft.start or self.draft.end):
+            self.draft.start = self.draft.end = self.draft.n_days = None
         self.draft.merge(new)
+        queued = self._queue_named_exclusions(text)
         # a bare answer to a single outstanding question
         if len(self.awaiting) == 1:
             key = self.awaiting[0]
@@ -287,56 +378,80 @@ class ExamManagementHandler:
                     self.draft.classes_suspended = True
                 elif re.match(r"\W*(?:no|nope|not|continue|false)", low):
                     self.draft.classes_suspended = False
-        if self.draft.__dict__ == before:
+        if repr(self.draft.to_json()) == before:
+            if queued:
+                return ("Noted - " + ", ".join(queued) + " will be excluded from this allocation.\n\n"
+                        + self._ask(self.understanding().check(self.draft, text)))
             return None                 # the message told us nothing new -> let other handlers try
         return self._advance(text)
-
-    def _missing_keys(self, req: ExamRequest) -> List[str]:
-        keys = []
-        if not (req.explicit_dates or (req.start and (req.end or req.n_days))):
-            keys.append("dates")
-        if not req.shifts:
-            keys.append("shifts")
-        if not (req.rooms or req.room_count):
-            keys.append("rooms")
-        if not req.per_room:
-            keys.append("per_room")
-        if self.settings.require_class_suspension_answer and req.classes_suspended is None:
-            keys.append("suspension")
-        return keys
 
     def _ask_missing(self, fields: List[str]) -> str:
         return "I still need: " + "; ".join(fields) + "."
 
+    def _resolve_ambiguity(self, low: str) -> None:
+        amb = self.draft.ambiguous
+        roles = amb.get("department_role")
+        if roles:
+            if re.search(r"\b(?:student|exam\w*|appear\w*|sit\w*|semester)\b", low) and not re.search(r"\b(?:faculty|invigilat\w*|teacher\w*)\b", low):
+                self.draft.student_departments = list(dict.fromkeys(self.draft.student_departments + roles))
+                amb.pop("department_role")
+            elif re.search(r"\b(?:faculty|invigilat\w*|teacher\w*|staff)\b", low):
+                self.draft.dept_include = list(dict.fromkeys(self.draft.dept_include + roles))
+                amb.pop("department_role")
+            elif re.search(r"\bboth\b", low):
+                self.draft.student_departments = list(dict.fromkeys(self.draft.student_departments + roles))
+                self.draft.dept_include = list(dict.fromkeys(self.draft.dept_include + roles))
+                amb.pop("department_role")
+        for k in [k for k in amb if k.startswith("llm_")]:
+            amb.pop(k)               # the model's reading never overrides the coordinator's own words
+
     def _advance(self, text: str) -> str:
         req = self.draft
         assert req is not None
-        keys = self._missing_keys(req)
-        if keys:
-            self.awaiting = keys
-            names = {"dates": "the examination dates (start date with end date, or start date with number of days)",
-                     "shifts": "the shift timings (for example: morning 9 am to 12 pm, afternoon 2 pm to 5 pm)",
-                     "rooms": "the number of examination rooms (or their names)",
-                     "per_room": "how many invigilators each room needs",
-                     "suspension": "whether regular classes are suspended during this examination "
-                                   "(final-semester exams usually suspend them, but I will not assume it)"}
-            known = self._known_lines(req)
-            return (known + "\n\n" if known else "") + "Before I can allocate duties I need " + \
-                ("one more detail:" if len(keys) == 1 else "a few details:") + "\n" + \
-                "\n".join(f"- {names[k]}" for k in keys)
+        u = self.understanding().check(req, text)
+        if u.conflicts or u.gaps:
+            self.awaiting = [g.key for g in u.gaps] or ["conflict"]
+            return self._ask(u)
         self.awaiting = []
-        dates, notes = nlu.expand_dates(req, self.settings.non_working_weekdays)
+        return self._create_and_generate(req, u.notes, text)
+
+    def _ask(self, u: und.Understanding) -> str:
+        """Say what was understood, then ask ONLY for what is truly missing or contradictory."""
+
+        known = self._known_lines(u.req)
+        parts = [known] if known else []
+        if u.conflicts:
+            parts.append("**I need you to settle this:**\n" + "\n".join(f"- {c}" for c in u.conflicts))
+        if u.gaps:
+            parts.append(("**One more detail is needed:**" if len(u.gaps) == 1 else "**A few details are still needed:**")
+                         + "\n" + "\n".join(f"- {g.question}" for g in u.gaps))
+        return "\n\n".join(parts)
+
+    def _labels(self, phrases: List[str]) -> Tuple[List[str], List[str]]:
+        depts = self.repo.departments()
+        res = self.svc.policy.resolver()
+        good, bad = [], []
+        for ph in phrases:
+            if ph in depts:
+                good.append(ph)
+                continue
+            r = res.resolve(ph)
+            (good if r.ok else bad).append(r.label if r.ok else ph)
+        return list(dict.fromkeys(good)), bad
+
+    def _create_and_generate(self, req: ExamRequest, notes: List[str], text: str, carry_from: Optional[int] = None) -> str:
+        dates, dnotes = nlu.expand_dates(req, self.settings.non_working_weekdays)
+        notes = list(notes) + dnotes
         if not dates:
             self.awaiting = ["dates"]
-            return "I could not work out any examination dates from that. Please give a start date with an end date or a number of days."
+            return "I could not work out any examination dates from that. Please give the date(s), or a start date with an end date."
         self._sync()
-        depts = self.repo.departments()
         opts: Dict[str, Any] = {}
-        inc, bad_i = nlu.match_departments(req.dept_include, depts)
-        exc, bad_e = nlu.match_departments(req.dept_exclude, depts)
+        inc, bad_i = self._labels(req.dept_include)
+        exc, bad_e = self._labels(req.dept_exclude)
         if bad_i or bad_e:
             notes.append("Department(s) not found and ignored: " + ", ".join(bad_i + bad_e) +
-                         f" (known departments: {', '.join(depts) or 'none'})")
+                         f" (known departments: {', '.join(self.repo.departments()) or 'none'})")
         if inc or exc:
             opts["departments"] = {"include": inc, "exclude": exc}
         if req.group_split:
@@ -347,13 +462,31 @@ class ExamManagementHandler:
             opts["prohibit_consecutive"] = True
         if req.max_per_day:
             opts["max_per_day"] = req.max_per_day
-        name = req.name or f"Examination {dates[0]:%d %b} - {dates[-1]:%d %b %Y}"
+        if req.duty_rule:
+            opts["duty_rule"] = req.duty_rule
+        if req.duty_priority:
+            opts["duty_priority"] = req.duty_priority
+        if req.allow_unverified:
+            opts["allow_unverified"] = True
+        scope = und.resolve_scope(req, self.catalog or und.NoClasses())
+        if req.classes_suspended is False and scope.classes:
+            opts["suspended_classes"] = scope.classes
+        notes += scope.notes
+        if req.duty_rule and (req.duty_rule.get("period") not in (None, "all recorded duties")):
+            notes.append(f"Duty counts: you mentioned '{req.duty_rule['period']}', but recorded duties carry no dates, so all recorded "
+                         "duties were counted.")
+        opts["request"] = req.to_json()
+        name = req.name or (f"{req.exam_type.title()} examination" if req.exam_type else "Examination") + f" {dates[0]:%d %b} - {dates[-1]:%d %b %Y}"
         spec = SessionSpec(name=name, dates=dates, shifts=req.shifts, per_room=req.per_room, rooms=req.rooms,
                            room_count=req.room_count, min_duties=req.min_duties, max_duties=req.max_duties,
                            classes_suspended=req.classes_suspended, options=opts)
         sid = self.svc.create_session(spec)
+        carry_from = carry_from or self._carry_from
+        if carry_from:
+            self._carry_rules(carry_from, sid)
         self.session_id = sid
         self.draft = None
+        self.last_request = req
         applied = self._apply_pending(sid)
         seed = re.search(r"\bseed\s*(?:=|:|of)?\s*(\d+)", text.lower())
         outcome = self.svc.generate(sid, seed=int(seed.group(1)) if seed else None)
@@ -362,24 +495,148 @@ class ExamManagementHandler:
             tpl = self.settings.room_label_template
             notes.append(f"You gave a room count, so rooms are labelled {tpl.format(n=1)}..{tpl.format(n='N')}. "
                          f"Give real room names in a new request if you want them (list the room names in your request).")
-        return self._present(outcome, notes + applied, first=True)
+        return self._present(outcome, notes + applied, first=True, req=req)
+
+    def _carry_rules(self, old: int, new: int) -> None:
+        """A modified request keeps the exclusions, department rules and priorities already given for it."""
+
+        conn = self.repo.conn
+        for table, where in (("exm_restriction", "status='active'"), ("exm_dept_restriction", "status='active'"),
+                             ("exm_priority_rule", "1=1")):
+            try:
+                cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})") if r[1] not in ("id", "session_id")]
+                if not cols:
+                    continue
+                names = ", ".join(cols)
+                conn.execute(f"INSERT INTO {table} (session_id, {names}) SELECT ?, {names} FROM {table} WHERE session_id=? AND {where}",
+                             (new, old))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+
+    # ---------------------------------------------------------- follow-up changes
+    _STRUCTURAL = ("semesters", "years", "student_departments", "dept_include", "dept_exclude", "shifts", "rooms", "room_count",
+                   "explicit_dates", "start", "duty_rule", "duty_priority", "avoid_teaching", "exam_type", "class_names",
+                   "all_faculty_departments", "college_wide")
+
+    def _modify_request(self, text: str, low: str) -> Optional[str]:
+        """
+        "Make it two shifts and 2 per room", "give preference to faculty with fewer than 8 duties", "also semester 5":
+        the message changes the CURRENT examination.  Everything already stated is kept; only what is new replaces it.
+        A message with its own dates and an allocation verb is a NEW examination and never gets here.
+        """
+
+        sess = self._session()
+        stored = (sess or {}).get("options", {}).get("request") if sess else None
+        instruction = re.match(r"^\W*give\s+(?:\w+\s+){0,2}?(?:preference|priority|precedence)\b", low)
+        if not sess or not stored or (self._is_question(low) and not instruction) or self.awaiting:
+            return None
+        # restrictions on people or departments ("exclude CS from 10 Nov", "Dr. X is unavailable on 12 Nov") are not edits
+        if re.search(r"\b(?:exclud\w*|unavailab\w*|restor\w*|on\s+leave|leave\s+on|available\s+again|replac\w*|remov\w*)\b", low):
+            return None
+        try:
+            if any(len(re.sub(r"[^A-Za-z]", "", m.text)) >= 3 for m in self._resolver().mentions(text)[0]):
+                return None
+        except Exception:
+            pass
+        new = self._parse_req(text, self._year())
+        changed = [k for k in self._STRUCTURAL if getattr(new, k) not in (None, [], {})]
+        date_cue = re.match(r"^\W*(?:please\s+)?(?:now\s+|also\s+|and\s+)?(?:make|change|update|modify|switch|move|shift|instead|reschedule|extend|postpone)\b", low)
+        if not date_cue:
+            changed = [k for k in changed if k not in ("explicit_dates", "start")]
+        if new.per_room and not re.search(r"\binvigilator", low):
+            changed.append("per_room")
+        if new.shifts_per_day_hint and not new.shifts:
+            changed.append("shifts_hint")
+        if not changed:
+            return None
+        continuing = re.match(r"^\W*(?:please\s+)?(?:now|also|and|then|make|change|update|modify|switch|instead|increase|reduce|"
+                              r"add|set|use|give|prefer|keep|let|can\s+you|could\s+you|but|actually|rather)\b", low)
+        if self._is_allocation_request(text, low) and not continuing:
+            return None                       # a complete new request: nothing from the previous examination is carried over
+        if (new.explicit_dates or new.start) and self._is_allocation_request(text, low) and not re.match(r"^\W*(?:make|change|update|modify|switch|instead)\b", low):
+            return None
+        alloc = self._latest_alloc()
+        if alloc and alloc["status"] == "approved":
+            return ("This examination is already **approved and saved**, so I will not rewrite it. Ask for a different draft "
+                    "with a new request (give its dates), or replace individual duties (*remove <name> from <date>*).")
+        merged = ExamRequest.from_json(stored)
+        if new.explicit_dates and (merged.start or merged.end):
+            merged.start = merged.end = merged.n_days = None
+        if (new.start or new.end) and merged.explicit_dates:
+            merged.explicit_dates = []
+        merged.merge(new)
+        if "shifts_hint" in changed:
+            merged.shifts = [] if len(merged.shifts) != new.shifts_per_day_hint else merged.shifts
+        self.draft = merged
+        self._carry_from = sess["id"]
+        msg = self._advance(text)
+        if self.draft is None and self._carry_from:      # it generated: retire the superseded draft
+            self._retire(self._carry_from)
+        return msg
+
+    def _retire(self, old: int) -> None:
+        try:
+            alloc = self.repo.latest_allocation(old)
+            if alloc and alloc["status"] == "draft":
+                self.svc.cancel_draft(alloc["id"])
+            self.repo.update_session(old, status="cancelled")
+        except Exception:
+            pass
+        self._carry_from = None
 
     def _known_lines(self, req: ExamRequest) -> str:
+        """Everything understood so far, in one compact block - so a coordinator sees nothing was dropped."""
+
         bits = []
-        if req.start and req.end:
-            bits.append(f"dates {req.start:%d %b} to {req.end:%d %b}")
+        if req.exam_type:
+            bits.append(f"**Type:** {req.exam_type}")
+        if req.semesters:
+            bits.append("**Semester:** " + ", ".join(map(str, req.semesters)))
+        if req.years:
+            bits.append("**Year:** " + ", ".join(str(y) for y in req.years))
+        if req.student_departments:
+            bits.append("**Students from:** " + ", ".join(req.student_departments))
+        if req.dept_include:
+            bits.append("**Faculty from:** " + ", ".join(req.dept_include))
+        elif req.all_faculty_departments:
+            bits.append("**Faculty from:** all departments")
+        if req.dept_exclude:
+            bits.append("**Not from:** " + ", ".join(req.dept_exclude))
+        if req.explicit_dates:
+            ds = sorted(req.explicit_dates)
+            bits.append("**Dates:** " + ", ".join(f"{d:%d %b %Y}" for d in ds))
+        elif req.start and req.end:
+            bits.append(f"**Dates:** {req.start:%d %b} to {req.end:%d %b %Y}")
         elif req.start and req.n_days:
-            bits.append(f"{req.n_days} days from {req.start:%d %b}")
+            bits.append(f"**Dates:** {req.n_days} days from {req.start:%d %b %Y}")
         if req.shifts:
-            bits.append("shifts " + ", ".join(f"{s['label']} {s['start']}-{s['end']}" for s in req.shifts))
+            bits.append("**Shifts:** " + ", ".join(f"{s['label']} {dash.clock12(s['start'])}-{dash.clock12(s['end'])}" for s in req.shifts))
+        elif req.shifts_per_day_hint:
+            bits.append(f"**Shifts per day:** {req.shifts_per_day_hint}")
         if req.room_count or req.rooms:
-            bits.append(f"{len(req.rooms) if req.rooms else req.room_count} rooms")
+            bits.append(f"**Rooms:** {len(req.rooms) if req.rooms else req.room_count}")
         if req.per_room:
-            bits.append(f"{req.per_room} invigilators per room")
+            bits.append(f"**Invigilators per room:** {req.per_room}")
+        if req.duty_rule:
+            from .duty_rules import DutyRule
+            bits.append("**Duty count:** " + DutyRule.from_dict(req.duty_rule).describe())
+        if req.duty_priority:
+            bits.append("**Preference:** lowest duty counts first")
         if req.min_duties is not None or req.max_duties is not None:
-            bits.append(f"duties per faculty: min {req.min_duties if req.min_duties is not None else '-'}, "
+            bits.append(f"**Duties per faculty here:** min {req.min_duties if req.min_duties is not None else '-'}, "
                         f"max {req.max_duties if req.max_duties is not None else '-'}")
-        return ("So far I have: " + "; ".join(bits) + ".") if bits else ""
+        if req.max_per_day:
+            bits.append(f"**Per day:** at most {req.max_per_day} duty")
+        if req.prohibit_consecutive:
+            bits.append("**Consecutive days:** not allowed")
+        if req.avoid_teaching:
+            bits.append("**Teaching clashes:** avoided")
+        if req.simultaneous_rooms_forbidden:
+            bits.append("**Two rooms at once:** never")
+        if req.unmapped:
+            bits.append("**Also noted (cannot be applied automatically):** " + " / ".join(req.unmapped))
+        return ("**What I understood** - " + "  ·  ".join(bits)) if bits else ""
 
     def _apply_pending(self, sid: int) -> List[str]:
         notes = []
@@ -410,10 +667,16 @@ class ExamManagementHandler:
         return notes
 
     # ---------------------------------------------------------------- presenting
-    def _present(self, outcome, notes: List[str], first: bool = False) -> str:
+    def _present(self, outcome, notes: List[str], first: bool = False, req: Optional[ExamRequest] = None) -> str:
         aid = outcome.allocation_id
         if outcome.status == "unchanged":
             return "\n".join(outcome.notes)
+        try:
+            self.last_dashboard = dash.build(self.svc, aid, req or self.last_request, [n for n in notes if n])
+            self.last_dashboard["headline"] = self._headline(self.last_dashboard)
+        except Exception as error:             # the chat text below is still complete without it
+            print(f"dashboard unavailable: {error}")
+            self.last_dashboard = None
         parts = []
         if outcome.status == "infeasible":
             parts.append("**No valid allocation exists under the current constraints.**")
@@ -446,6 +709,13 @@ class ExamManagementHandler:
                          f"*generate the PDF*, *exclude <a faculty name> on {day}*, *show duties on {day}*, "
                          "*show department-wise distribution*, or *why did <name> receive more duties than <name>*.")
         return "\n\n".join(parts)
+
+    @staticmethod
+    def _headline(d: Dict[str, Any]) -> str:
+        cards = {c["label"]: c["value"] for c in d["cards"]}
+        tail = ("every position is filled" if d["complete"] else f"{cards['Positions unfilled']} position(s) could not be filled")
+        return (f"**{d['status_text']}** - {cards['Positions assigned']} of {cards['Positions required']} positions assigned "
+                f"across {cards['Total shifts']} · {tail}. Validation: **{d['validation_overall']}**.")
 
     def _suggestions(self, aid: int) -> str:
         un = self.repo.unfilled(aid)

@@ -15,6 +15,7 @@ from datetime import date
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .config import ExamSettings
+from .duty_rules import DutyRule
 from .models import SlotInfo
 from .providers import NoTimetable, TimetableConflicts
 from .policy import PolicyService
@@ -44,8 +45,11 @@ STATUS_OF = {
     "existing_duty": "Ineligible",
     "commitment": "Ineligible",
     "timetable": "Ineligible",
+    "duty_count": "Ineligible",
+    "unverified": "Unverified",           # not enough data to rule a clash out - never treated as "free"
+    "unverified_dept": "Unverified",
 }
-SEVERITY = {"Excluded": 3, "Unavailable": 2, "Ineligible": 1, "Eligible": 0}
+SEVERITY = {"Excluded": 3, "Unavailable": 2, "Ineligible": 1, "Unverified": 1, "Eligible": 0}
 
 
 @dataclass(frozen=True)
@@ -157,9 +161,18 @@ class EligibilityEngine:
         for row in self.repo.commitments(dates):
             commits.setdefault(row["faculty_id"], []).append(row)
 
-        # teaching conflicts only when classes are NOT suspended
+        # teaching conflicts only when classes are NOT suspended; with a scoped suspension only the examined classes stop
         busy_cache: Dict[Tuple[int, str, str], Set[int]] = {}
         check_timetable = session["classes_suspended"] == 0
+        stopped = set(opts.get("suspended_classes") or [])
+
+        rule = DutyRule.from_dict(opts["duty_rule"]) if opts.get("duty_rule") else None
+        prior: Dict[int, float] = {}
+        if rule is not None:
+            comps = self.repo.history_components(exclude_session_id=session_id)
+            for f in faculty:
+                c = comps.get(f["id"], {})
+                prior[f["id"]] = c.get("baseline", 0.0) + c.get("completed", 0.0) + c.get("committed", 0.0)
 
         # A timetable spells a name its own way ("Dr. X"): resolve it by exact name first, then by the name
         # without titles, then through an administrator-confirmed alias.  When a spelling fits more than one
@@ -188,21 +201,45 @@ class EligibilityEngine:
         def busy_ids(slot: SlotInfo) -> Set[int]:
             key = (slot.exam_date.weekday(), slot.start, slot.end)
             if key not in busy_cache:
-                names = self.timetable.busy(slot.exam_date, slot.start, slot.end)
+                if stopped and hasattr(self.timetable, "busy_outside"):
+                    names = self.timetable.busy_outside(slot.exam_date, slot.start, slot.end, stopped)
+                else:
+                    names = self.timetable.busy(slot.exam_date, slot.start, slot.end)
                 out: Set[int] = set()
                 for n in names:
                     out |= ids_for(n)
                 busy_cache[key] = out
             return busy_cache[key]
 
+        # people the timetable has NO data for are unverified for teaching - never assumed free
+        known_ids: Optional[Set[int]] = None
+        if check_timetable and hasattr(self.timetable, "known_names") and not opts.get("allow_unverified") \
+                and self.settings.unverified_faculty_policy == "exclude":
+            known_ids = set()
+            for n in self.timetable.known_names():
+                known_ids |= ids_for(n)
+
         for f in faculty:
             fid = f["id"]
+            rule_why: Optional[Verdict] = None
+            if rule is not None and rule.strength == "required":
+                p0 = prior.get(fid, 0.0)
+                if rule.basis == "previous" and not rule.holds(p0):
+                    rule_why = Verdict(False, "duty_count", f"Duty count {p0:g} does not satisfy the rule: {rule.describe()}")
+                elif rule.basis == "projected":
+                    cap = rule.projected_cap(p0)
+                    if cap is not None and cap <= 0:
+                        rule_why = Verdict(False, "duty_count", f"Duty count {p0:g} leaves no room under the rule: {rule.describe()}")
             for s in slots:
                 why: List[Verdict] = []
+                if rule_why is not None:
+                    why.append(rule_why)
                 if not f["active"]:
                     why.append(Verdict(False, "inactive", "Not an active faculty member"))
                 dl = (f["department"] or "").lower()
-                if include and dl not in include:
+                if include and not dl:
+                    why.append(Verdict(False, "unverified_dept", "Department not on record - cannot confirm it is one you asked for"))
+                elif include and dl not in include:
                     why.append(Verdict(False, "department", "Department not included in this allocation"))
                 if exclude and dl in exclude:
                     why.append(Verdict(False, "department", "Department excluded from this allocation"))
@@ -234,6 +271,8 @@ class EligibilityEngine:
                         break
                 if check_timetable and fid in busy_ids(s):
                     why.append(Verdict(False, "timetable", "Teaching a regular class at that time"))
+                elif known_ids is not None and fid not in known_ids and f["active"]:
+                    why.append(Verdict(False, "unverified", "Timetable not on record - a teaching clash cannot be ruled out"))
                 if why:
                     matrix.verdicts[(fid, s.index)] = why
         return matrix

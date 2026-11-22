@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import secrets
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -173,7 +173,8 @@ class ExamService:
         if sess is None:
             raise ExamError(f"unknown session {sid}")
         opts = dict(sess["options"])
-        for k in ("departments", "prohibit_consecutive", "max_per_day", "group_split"):
+        for k in ("departments", "prohibit_consecutive", "max_per_day", "group_split", "duty_rule", "duty_priority",
+                  "suspended_classes", "allow_unverified", "request"):
             if k in fields:
                 v = fields.pop(k)
                 if v is None:
@@ -220,10 +221,22 @@ class ExamService:
                                        c.get("committed", 0.0), PolicyService.tier_of(f, rules)[0]))
         eligible = {f.id: matrix.eligible_slots(f.id) for f in faculty}
         opts = session["options"]
+        person_max: Dict[int, int] = {}
+        if opts.get("duty_rule"):
+            from .duty_rules import DutyRule
+            rule = DutyRule.from_dict(opts["duty_rule"])
+            for i, f in enumerate(faculty):
+                prior_n = f.history + f.committed
+                if rule.basis == "projected" and rule.strength == "required":
+                    cap = rule.projected_cap(prior_n)
+                    if cap is not None:
+                        person_max[f.id] = cap
+                elif rule.strength == "preferred" and not rule.holds(prior_n):
+                    faculty[i] = replace(f, tier=max(f.tier, 2))       # used only for seats the preferred group cannot fill
         p = Problem(faculty=faculty, slots=matrix.slots, eligible=eligible,
                     min_duties=session["min_duties"], max_duties=session["max_duties"],
                     prohibit_consecutive=bool(opts.get("prohibit_consecutive")),
-                    max_per_day=opts.get("max_per_day"), seed=seed,
+                    max_per_day=opts.get("max_per_day"), seed=seed, person_max=person_max,
                     fixed=fixed or set(), forbidden=forbidden or set(),
                     keep_preferred=keep_preferred or set(), previous=previous or set())
         p.overlaps = overlapping_pairs(p.slots)
@@ -234,6 +247,13 @@ class ExamService:
             for sl in p.slots:
                 p.group_quota[sl.index] = seat_quota(sl.required, spec["shares"])
         return p, matrix
+
+    def session_settings(self, session: Dict[str, Any]) -> ExamSettings:
+        """The engine settings for ONE examination: "lowest duty count first" lets history decide fully."""
+
+        if (session.get("options") or {}).get("duty_priority") == "lowest_first":
+            return self.settings.with_overrides(history_weight=1.0, history_adjust_cap=1e9, history_adjust_fraction=None)
+        return self.settings
 
     def _slot_key(self, matrix: EligibilityMatrix) -> Dict[Tuple[str, int], int]:
         return {(s.exam_date.isoformat(), s.shift_id): s.index for s in matrix.slots}
@@ -269,7 +289,7 @@ class ExamService:
             best: Optional[SolveResult] = None
             prev_quality = None
             if prev_alloc and prev_pairs:
-                targets = targets_for(problem, self.settings)
+                targets = targets_for(problem, self.session_settings(session))
                 pa: Dict[int, List[int]] = defaultdict(list)
                 for f, s in prev_pairs:
                     pa[s].append(f)
@@ -277,7 +297,7 @@ class ExamService:
             different = None
             for k in range(attempts if avoid_previous and prev_pairs else 1):
                 problem.seed = base_seed + k * 104729
-                res = solve(problem, self.settings)
+                res = solve(problem, self.session_settings(session))
                 if res.status == "infeasible" and not res.assignments:
                     best = res
                     break

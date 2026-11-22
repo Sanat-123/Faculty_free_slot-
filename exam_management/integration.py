@@ -25,6 +25,8 @@ def build_exam_management(model_getter: Callable, branch_getter: Callable,
         except Exception:
             buffer = 0
         settings = ExamSettings()
+        if os.environ.get("EXAM_MGMT_OWN_ALL") == "1":
+            settings = settings.with_overrides(own_all_allocation_requests=True)
         path = db_path or os.environ.get("EXAM_MGMT_DB_PATH") or state_file(ExamSettings().db_filename)
         svc = ExamService(
             path,
@@ -34,7 +36,24 @@ def build_exam_management(model_getter: Callable, branch_getter: Callable,
             settings=settings,
         )
         svc.reload_settings()
-        return ExamManagementHandler(svc, today_getter)
+        resolver_cache: dict = {}
+
+        def dept_of_branch(code: str):
+            if "r" not in resolver_cache or resolver_cache.get("n") != len(svc.repo.departments()):
+                resolver_cache["r"], resolver_cache["n"] = svc.policy.resolver(), len(svc.repo.departments())
+            res = resolver_cache["r"].resolve(code)
+            return res.label if res.ok else None
+
+        from .providers import ProjectClasses
+        catalog = ProjectClasses(model_getter, branch_getter, dept_of_branch)
+        llm = None
+        try:
+            from .llm_extract import LLMExtractor
+            if svc.settings.use_llm_extraction and LLMExtractor.available():
+                llm = LLMExtractor()
+        except Exception:
+            llm = None
+        return ExamManagementHandler(svc, today_getter, catalog=catalog, llm=llm)
     except Exception as error:      # never let this feature stop the chatbot starting
         print(f"Exam management unavailable: {error}")
         return None

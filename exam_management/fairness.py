@@ -77,7 +77,8 @@ def compute_targets(faculty: Sequence[FacultyInfo], eligible: Mapping[int, Set[i
                     scale: int = 10, min_duties: Optional[int] = None,
                     history_weight: float = 1.0, history_cap: Optional[float] = None,
                     history_cap_fraction: Optional[float] = None,
-                    demand_cap_by_slot: Optional[float] = None) -> Dict[int, int]:
+                    demand_cap_by_slot: Optional[float] = None,
+                    person_max: Optional[Mapping[int, int]] = None) -> Dict[int, int]:
     """
     Fixed-point targets (value * scale) of NEW duties per faculty id.
 
@@ -90,7 +91,8 @@ def compute_targets(faculty: Sequence[FacultyInfo], eligible: Mapping[int, Set[i
     base: Dict[int, float] = {}
     for f in faculty:
         n = len(eligible.get(f.id, ()))
-        cap[f.id] = float(min(n, max_duties) if max_duties is not None else n)
+        own = [x for x in (max_duties, (person_max or {}).get(f.id)) if x is not None]
+        cap[f.id] = float(min([n] + own))
         base[f.id] = f.history + f.committed
     # History is ONE input, not the master: only a bounded, damped part of a person's gap to the
     # average (of people who can actually serve) moves their target.  weight=1 / no cap = raw water-fill.

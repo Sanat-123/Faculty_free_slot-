@@ -76,3 +76,34 @@ Fairness: history now shifts a person's target only by a bounded share (`history
 restores the old raw behaviour. Lower tiers are used only for seats higher tiers cannot fill (`tier_penalty`).
 Weekly off-days are the `non_working_weekdays` setting (empty = every calendar day is an exam day).
 Migration v3 is additive; the database file should still be copied before upgrading.
+## Universal request understanding, validation and dashboard (added)
+
+A coordinator can describe an examination in their own words. One path understands every message:
+
+```
+message -> rule reader (nlu.py + config/exam_lexicon.json)      always available, deterministic
+        -> semesters / years / classes (understanding.py)
+        -> department ROLES: students examined vs faculty who invigilate (resolved against the database)
+        -> optional language model (llm_extract.py)             validated, grounded in the message, fills gaps only
+        -> contradictions + genuinely missing facts (Understanding.gaps / .conflicts)
+        -> session -> eligibility -> fairness -> CP-SAT -> validation.py -> dashboard.py
+        -> Streamlit view (streamlit_view.py) / Excel + PDF (official_export.py)
+```
+
+* **Nothing is hardcoded.** Departments come from the roster, classes/semesters from the timetable, numbers/dates/times from the
+  message. Wording (operators like "fewer than", "each room must have") lives in `config/exam_lexicon.json`.
+* **Asks only what is missing** and always echoes what it understood. A stated value is never asked again.
+* **Student department != faculty department.** Faculty default to *all departments* unless restricted.
+* **Scoped suspension.** "3rd semester exam" suspends only the 3rd-semester classes; every other class keeps teaching.
+* **Missing timetable != free.** Faculty with no timetable on record are *Unverified* and not assigned
+  (`ExamSettings.unverified_faculty_policy="allow"` or say "include faculty whose timetable is missing" to allow, flagged).
+* **Duty-count rules** (`duty_rules.py`): `<, <=, >, >=, =, between`, required or preferred, judged on the count *before* the
+  allocation (default) or the projected total. "Lowest duty count first" lets history decide fully.
+* **Follow-ups** ("make it three per room", "prefer faculty with fewer than 8 duties") modify the current request and keep earlier
+  conditions and exclusions; a complete new request starts clean.
+* **Validation** recomputes from stored rows: Passed / Failed / Not verified / Not applicable. "Passed" only when verified.
+
+Optional configuration (`ExamSettings`): `own_all_allocation_requests` (env `EXAM_MGMT_OWN_ALL=1`; handle every request here even
+without an imported roster), `named_shifts` (e.g. `{"morning": ("09:30","12:30")}` so "morning shift" needs no times),
+`default_classes_suspended`, `duty_rule_default_basis`, `unverified_faculty_policy`, `use_llm_extraction`.
+Language model: set `ANTHROPIC_API_KEY` (and optionally `FACULTY_LLM_MODEL`); without it the rule reader works alone.

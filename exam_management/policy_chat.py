@@ -80,10 +80,18 @@ class PolicyChat:
                     found.append(Found(next(iter(owners)), toks[i][1], toks[i + n - 1][2]))
                 else:
                     ambiguous.append((" ".join(words), sorted(owners)))
-        if not found and not ambiguous:                       # misspelling: one fuzzy try on unused words
+        # misspelling: one fuzzy try on unused words - only when the message actually talks about a department
+        # (otherwise ordinary words and people's names such as "preference" or "Arpita" get read as departments)
+        cue = re.search(r"\b(?:department|departments|dept|depts|branch|branches|stream)\b", text, re.I)
+        if not found and not ambiguous and cue:
+            from .understanding import is_common_word
             stop = set(self.lex.get("stop_words", []))
+            try:
+                people = {w.lower() for m in self.h._resolver().mentions(text)[0] for w in re.findall(r"[A-Za-z]+", m.text)}
+            except Exception:
+                people = set()
             for i, (w, a, b) in enumerate(toks):
-                if used[i] or len(w) < 6 or w.lower() in stop:
+                if used[i] or len(w) < 6 or w.lower() in stop or is_common_word(w) or w.lower() in people:
                     continue
                 r = resolver.resolve(w)
                 if r.ok and r.how in ("fuzzy", "prefix"):

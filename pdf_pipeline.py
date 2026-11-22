@@ -573,6 +573,7 @@ def answer_query(query: str, entity_extractor=None, history=None) -> dict:
                 "entities": {},
                 "rows": [],
                 "text": exam_reply,
+                "dashboard": _EXAM_HANDLER.consume_dashboard(),
                 "detection": {"intent": "EXAM_DUTY", "day": None,
                               "slot": None, "entities": {}},
             }

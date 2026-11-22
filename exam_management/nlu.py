@@ -19,6 +19,9 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from . import duty_rules
+from . import lexicon as lx
+
 MONTHS = {m.lower(): i for i, m in enumerate(calendar.month_name) if m}
 MONTHS.update({m.lower(): i for i, m in enumerate(calendar.month_abbr) if m})
 MONTHS["sept"] = 9
@@ -399,9 +402,21 @@ def parse_shifts(text: str, label_template: str = "Shift {n}") -> List[Dict[str,
 # examination request
 # ===========================================================================
 
+# how a value in the request got there (shown to the coordinator, never hidden)
+SRC_USER, SRC_LLM, SRC_DB, SRC_DEFAULT, SRC_INFERRED = "user", "llm", "database", "default", "inferred"
+
+
 @dataclass
 class ExamRequest:
+    """
+    The structured form of what a coordinator asked for.  ``None`` / ``[]`` always mean "not stated" - a missing
+    value is never invented.  ``provenance`` records where each stated value came from (the coordinator's words,
+    the language model, the database, a configured default, or an inference from other facts) and ``ambiguous``
+    keeps competing readings until the coordinator resolves them.
+    """
+
     name: Optional[str] = None
+    exam_type: Optional[str] = None
     start: Optional[date] = None
     end: Optional[date] = None
     n_days: Optional[int] = None
@@ -417,19 +432,82 @@ class ExamRequest:
     max_per_day: Optional[int] = None
     classes_suspended: Optional[bool] = None
     prohibit_consecutive: Optional[bool] = None
-    dept_include: List[str] = field(default_factory=list)
+    dept_include: List[str] = field(default_factory=list)        # FACULTY departments to use (roster labels)
     dept_exclude: List[str] = field(default_factory=list)
     shifts_per_day_hint: Optional[int] = None
     group_split: Optional[Dict[str, Any]] = None      # {'base': 'cs', 'second': None, 'shares': {...}}
+    # ---- who is examined (kept apart from who invigilates) ----
+    semesters: List[int] = field(default_factory=list)
+    years: List[Any] = field(default_factory=list)               # [2, "final"] - resolved to semesters later
+    class_names: List[str] = field(default_factory=list)
+    college_wide: Optional[bool] = None
+    student_departments: List[str] = field(default_factory=list)  # departments whose STUDENTS sit the exam
+    # ---- who may invigilate ----
+    all_faculty_departments: Optional[bool] = None
+    duty_rule: Optional[Dict[str, Any]] = None                    # see duty_rules.DutyRule
+    duty_priority: Optional[str] = None                           # "lowest_first"
+    duty_priority_period: Optional[str] = None
+    exclude_names: List[str] = field(default_factory=list)        # names the coordinator wants left out (as written)
+    avoid_teaching: Optional[bool] = None                         # "avoid faculty who are teaching"
+    allow_unverified: Optional[bool] = None                       # "include faculty whose timetable is missing"
+    # ---- bookkeeping ----
+    simultaneous_rooms_forbidden: Optional[bool] = None           # stated; always enforced by the engine
+    unmapped: List[str] = field(default_factory=list)             # requirement sentences no reader understood
+    ambiguous: Dict[str, Any] = field(default_factory=dict)
+    provenance: Dict[str, str] = field(default_factory=dict)
+
+    _KEEP_FALSE = ("include_weekdays",)
 
     def merge(self, newer: "ExamRequest") -> "ExamRequest":
+        """Later statements win; anything the newer message did not state is kept.  An explicit False is a real answer."""
+
         for k, v in newer.__dict__.items():
-            if v in (None, [], False) and k != "include_weekdays":
+            if v is None or v == [] or v == {}:
                 continue
-            if k == "include_weekdays" and not v:
+            if k in self._KEEP_FALSE and not v:
+                continue
+            if k == "provenance":
+                self.provenance.update(v)
+                continue
+            if k in ("ambiguous",):
+                self.ambiguous.update(v)
+                continue
+            if k == "unmapped":
+                self.unmapped = list(dict.fromkeys(self.unmapped + list(v)))
                 continue
             setattr(self, k, v)
         return self
+
+    def mark(self, key: str, source: str) -> None:
+        self.provenance[key] = source
+
+    def source(self, key: str) -> Optional[str]:
+        return self.provenance.get(key)
+
+    # ---- JSON (stored on the session so a follow-up can modify the SAME request) ----
+    def to_json(self) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for k, v in self.__dict__.items():
+            if isinstance(v, date):
+                out[k] = v.isoformat()
+            elif isinstance(v, list) and v and isinstance(v[0], date):
+                out[k] = [d.isoformat() for d in v]
+            else:
+                out[k] = v
+        return out
+
+    @staticmethod
+    def from_json(data: Dict[str, Any]) -> "ExamRequest":
+        req = ExamRequest()
+        for k, v in (data or {}).items():
+            if not hasattr(req, k) or k.startswith("_"):
+                continue
+            if k in ("start", "end") and isinstance(v, str):
+                v = date.fromisoformat(v)
+            elif k in ("explicit_dates", "skip_dates"):
+                v = [date.fromisoformat(x) if isinstance(x, str) else x for x in v or []]
+            setattr(req, k, v)
+        return req
 
 
 _ROOM_NAME = r"[A-Za-z]{0,4}[- ]?\d+[A-Za-z0-9-]*"
@@ -437,6 +515,99 @@ _ROOM_NAME = r"[A-Za-z]{0,4}[- ]?\d+[A-Za-z0-9-]*"
 
 def _n(tok: str) -> Optional[int]:
     return to_int(tok)
+
+
+
+_NOT_A_COUNT_AFTER = r"(?!\s*(?:rooms?|halls?|venues?|dut(?:y|ies)|days?|shifts?|sessions?|dates?|am\b|pm\b|a\.m|p\.m|[:/.]\d|%|\d|"\
+                     r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*))"
+
+
+def parse_per_room(text: str) -> Optional[int]:
+    """
+    Invigilators needed in EACH room, read by the ROLE a number plays rather than by one sentence shape:
+
+        "2 invigilators per room"          "each room must have 2 faculties"      "two on duty in every hall"
+        "three teachers are needed in every room"    "rooms with 2 invigilators each"    "2 in each room"
+
+    A number counts when it is attached to a people-word (invigilator, faculty, teacher ...) and the same sentence
+    says "each / every / per ... room", or when it follows "each room needs / has / must have".  Numbers that are
+    clock times, dates, room counts, duty counts or comparisons are never read as this.
+    """
+
+    num = lx.number_pattern()
+    who = lx.alternation("per_room_nouns")
+    room = lx.alternation("room_nouns")
+    each = lx.alternation("room_each_words")
+    verbs = lx.alternation("per_room_verbs")
+    roomcue = rf"(?:{each})\s*(?:exam(?:ination)?\s+)?(?:{room})|in\s+(?:the\s+)?(?:{room})|(?:{room})\s*(?:each|apiece)"
+    for a, b in lx.sentence_spans(text):
+        sent = text[a:b]
+        # A) "<N> <people-word> ... each/every/per room"
+        for m in re.finditer(rf"(?<![\w.:/-])(?P<n>{num})[\s-]*(?:more\s+|additional\s+|extra\s+)?(?:{who})\b", sent, re.I):
+            before = sent[max(0, m.start() - 28):m.start()]
+            if re.search(r"(?:less|fewer|more|greater|lower|higher|under|below|over|above|than|between|at\s+(?:least|most)|"
+                         r"maximum|minimum|max|min)\s*(?:of\s+)?$", before, re.I):
+                continue
+            after = sent[m.end():m.end() + 60]
+            if re.search(roomcue, after, re.I) or re.search(rf"(?:{each})\s*(?:{room})", sent[max(0, m.start() - 40):m.start()], re.I):
+                v = lx.to_number(m.group("n"))
+                if v and 0 < v <= 50:
+                    return v
+        # B) "each room <verb> <N> [people-word]"
+        pat = rf"(?:{each})\s*(?:exam(?:ination)?\s+)?(?:{room})\s*(?:{verbs}\s*){{0,3}}(?:exactly\s+|at\s+least\s+|a\s+(?:team|set)\s+of\s+)?(?P<n>{num})(?![\d:])\b{_NOT_A_COUNT_AFTER}"
+        m = re.search(pat, sent, re.I)
+        if m:
+            v = lx.to_number(m.group("n"))
+            if v and 0 < v <= 50:
+                return v
+        # C) "<N> in/per each room"   "<N> each"   (after rooms were mentioned)
+        m = re.search(rf"(?<![\w.:/-])(?P<n>{num})\s*(?:on\s+duty\s+|present\s+|stationed\s+|there\s+)?(?:(?:in|for|on|at)\s+(?:{each})|per|each|every)\s*(?:{room})\b", sent, re.I)
+        if m:
+            v = lx.to_number(m.group("n"))
+            if v and 0 < v <= 50:
+                return v
+        m = re.search(rf"(?:{room})\s*(?:with|having|of)\s+(?P<n>{num})[\s-]*(?:{who})\b", sent, re.I)
+        if m:
+            v = lx.to_number(m.group("n"))
+            if v and 0 < v <= 50:
+                return v
+    return None
+
+
+def parse_room_count(text: str) -> Optional[int]:
+    """How many rooms: "15 rooms", "twenty examination halls", "number of rooms is 15", "using 12 halls"."""
+
+    low = text.lower()
+    num = lx.number_pattern()
+    skip = r"(?!per\b|each\b|every\b|in\b|for\b|a\b|an\b|the\b|and\b|with\b|invigilators?\b|faculty\b|faculties\b|teachers?\b|staff\b)"
+    for rm in re.finditer(rf"(?<![\w:.])({num})\s+(?:{skip}[a-z]+\s+){{0,2}}?(?:rooms?|halls?|venues?|classrooms?)\b", low):
+        if re.search(r"per\s+room", low[rm.start():rm.end() + 9]):
+            continue
+        return lx.to_number(rm.group(1))
+    m = re.search(rf"(?:number\s+of|total|count\s+of|no\.?\s+of)\s+(?:exam\w*\s+)?(?:rooms?|halls?|venues?)\s*(?:is|are|=|:|of|will\s+be)?\s*({num})\b", low)
+    if m:
+        return lx.to_number(m.group(1))
+    m = re.search(rf"(?:rooms?|halls?)\s*(?:needed|required|available|count)\s*(?:is|are|=|:)?\s*({num})\b", low)
+    if m:
+        return lx.to_number(m.group(1))
+    return None
+
+
+def _first(patterns: Iterable[str], text: str) -> Optional["re.Match[str]"]:
+    for pat in patterns:
+        m = re.search(pat, text, re.I)
+        if m:
+            return m
+    return None
+
+
+def parse_exam_type(text: str) -> Optional[str]:
+    """The kind of examination, by the words the coordinator used (vocabulary in the lexicon; None when not stated)."""
+
+    for label, pats in lx.lexicon().get("exam_types", {}).items():
+        if any(re.search(rf"(?<![A-Za-z]){p}(?![A-Za-z])", text, re.I) for p in pats):
+            return label
+    return None
 
 
 def parse_exam_request(text: str, today: date, year_hint: Optional[int] = None,
@@ -488,9 +659,9 @@ def parse_exam_request(text: str, today: date, year_hint: Optional[int] = None,
     req.shifts = parse_shifts(shift_text, shift_label)
 
     # rooms
-    rm = re.search(r"\b(\d{1,3}|" + "|".join(NUMWORDS) + r")\s+(?:[a-z]+\s+)?(?:rooms?|halls?|venues?|classrooms?)\b", low)
-    if rm and not re.search(r"per\s+room", low[rm.start():rm.end() + 9]):
-        req.room_count = _n(rm.group(1))
+    rc = parse_room_count(text)
+    if rc:
+        req.room_count = rc
     nm = re.search(r"\b(?:rooms?|halls?)\s*(?:are|:|=|-)?\s*(" + _ROOM_NAME + r"(?:\s*(?:,|and|&)\s*" + _ROOM_NAME + r")+)", text, re.I)
     if nm:
         req.rooms = [r.strip() for r in re.split(r"\s*(?:,|\band\b|&)\s*", nm.group(1)) if r.strip()]
@@ -509,6 +680,8 @@ def parse_exam_request(text: str, today: date, year_hint: Optional[int] = None,
         pm = re.search(r"\b(\d{1,2}|" + "|".join(NUMWORDS) + r")\s+(?:invigilators?|supervisors?|faculty|faculties|teachers?)\s*(?:each|apiece|per\s+(?:room|hall))\b", low)
     if pm:
         req.per_room = _n(pm.group(1))
+    if not req.per_room:
+        req.per_room = parse_per_room(text)
 
     # per-day cap (read before the general max)
     dayc = re.search(r"(?:max(?:imum)?|at\s+most|no\s+more\s+than|only)\s*(?:of\s*)?(\d{1,2}|" + "|".join(NUMWORDS) +
@@ -516,9 +689,18 @@ def parse_exam_request(text: str, today: date, year_hint: Optional[int] = None,
     if dayc:
         req.max_per_day = _n(dayc.group(1))
     elif re.search(r"\b(?:one|1)\s+dut(?:y|ies)\s+(?:per|a)\s+day", low) or \
-            re.search(r"not\s+more\s+than\s+once\s+(?:a|per)\s+day", low):
+            re.search(r"not\s+more\s+than\s+once\s+(?:a|per)\s+day", low) or \
+            _first(lx.lexicon().get("same_day_cap", []), low):
         req.max_per_day = 1
     scrub = low if not dayc else low[:dayc.start()] + " " * (dayc.end() - dayc.start()) + low[dayc.end():]
+    rule, rule_spans = duty_rules.parse_duty_rules(text)          # "who have a duty count less than 12" is NOT a per-exam cap
+    if rule:
+        req.duty_rule = rule.to_dict()
+        for a, b in rule_spans:
+            scrub = scrub[:a] + " " * (b - a) + scrub[b:]
+    prio, _, prio_period = duty_rules.parse_priority(text)
+    if prio:
+        req.duty_priority, req.duty_priority_period = prio, prio_period
 
     # min / max duties per faculty
     bt = re.search(r"between\s+(\d{1,2})\s+and\s+(\d{1,2})\s+dut", scrub)
@@ -558,6 +740,15 @@ def parse_exam_request(text: str, today: date, year_hint: Optional[int] = None,
     for m in re.finditer(r"\b(?:except|excluding|exclude|not\s+from|without)\s+(?:the\s+)?([a-z&, ]+?)\s+(?:department|dept|branch)s?\b", low):
         req.dept_exclude += [p.strip() for p in re.split(r",|\band\b|&", m.group(1)) if p.strip()]
 
+    if _first(lx.lexicon().get("no_consecutive", []), low):
+        req.prohibit_consecutive = True
+    if _first(lx.lexicon().get("teaching_conflict_cues", []), low):
+        req.avoid_teaching = True
+    if _first(lx.lexicon().get("no_simultaneous", []), low):
+        req.simultaneous_rooms_forbidden = True
+    if _first(lx.lexicon().get("unverified_allow_cues", []), low):
+        req.allow_unverified = True
+    req.exam_type = parse_exam_type(text)
     req.group_split = parse_group_split(text)
 
     # name
